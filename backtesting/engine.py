@@ -20,6 +20,7 @@ simulados, sin gaps, sin rollover.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any
 
 from execution.order import Fill, OrderSide, OrderStatus, OrderType
@@ -32,6 +33,24 @@ from strategies.base.strategy import BaseStrategy
 Bar = dict[str, Any]
 
 TradeRecord = dict[str, Any]
+
+
+def _day_key(ts) -> Any:
+    """Día de trading (UTC) de un timestamp de barra.
+
+    Soporta epoch numérico/string y fechas ISO. Devuelve None si no se
+    puede interpretar (entonces no hay reset diario).
+    """
+    if isinstance(ts, (int, float)):
+        return datetime.fromtimestamp(float(ts)).date()
+    if isinstance(ts, str):
+        if ts.isdigit():
+            return datetime.fromtimestamp(float(ts)).date()
+        try:
+            return datetime.fromisoformat(ts.replace("Z", "+00:00")).date()
+        except ValueError:
+            return None
+    return None
 
 
 @dataclass(frozen=True, slots=True)
@@ -52,12 +71,18 @@ class ExecutionCosts:
 
 @dataclass(slots=True)
 class BacktestResult:
-    """Resultado agregado + registro completo de operaciones."""
+    """Resultado agregado + registro completo de operaciones.
+
+    Attributes:
+        diagnostics: Contadores diagnósticos EXACTOS del recorrido (raw
+            signals, bloqueadas por posición, rechazadas por riesgo, etc.).
+    """
 
     initial_equity: float
     final_equity: float
     trades: list[TradeRecord] = field(default_factory=list)
     equity_curve: list[float] = field(default_factory=list)
+    diagnostics: dict[str, Any] = field(default_factory=dict)
 
     @property
     def net_return(self) -> float:
@@ -87,14 +112,57 @@ class BacktestEngine:
     max_bars_in_trade: int | None = None
     seed: int | None = None
 
+ENGINE_VERSION = 2
+
+
+@dataclass(slots=True)
+class BacktestEngine:
+    """Simula una estrategia sobre datos históricos a través del pipeline real.
+
+    Versión 2 (ENGINE_VERSION): el veto de pérdida diaria
+    (`max_daily_loss`) usa la pérdida REALIZADA del día de trading
+    (calendar-day UTC), no el P&L acumulado del backtest. Esto refleja la
+    semántica realista de "pérdida diaria" sin modificar el RiskEngine.
+
+    Attributes:
+        costs: Supuestos de costes (documentar siempre).
+        risk_engine: Autoridad de veto y sizing de cada intención.
+        order_manager: Registra y controla el ciclo de vida de las órdenes.
+        account_id: Cuenta representada en el backtest.
+        point_value: P&L monetario por unidad de precio (sizing fixed-fractional).
+        min_size: Cantidad mínima operada; por debajo no se crea orden.
+        max_bars_in_trade: Regla temporal de salida (None = solo stop/END).
+    """
+
+    ENGINE_VERSION = 2  # semántica del recorrido (véase docstring de la clase)
+
+    costs: ExecutionCosts
+    risk_engine: RiskEngine
+    order_manager: OrderManager
+    account_id: str = "BACKTEST-01"
+    point_value: float = 1.0
+    min_size: float = 0.0
+    max_bars_in_trade: int | None = None
+    seed: int | None = None
+
     def run(self, strategy: BaseStrategy, bars: list[Bar]) -> BacktestResult:
         """Ejecuta el backtest. `bars` debe estar cronológicamente ordenado."""
         if len(bars) < 2:
             raise ValueError("Se necesitan al menos 2 barras para ejecutar")
 
         realized = 0.0
+        day_pnl = 0.0
+        current_day = _day_key(bars[0]["ts"])
         curve: list[float] = [self.costs.initial_equity]
         trades: list[TradeRecord] = []
+        diag: dict[str, int | dict[str, int]] = {
+            "raw_signals": 0,
+            "signals_while_flat": 0,
+            "signals_while_in_position": 0,
+            "risk_rejected_signals": 0,
+            "orders_created": 0,
+            "risk_rejection_by_reason": {},
+        }
 
         quantity = 0.0
         entry: float | None = None
@@ -105,6 +173,11 @@ class BacktestEngine:
         per_side = self.costs.per_side_cost
 
         for i, bar in enumerate(bars):
+            new_day = _day_key(bar["ts"])
+            if new_day is not None and new_day != current_day:
+                current_day = new_day
+                day_pnl = 0.0
+
             if pending is not None:
                 quantity, entry, side, stop, entry_idx = self._fill(
                     pending, float(bar["open"]), per_side, i, bar["ts"]
@@ -132,6 +205,7 @@ class BacktestEngine:
                     exit_price, reason = exit_plan
                     pnl = (exit_price - entry) * quantity * (1 if side == "LONG" else -1)
                     realized += pnl
+                    day_pnl += pnl
                     trades[-1].update(
                         exit_price=exit_price,
                         exit_time=bar.get("ts"),
@@ -152,12 +226,19 @@ class BacktestEngine:
             else:
                 curve.append(self.costs.initial_equity + realized)
 
-            if quantity == 0.0 and i < len(bars) - 1:
-                order = self._plan_order(
-                    strategy, bars[: i + 1], curve[-1], realized, bar["ts"]
-                )
-                if order is not None:
-                    pending = order
+            if i < len(bars) - 1:
+                signal = strategy.generate_signal(bars[: i + 1])
+                if signal.action is not Action.NO_TRADE:
+                    diag["raw_signals"] += 1
+                    if quantity != 0.0:
+                        diag["signals_while_in_position"] += 1
+                    else:
+                        diag["signals_while_flat"] += 1
+                        order = self._decide_order(
+                            signal, curve[-1], day_pnl, bar["ts"], diag
+                        )
+                        if order is not None:
+                            pending = order
 
         if quantity != 0.0:
             bar = bars[-1]
@@ -165,6 +246,7 @@ class BacktestEngine:
             exit_price = self._exit_price(side, close, per_side)
             pnl = (exit_price - entry) * quantity * (1 if side == "LONG" else -1)
             realized += pnl
+            day_pnl += pnl
             trades[-1].update(
                 exit_price=exit_price,
                 exit_time=bar.get("ts"),
@@ -174,11 +256,13 @@ class BacktestEngine:
             )
 
         curve[-1] = self.costs.initial_equity + realized
+        diag["trades_completed"] = len(trades)
         return BacktestResult(
             initial_equity=self.costs.initial_equity,
             final_equity=self.costs.initial_equity + realized,
             trades=trades,
             equity_curve=curve,
+            diagnostics=diag,
         )
 
     def _fill(
@@ -228,29 +312,42 @@ class BacktestEngine:
             return self._exit_price(side, close, per_side), "TIME"
         return None
 
-    def _plan_order(
+    def _decide_order(
         self,
-        strategy: BaseStrategy,
-        visible: list[Bar],
+        signal: Signal,
         equity: float,
-        realized: float,
+        day_pnl: float,
         bar_ts: str,
+        diag: dict[str, Any],
     ):
-        signal = strategy.generate_signal(visible)
-        if signal.action is Action.NO_TRADE:
-            return None
+        """Valida la intención, crea/registra la orden si se aprueba.
 
+        Solo se llama desde `run()` cuando la señal es de entrada (no
+        NO_TRADE) y la posición está plana. Los rechazos se contabilizan
+        en `diag` (diagnóstico de capacidad de señales).
+        """
         state = AccountRiskState(
             equity=equity,
             balance=self.costs.initial_equity,
             open_positions=0,
-            current_daily_pnl=realized,
+            current_daily_pnl=day_pnl,
             current_drawdown=0.0,
         )
         decision = self.risk_engine.validate(
             signal, state, point_value=self.point_value
         )
-        if not decision.approved or decision.approved_quantity < self.min_size:
+        if not decision.approved:
+            diag["risk_rejected_signals"] += 1
+            for name, ok in decision.checks.items():
+                if not ok:
+                    bucket = diag["risk_rejection_by_reason"]
+                    bucket[name] = bucket.get(name, 0) + 1
+            return None
+
+        if decision.approved_quantity < self.min_size:
+            diag["risk_rejected_signals"] += 1
+            bucket = diag["risk_rejection_by_reason"]
+            bucket["min_size"] = bucket.get("min_size", 0) + 1
             return None
 
         side = OrderSide.BUY if signal.action is Action.LONG else OrderSide.SELL
@@ -268,6 +365,7 @@ class BacktestEngine:
         )
         self.order_manager.approve(order.order_id)
         self.order_manager.submit(order.order_id)
+        diag["orders_created"] += 1
         return order
 
     def _entry_price(self, side: str | None, price: float, per_side: float) -> float:

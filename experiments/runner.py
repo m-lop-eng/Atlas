@@ -76,6 +76,12 @@ def run_experiment_dir(config_path: str | Path) -> int:
     print(f"final_equity  : {report['final_equity']:.2f}")
     print(f"net_return    : {report['metrics']['net_return']}")
     print(f"max_drawdown  : {report['metrics']['max_drawdown']}")
+    diag = report.get("diagnostics", {})
+    if diag:
+        print(f"raw/flat/en-pos/rechazadas/órdenes/trades : "
+              f"{diag['raw_signals']}/{diag['signals_while_flat']}/"
+              f"{diag['signals_while_in_position']}/{diag['risk_rejected_signals']}/"
+              f"{diag['orders_created']}/{diag['trades_completed']}")
     print(f"registro      : {tracked.status.value} ({report['experiment_id']})")
     print(f"reporte       : {out_dir / report['experiment_id'] / 'report.json'}")
     return 0

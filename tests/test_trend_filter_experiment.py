@@ -16,7 +16,7 @@ from data.synthetic import generate_ohlc_bars, write_ohlc_csv
 from research.pipeline import build_strategy, run_experiment
 
 EXPERIMENTS = Path(__file__).resolve().parents[1] / "experiments"
-BASELINE_ID = "exp-c494bacc5643"
+BASELINE_ID = "exp-945890d1b42e"
 
 
 @pytest.fixture()

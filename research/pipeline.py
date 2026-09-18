@@ -56,10 +56,11 @@ def build_engine(cfg: dict) -> BacktestEngine:
 
 
 def experiment_id_for(config: dict, dataset_path: Path) -> str:
-    """ID determinista del experimento: hash(config + dataset)."""
+    """ID determinista del experimento: hash(config + dataset + versión del motor)."""
     payload = {
         "config": config,
         "dataset_sha256": sha256_of_file(dataset_path),
+        "engine_version": BacktestEngine.ENGINE_VERSION,
     }
     return f"exp-{make_config_hash(payload)[:12]}"
 
@@ -103,6 +104,7 @@ def run_experiment(
         "risk_config": config["risk"],
         "costs": config["costs"],
         "engine": config.get("engine", {}),
+        "engine_version": BacktestEngine.ENGINE_VERSION,
         "environment": config.get("experiment", {"environment": "BACKTEST"}).get(
             "environment", "BACKTEST"
         ),
@@ -121,6 +123,7 @@ def run_experiment(
         },
         "trades": result.trades,
         "equity_curve": result.equity_curve,
+        "diagnostics": result.diagnostics,
         "final_equity": result.final_equity,
     }
 
