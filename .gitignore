@@ -47,6 +47,7 @@ logs/
 
 # Resultados de experimentos (generados; reproducibles desde config.yaml)
 experiments/*/outputs/
+experiments/outputs/
 
 # SO
 Thumbs.db
