@@ -12,13 +12,16 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+ROOT = Path(__file__).resolve().parents[2]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
 import yaml
 
 from data.quality import summarize_quality
 from data.synthetic import generate_ohlc_bars, write_ohlc_csv
 from research.pipeline import run_experiment, track_experiment
 
-ROOT = Path(__file__).resolve().parents[2]
 CONFIG_PATH = Path(__file__).resolve().parent / "config.yaml"
 
 
