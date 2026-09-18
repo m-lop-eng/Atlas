@@ -1,0 +1,53 @@
+experiment:
+  name: atlas-btc1h-asymmetry-h002
+  environment: BACKTEST
+  type: BASELINE
+  hypothesis: h002-asymmetry
+  parent: exp-241340f5d8fb
+
+strategy:
+  strategy_id: atlas-breakout
+  strategy_name: "Atlas Breakout (BTC 1h, H002)"
+  strategy_family: breakout
+  market: crypto
+  instrument: BTCUSDT
+  timeframe: 1h
+  version: 1.0.0
+  parameter_set_version: h2a
+  data_version: v2
+  params:
+    lookback: 20
+    atr_period: 14
+    stop_atr_mult: 2.0
+    direction: both
+
+risk:
+  risk_per_trade: 0.01
+  max_open_positions: 3
+  max_strategy_risk: 0.9
+  max_daily_loss: 0.05
+  max_drawdown: 0.2
+
+costs:
+  spread_ticks: 0
+  tick_size: 0
+  slippage_per_side: 0.05
+  commission_per_unit: 0.1
+  initial_equity: 100000
+
+engine:
+  account_id: BACKTEST-BTC1H
+  point_value: 1.0
+  min_size: 0.001
+  max_bars_in_trade: 48
+
+# Dataset histórico profundo: data.binance.vision (kline spot 1h), 2019-2026.
+# Manifest versionado fija rango + sha256 (reproducibilidad).
+dataset:
+  path: experiments/data/market_BTCUSDT_60min.csv
+  manifest: experiments/data/market_BTCUSDT_60min.manifest.json
+  n_bars: 67141
+  start_epoch: 1546300800
+  end_epoch: 1788217200
+  interval_seconds: 3600
+  regenerate: false

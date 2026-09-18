@@ -1,0 +1,16 @@
+{
+  "source": "binance/vision/klines-1h",
+  "pair": "BTCUSDT",
+  "interval_seconds": 3600,
+  "bars": 67141,
+  "first_ts": "1546300800",
+  "last_ts": "1788217200",
+  "sha256": "3d368b84ed27d2ec012eb2a03247ec860771e60bc239c7465febed01e61cf7f9",
+  "params": {
+    "symbol": "BTCUSDT",
+    "interval": "1h",
+    "start": "2019-01-01",
+    "end": "2026-09-18T18:37:54"
+  },
+  "fetched_at": "2026-09-18T18:39:24.484394+00:00"
+}

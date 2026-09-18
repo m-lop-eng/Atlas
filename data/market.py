@@ -1,11 +1,12 @@
-"""Datos de mercado real: OHLCV horario de instrumentos líquidos (MVP).
+"""Adquisición de datos de mercado real (DataSource + DataManifest).
 
-Fuente: API pública de Kraken (talker: /0/public/OHLC). Sin autenticación y
-sin dependencias externas (solo stdlib urllib). Reproducible dado
-(pair, interval, since): el CSV se escribe en `experiments/data/` (gitignore
-via *.csv) y el manifest (JSON versionado) fija el rango/parámetros/hash.
+CLI:
+    python data/market.py kraken  [pair] [interval] [since_iso]
+    python data/market.py binance [symbol] [start_iso] [end_iso]
 
-Limitación declarada: la ventana solicitada debe existir completa en la fuente.
+Compatibilidad: `fetch_kraken_ohlc`, `epoch_of` y `write_market_dataset` se
+mantienen como API estable (proveedor Kraken) para tests/CLI legados; toda
+la lógica de proveedores vive en `data/sources.py`.
 """
 
 from __future__ import annotations
@@ -18,6 +19,11 @@ from pathlib import Path
 from typing import Any
 from datetime import datetime, timezone
 
+from data.sources import (
+    BinanceVisionSource,
+    KrakenSource,
+    write_dataset,
+)
 from data.synthetic import sha256_of_file, write_ohlc_csv
 
 KRAKEN_OHLC_URL = "https://api.kraken.com/0/public/OHLC"
@@ -107,6 +113,12 @@ def write_market_dataset(
 
 def main(argv: list[str] | None = None) -> int:
     argv = argv if argv is not None else sys.argv[1:]
+    if argv and argv[0] == "binance":
+        return _binance_main(argv[1:])
+    return _kraken_main(argv)
+
+
+def _kraken_main(argv: list[str]) -> int:
     pair = argv[0] if argv else "XXBTZUSD"
     interval = int(argv[1]) if len(argv) > 1 else 60
     since_iso = argv[2] if len(argv) > 2 else "2026-08-01T00:00:00"
@@ -120,6 +132,40 @@ def main(argv: list[str] | None = None) -> int:
         bars, out_csv, manifest, pair=pair, interval=interval, since=since
     )
     print(f"descargadas {len(bars)} barras de {pair} ({interval} min)")
+    print(f"rango       : {bars[0]['ts']} -> {bars[-1]['ts']}")
+    print(f"csv         : {out_csv}")
+    print(f"manifest    : {manifest}")
+    return 0
+
+
+def _binance_main(argv: list[str]) -> int:
+    """`python data/market.py binance [symbol] [start_iso] [end_iso]`."""
+    symbol = argv[0] if argv else "BTCUSDT"
+    start_iso = argv[1] if len(argv) > 1 else "2019-01-01"
+    end_iso = argv[2] if len(argv) > 2 else datetime.now(timezone.utc).strftime(
+        "%Y-%m-%dT%H:%M:%S"
+    )
+    start = epoch_of(start_iso)
+    end = epoch_of(end_iso)
+    if end <= start:
+        raise ValueError(f"end ({end}) debe ser > start ({start})")
+
+    root = Path(__file__).resolve().parents[1]
+    bars = BinanceVisionSource(symbol=symbol).fetch(start, end)
+    out_csv = root / "experiments" / "data" / f"market_{symbol}_{int(3600 / 60)}min.csv"
+    manifest = root / "experiments" / "data" / (
+        f"market_{symbol}_{int(3600 / 60)}min.manifest.json"
+    )
+    write_dataset(
+        bars,
+        out_csv,
+        manifest,
+        source="binance/vision/klines-1h",
+        pair=symbol,
+        interval_seconds=3600,
+        params={"symbol": symbol, "interval": "1h", "start": start_iso, "end": end_iso},
+    )
+    print(f"descargadas {len(bars)} barras de {symbol} 1h ({start_iso} -> {end_iso})")
     print(f"rango       : {bars[0]['ts']} -> {bars[-1]['ts']}")
     print(f"csv         : {out_csv}")
     print(f"manifest    : {manifest}")

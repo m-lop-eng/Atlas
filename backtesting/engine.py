@@ -98,6 +98,13 @@ class BacktestEngine:
     (calendar-day UTC), no el P&L acumulado del backtest. Esto refleja la
     semántica realista de "pérdida diaria" sin modificar el RiskEngine.
 
+    Monetización en divisa de cuenta: P&L, costes, MAE y MFE se expresan en
+    $ multiplicando por `point_value` (dólares por unidad de precio). Para
+    point_value = 1.0 el resultado es idéntico al histórico del grafo H001
+    (por eso se mantiene el mismo ENGINE_VERSION y los experiment_id
+    permanecen estables); con point_value > 1 (p.ej. NQ=50) el risk in $ y
+    el P&L in $ quedan perfectamente alineados (auditoría de unidades).
+
     Attributes:
         costs: Supuestos de costes (documentar siempre).
         risk_engine: Autoridad de veto y sizing de cada intención.
@@ -212,8 +219,9 @@ class BacktestEngine:
                     exit_raw, reason = exit_plan
                     exit_price = self._exit_price(side, exit_raw, per_side)
                     sign = 1 if side == "LONG" else -1
-                    costs = quantity * 2 * per_side
-                    gross = (exit_raw - entry_raw) * sign * quantity
+                    pv = self.point_value
+                    costs = quantity * 2 * per_side * pv
+                    gross = (exit_raw - entry_raw) * sign * quantity * pv
                     net = gross - costs
                     realized += net
                     day_pnl += net
@@ -227,8 +235,8 @@ class BacktestEngine:
                         costs=costs,
                         net_pnl=net,
                         pnl=net,
-                        mae=round(mae_units * quantity, 8),
-                        mfe=round(mfe_units * quantity, 8),
+                        mae=round(mae_units * quantity * pv, 8),
+                        mfe=round(mfe_units * quantity * pv, 8),
                         mae_units=round(mae_units, 8),
                         mfe_units=round(mfe_units, 8),
                         bars_in_trade=i - entry_idx + 1,
@@ -244,7 +252,10 @@ class BacktestEngine:
 
             if quantity != 0.0:
                 close = float(bar["close"])
-                unrealized = (close - entry) * quantity * (1 if side == "LONG" else -1)
+                unrealized = (
+                    (close - entry) * quantity * (1 if side == "LONG" else -1)
+                    * self.point_value
+                )
                 curve.append(self.costs.initial_equity + realized + unrealized)
             else:
                 curve.append(self.costs.initial_equity + realized)
@@ -274,8 +285,9 @@ class BacktestEngine:
             exit_raw = close
             exit_price = self._exit_price(side, exit_raw, per_side)
             sign = 1 if side == "LONG" else -1
-            costs = quantity * 2 * per_side
-            gross = (exit_raw - entry_raw) * sign * quantity
+            pv = self.point_value
+            costs = quantity * 2 * per_side * pv
+            gross = (exit_raw - entry_raw) * sign * quantity * pv
             net = gross - costs
             realized += net
             day_pnl += net
@@ -289,8 +301,8 @@ class BacktestEngine:
                 costs=costs,
                 net_pnl=net,
                 pnl=net,
-                mae=round(mae_units * quantity, 8),
-                mfe=round(mfe_units * quantity, 8),
+                mae=round(mae_units * quantity * pv, 8),
+                mfe=round(mfe_units * quantity * pv, 8),
                 mae_units=round(mae_units, 8),
                 mfe_units=round(mfe_units, 8),
                 bars_in_trade=len(bars) - 1 - entry_idx + 1,
