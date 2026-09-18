@@ -31,12 +31,17 @@ class BreakoutParams:
             None (default) = sin filtro. Si el SMA no es computable (pocas
             barras) el filtro no se aplica: la variante es un superset puro
             del baseline (únicamente elimina señales).
+        invert: Invierte la señal breakout (control negativo E5-C): cuando el
+            baseline sería LONG contra el máximo, la variante entra SHORT
+            (y viceversa). El stop se coloca en el lado opuesto. Deliberado
+            para experimentos de hipótesis nula, no como estrategia.
     """
 
     lookback: int = 20
     atr_period: int = 14
     stop_atr_mult: float = 2.0
     trend_filter: int | None = None
+    invert: bool = False
 
     def __post_init__(self) -> None:
         if self.lookback < 1:
@@ -115,13 +120,21 @@ class BreakoutStrategy(BaseStrategy):
             if sma is not None and close <= sma:
                 return self._signal(Action.NO_TRADE, reference=None, stop=None)
             stop = close - p.stop_atr_mult * atr
-            return self._signal(Action.LONG, reference=close, stop=stop)
+            return self._signal(
+                Action.SHORT if p.invert else Action.LONG,
+                reference=close,
+                stop=close + p.stop_atr_mult * atr if p.invert else stop,
+            )
 
         if close < prev_low:
             if sma is not None and close >= sma:
                 return self._signal(Action.NO_TRADE, reference=None, stop=None)
             stop = close + p.stop_atr_mult * atr
-            return self._signal(Action.SHORT, reference=close, stop=stop)
+            return self._signal(
+                Action.LONG if p.invert else Action.SHORT,
+                reference=close,
+                stop=close - p.stop_atr_mult * atr if p.invert else stop,
+            )
 
         return self._signal(Action.NO_TRADE, reference=None, stop=None)
 

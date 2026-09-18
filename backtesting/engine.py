@@ -93,32 +93,6 @@ class BacktestResult:
 class BacktestEngine:
     """Simula una estrategia sobre datos históricos a través del pipeline real.
 
-    Args:
-        costs: Supuestos de costes (documentar siempre).
-        risk_engine: Autoridad de veto y sizing de cada intención.
-        order_manager: Registra y controla el ciclo de vida de las órdenes.
-        account_id: Cuenta representada en el backtest.
-        point_value: P&L monetario por unidad de precio (sizing fixed-fractional).
-        min_size: Cantidad mínima operada; por debajo no se crea orden.
-        max_bars_in_trade: Regla temporal de salida (None = solo stop).
-    """
-
-    costs: ExecutionCosts
-    risk_engine: RiskEngine
-    order_manager: OrderManager
-    account_id: str = "BACKTEST-01"
-    point_value: float = 1.0
-    min_size: float = 0.0
-    max_bars_in_trade: int | None = None
-    seed: int | None = None
-
-ENGINE_VERSION = 2
-
-
-@dataclass(slots=True)
-class BacktestEngine:
-    """Simula una estrategia sobre datos históricos a través del pipeline real.
-
     Versión 2 (ENGINE_VERSION): el veto de pérdida diaria
     (`max_daily_loss`) usa la pérdida REALIZADA del día de trading
     (calendar-day UTC), no el P&L acumulado del backtest. Esto refleja la
@@ -157,6 +131,8 @@ class BacktestEngine:
         trades: list[TradeRecord] = []
         diag: dict[str, int | dict[str, int]] = {
             "raw_signals": 0,
+            "raw_signals_long": 0,
+            "raw_signals_short": 0,
             "signals_while_flat": 0,
             "signals_while_in_position": 0,
             "risk_rejected_signals": 0,
@@ -166,10 +142,14 @@ class BacktestEngine:
 
         quantity = 0.0
         entry: float | None = None
+        entry_raw: float | None = None
         side: str | None = None
         stop: float | None = None
         entry_idx: int | None = None
+        mae_units = 0.0
+        mfe_units = 0.0
         pending = None
+        pending_ts: str | None = None
         per_side = self.costs.per_side_cost
 
         for i, bar in enumerate(bars):
@@ -179,45 +159,88 @@ class BacktestEngine:
                 day_pnl = 0.0
 
             if pending is not None:
-                quantity, entry, side, stop, entry_idx = self._fill(
-                    pending, float(bar["open"]), per_side, i, bar["ts"]
+                quantity, entry, entry_raw, side, stop, entry_idx = self._fill(
+                    pending, float(bar["open"]), per_side, i
                 )
                 trades.append(
                     {
+                        "trade_id": pending.client_order_id,
                         "strategy_id": pending.strategy_id,
                         "strategy_version": pending.strategy_version,
                         "instrument": pending.instrument,
+                        "signal_time": pending_ts,
+                        "entry_time": bar["ts"],
+                        "entry_index": i,
                         "side": side,
                         "quantity": quantity,
                         "entry_price": entry,
-                        "entry_time": bar["ts"],
-                        "entry_index": i,
+                        "entry_raw": entry_raw,
+                        "stop_price": stop,
                         "stop": stop,
+                        "mae": 0.0,
+                        "mfe": 0.0,
+                        "mae_units": 0.0,
+                        "mfe_units": 0.0,
+                        "gross_pnl": 0.0,
+                        "costs": 0.0,
+                        "net_pnl": 0.0,
+                        "pnl": 0.0,
+                        "bars_in_trade": 0,
                     }
                 )
+                mae_units = 0.0
+                mfe_units = 0.0
                 pending = None
+                pending_ts = None
 
             if quantity != 0.0:
+                low = float(bar["low"])
+                high = float(bar["high"])
+                if side == "LONG":
+                    adverse = entry_raw - low
+                    favorable = high - entry_raw
+                else:
+                    adverse = high - entry_raw
+                    favorable = entry_raw - low
+                mae_units = max(mae_units, max(adverse, 0.0))
+                mfe_units = max(mfe_units, max(favorable, 0.0))
+
                 exit_plan = self._evaluate_exit(
-                    bar, side, stop, per_side, i, entry_idx
+                    bar, side, stop, i, entry_idx
                 )
                 if exit_plan is not None:
-                    exit_price, reason = exit_plan
-                    pnl = (exit_price - entry) * quantity * (1 if side == "LONG" else -1)
-                    realized += pnl
-                    day_pnl += pnl
+                    exit_raw, reason = exit_plan
+                    exit_price = self._exit_price(side, exit_raw, per_side)
+                    sign = 1 if side == "LONG" else -1
+                    costs = quantity * 2 * per_side
+                    gross = (exit_raw - entry_raw) * sign * quantity
+                    net = gross - costs
+                    realized += net
+                    day_pnl += net
                     trades[-1].update(
                         exit_price=exit_price,
+                        exit_raw=exit_raw,
                         exit_time=bar.get("ts"),
                         exit_index=i,
                         exit_reason=reason,
-                        pnl=pnl,
+                        gross_pnl=gross,
+                        costs=costs,
+                        net_pnl=net,
+                        pnl=net,
+                        mae=round(mae_units * quantity, 8),
+                        mfe=round(mfe_units * quantity, 8),
+                        mae_units=round(mae_units, 8),
+                        mfe_units=round(mfe_units, 8),
+                        bars_in_trade=i - entry_idx + 1,
                     )
                     quantity = 0.0
                     entry = None
+                    entry_raw = None
                     side = None
                     stop = None
                     entry_idx = None
+                    mae_units = 0.0
+                    mfe_units = 0.0
 
             if quantity != 0.0:
                 close = float(bar["close"])
@@ -230,6 +253,10 @@ class BacktestEngine:
                 signal = strategy.generate_signal(bars[: i + 1])
                 if signal.action is not Action.NO_TRADE:
                     diag["raw_signals"] += 1
+                    if signal.action is Action.LONG:
+                        diag["raw_signals_long"] += 1
+                    else:
+                        diag["raw_signals_short"] += 1
                     if quantity != 0.0:
                         diag["signals_while_in_position"] += 1
                     else:
@@ -239,20 +266,34 @@ class BacktestEngine:
                         )
                         if order is not None:
                             pending = order
+                            pending_ts = bar["ts"]
 
         if quantity != 0.0:
             bar = bars[-1]
             close = float(bar["close"])
-            exit_price = self._exit_price(side, close, per_side)
-            pnl = (exit_price - entry) * quantity * (1 if side == "LONG" else -1)
-            realized += pnl
-            day_pnl += pnl
+            exit_raw = close
+            exit_price = self._exit_price(side, exit_raw, per_side)
+            sign = 1 if side == "LONG" else -1
+            costs = quantity * 2 * per_side
+            gross = (exit_raw - entry_raw) * sign * quantity
+            net = gross - costs
+            realized += net
+            day_pnl += net
             trades[-1].update(
                 exit_price=exit_price,
+                exit_raw=exit_raw,
                 exit_time=bar.get("ts"),
                 exit_index=len(bars) - 1,
                 exit_reason="END",
-                pnl=pnl,
+                gross_pnl=gross,
+                costs=costs,
+                net_pnl=net,
+                pnl=net,
+                mae=round(mae_units * quantity, 8),
+                mfe=round(mfe_units * quantity, 8),
+                mae_units=round(mae_units, 8),
+                mfe_units=round(mfe_units, 8),
+                bars_in_trade=len(bars) - 1 - entry_idx + 1,
             )
 
         curve[-1] = self.costs.initial_equity + realized
@@ -271,10 +312,10 @@ class BacktestEngine:
         open_price: float,
         per_side: float,
         index: int,
-        ts: str,
-    ) -> tuple[float, float, str, float | None, int]:
+    ) -> tuple[float, float, float, str, float | None, int]:
         side = "LONG" if order.side is OrderSide.BUY else "SHORT"
-        fill_price = self._entry_price(side, open_price, per_side)
+        fill_raw = open_price
+        fill_price = self._entry_price(side, fill_raw, per_side)
         filled = self.order_manager.apply_fill(
             order.order_id,
             Fill(
@@ -285,31 +326,42 @@ class BacktestEngine:
                 slippage=per_side if per_side else None,
             ),
         )
-        return filled.fill_quantity, fill_price, side, order.stop_price, index
+        return (
+            filled.fill_quantity,
+            fill_price,
+            fill_raw,
+            side,
+            order.stop_price,
+            index,
+        )
 
     def _evaluate_exit(
         self,
         bar: Bar,
         side: str | None,
         stop: float | None,
-        per_side: float,
         index: int,
         entry_idx: int | None,
     ) -> tuple[float, str] | None:
+        """Devuelve el PRECIO BRUTO de salida (sin costes) y la razón.
+
+        Los costes se aplican después (`_exit_price`), por lo que el precio
+        registrado distingue `exit_raw` (bruto) de `exit_price` (neto).
+        """
         low = float(bar["low"])
         high = float(bar["high"])
 
         if side == "LONG" and stop is not None and low <= stop:
-            return self._exit_price(side, stop, per_side), "STOP"
+            return stop, "STOP"
         if side == "SHORT" and stop is not None and high >= stop:
-            return self._exit_price(side, stop, per_side), "STOP"
+            return stop, "STOP"
         snapped = index - entry_idx if entry_idx is not None else 0
         if (
             self.max_bars_in_trade is not None
             and snapped >= self.max_bars_in_trade
         ):
             close = float(bar["close"])
-            return self._exit_price(side, close, per_side), "TIME"
+            return close, "TIME"
         return None
 
     def _decide_order(

@@ -34,7 +34,7 @@ def _config(**overrides) -> dict:
     base = {
         "experiment": {"environment": "BACKTEST"},
         "strategy": {
-            "strategy_id": "pipeline-test",
+            "strategy_id": "atlas-breakout",
             "strategy_name": "Pipeline Test",
             "strategy_family": "breakout",
             "market": "cash",
@@ -199,7 +199,7 @@ class TestLineage:
         report = run_experiment(cfg, csv_path)
         line = report["lineage"]
         assert line["experiment_id"] == report["experiment_id"]
-        assert line["strategy"]["strategy_id"] == "pipeline-test"
+        assert line["strategy"]["strategy_id"] == "atlas-breakout"
         assert line["strategy"]["params_hash"] == make_config_hash(cfg["strategy"]["params"])
         assert line["dataset"]["sha256"] == sha256_of_file(csv_path)
         assert line["risk_config"]["risk_per_trade"] == 0.01

@@ -16,14 +16,23 @@ from data.loader import read_ohlc_csv
 from data.synthetic import sha256_of_file
 from execution.order_manager import OrderManager
 from reporting.metrics import calculate_metrics
+from research.analysis import build_report_sections
 from research.experiment import ExperimentRun, ExperimentStatus, make_config_hash
 from risk.engine import RiskEngine
 from risk.types import RiskConfig
-from strategies.base.strategy import StrategyMetadata
+from strategies.base.strategy import BaseStrategy, StrategyMetadata
 from strategies.breakout import BreakoutParams, BreakoutStrategy
+from strategies.random_entry import RandomEntryParams, RandomEntryStrategy
+
+STRATEGY_REGISTRY: dict[str, tuple] = {
+    "atlas-breakout": (BreakoutParams, BreakoutStrategy),
+    "atlas-first-breakout": (BreakoutParams, BreakoutStrategy),
+    "atlas-breakout-trend-filter": (BreakoutParams, BreakoutStrategy),
+    "atlas-random-entry": (RandomEntryParams, RandomEntryStrategy),
+}
 
 
-def build_strategy(cfg: dict) -> BreakoutStrategy:
+def build_strategy(cfg: dict) -> BaseStrategy:
     """Construye la estrategia desde la sección `strategy` de la config."""
     meta = StrategyMetadata(
         strategy_id=cfg["strategy_id"],
@@ -36,8 +45,8 @@ def build_strategy(cfg: dict) -> BreakoutStrategy:
         parameter_set_version=cfg["parameter_set_version"],
         data_version=cfg["data_version"],
     )
-    params = BreakoutParams(**cfg["params"])
-    return BreakoutStrategy(meta, params)
+    params_cls, strategy_cls = STRATEGY_REGISTRY[cfg["strategy_id"]]
+    return strategy_cls(meta, params_cls(**cfg["params"]))
 
 
 def build_engine(cfg: dict) -> BacktestEngine:
@@ -84,6 +93,9 @@ def run_experiment(
     engine = build_engine(config)
     result = engine.run(strategy, bars)
     metrics = calculate_metrics(result)
+    sections = build_report_sections(
+        result.diagnostics, result.trades, config["costs"], metrics.to_dict()
+    )
 
     experiment_id = experiment_id_for(config, data_path)
     lineage = {
@@ -120,7 +132,16 @@ def run_experiment(
             "wins": sum(1 for t in result.trades if (t.get("pnl") or 0) > 0),
             "losses": sum(1 for t in result.trades if (t.get("pnl") or 0) < 0),
             "stopped": sum(1 for t in result.trades if t.get("exit_reason") == "STOP"),
+            "long": sum(1 for t in result.trades if t.get("side") == "LONG"),
+            "short": sum(1 for t in result.trades if t.get("side") == "SHORT"),
+            "time_exits": sum(1 for t in result.trades if t.get("exit_reason") == "TIME"),
         },
+        "signals": sections["signals"],
+        "trades_breakdown": sections["trades_breakdown"],
+        "performance": sections["performance"],
+        "trade_distribution": sections["trade_distribution"],
+        "execution": sections["execution"],
+        "sides": sections["sides"],
         "trades": result.trades,
         "equity_curve": result.equity_curve,
         "diagnostics": result.diagnostics,
