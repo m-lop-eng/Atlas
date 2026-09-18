@@ -38,10 +38,12 @@ from research.pipeline import run_experiment
 
 EXPERIMENTS = Path(__file__).resolve().parent
 BASELINE_CONFIG = EXPERIMENTS / "first_experiment" / "config.yaml"
+PARENT = "exp-bb2cb3867462"
 
 # Entorno neutralizado: el veto diario NO debe contaminar la comparación de
 # entradas. 0.9999 < 1.0 para pasar la validación del RiskConfig (0 < x < 1).
 NEUTRAL_ENV = {
+    "experiment": {"type": "NULL_CONTROL", "parent": PARENT, "hypothesis": "null"},
     "risk": {"max_daily_loss": 0.9999},
     "engine": {"max_bars_in_trade": 48},
 }

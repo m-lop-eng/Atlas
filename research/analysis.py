@@ -143,6 +143,8 @@ def build_report_sections(
 def _side_table(rows: list[dict], raw_signals: int) -> dict[str, Any]:
     pnls = [float(t["net_pnl"]) for t in rows]
     durations = [int(t["bars_in_trade"]) for t in rows]
+    mae = [float(t["mae"]) for t in rows]
+    mfe = [float(t["mfe"]) for t in rows]
     wins = sum(1 for p in pnls if p > 0)
     losses = sum(1 for p in pnls if p < 0)
     stopped = sum(1 for t in rows if t.get("exit_reason") == "STOP")
@@ -156,4 +158,6 @@ def _side_table(rows: list[dict], raw_signals: int) -> dict[str, Any]:
         "median_pnl": round(statistics.median(pnls), 6) if n else None,
         "avg_bars": round(statistics.mean(durations), 6) if n else None,
         "stop_rate": round(stopped / n, 6) if n else None,
+        "avg_mae": round(statistics.mean(mae), 6) if n else None,
+        "avg_mfe": round(statistics.mean(mfe), 6) if n else None,
     }

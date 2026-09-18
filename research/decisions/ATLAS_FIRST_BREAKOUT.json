@@ -1,0 +1,29 @@
+{
+  "strategy": "ATLAS_FIRST_BREAKOUT",
+  "status": "RESEARCH_REQUIRED",
+  "decided_at": "2026-09-18",
+  "reason": "No evidence of incremental predictive value over the random-entry control in the current synthetic data-generating process.",
+  "additional_observation": "Inverse breakout exhibits positive gross performance (+7,184) but negative net performance after modeled costs (-5,345) on synthetic data, evidencing that the cost model is material on this dataset. On the first real-market dataset (Kraken BTC 1h) the breakout net return is -3.39% vs -9.07% for random entry and -5.40% for the inverse: the breakout dominates the controls on real data, but still shows no net edge; LONG avg P&L +299 vs SHORT -635 flags an asymmetry worth a dedicated hypothesis before any exit/filter work. Costs on real data are negligible (11.0) vs 12,451 on synthetic: cost conclusions are model- and dataset-dependent.",
+  "evidence": {
+    "baseline_synthetic": "exp-bb2cb3867462",
+    "ablation_sma50": "exp-3ad3e139b53b",
+    "env_sensitivity_E3A": "exp-b01d0d3e4481",
+    "null_baseline_E5A": "exp-3041356e3a02",
+    "null_random_E5B": "exp-930c352936ee",
+    "null_inverse_E5C": "exp-6a0edb91ec39",
+    "baseline_real_btc1h": "exp-241340f5d8fb",
+    "materials": [
+      "experiments/e3_matrix.py",
+      "experiments/e5_null_experiments.py",
+      "experiments/e6_real_market.py",
+      "experiments/post_mortem.py",
+      "research/analysis.py"
+    ]
+  },
+  "optimization": "NOT_PERFORMED",
+  "oos": "NOT_PERFORMED",
+  "production": "NOT_ELIGIBLE",
+  "engine_version": 2,
+  "tests_passing": 168,
+  "next_step": "Do not tune ATLAS_FIRST_BREAKOUT. Build a LONG/SHORT asymmetry hypothesis or move to robustness/OOS only if a differentiating signal appears; keep the 168 tests green as regression baseline."
+}

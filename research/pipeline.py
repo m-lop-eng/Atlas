@@ -17,7 +17,12 @@ from data.synthetic import sha256_of_file
 from execution.order_manager import OrderManager
 from reporting.metrics import calculate_metrics
 from research.analysis import build_report_sections
-from research.experiment import ExperimentRun, ExperimentStatus, make_config_hash
+from research.experiment import (
+    ExperimentRun,
+    ExperimentStatus,
+    experiment_meta,
+    make_config_hash,
+)
 from risk.engine import RiskEngine
 from risk.types import RiskConfig
 from strategies.base.strategy import BaseStrategy, StrategyMetadata
@@ -98,8 +103,13 @@ def run_experiment(
     )
 
     experiment_id = experiment_id_for(config, data_path)
+    exp_meta = experiment_meta(config)
     lineage = {
         "experiment_id": experiment_id,
+        "experiment_type": exp_meta["experiment_type"],
+        "parent_experiment_id": exp_meta["parent_experiment_id"],
+        "hypothesis": exp_meta["hypothesis"],
+        "change": exp_meta["change"],
         "strategy": {
             "strategy_id": strategy.metadata.strategy_id,
             "strategy_version": strategy.metadata.version,

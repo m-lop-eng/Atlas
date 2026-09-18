@@ -20,6 +20,45 @@ class ExperimentStatus(str, Enum):
     ABANDONED = "abandoned"
 
 
+class ExperimentType(str, Enum):
+    """Papel del experimento en el grafo de investigación (05_RESEARCH.md §10).
+
+    El tipo pertenece a la METADATA del experimento (sección `experiment:`
+    de la config), por lo que formar parte del hash lo invalida si cambia.
+    `parent` encadena con el experimento base (p. ej. un ABLATION sobre un
+    BASELINE); `hypothesis` agrupa la familia de hipótesis que se está
+    destruyendo.
+    """
+
+    HYPOTHESIS = "HYPOTHESIS"
+    BASELINE = "BASELINE"
+    ABLATION = "ABLATION"
+    NULL_CONTROL = "NULL_CONTROL"
+    SENSITIVITY = "SENSITIVITY"
+    STRESS = "STRESS"
+    ROBUSTNESS = "ROBUSTNESS"
+    OOS = "OOS"
+    WALK_FORWARD = "WALK_FORWARD"
+    EXECUTION = "EXECUTION"
+
+
+ZERO_TRADES_AS_TEXT = "0-trades"
+
+
+def experiment_meta(config: dict) -> dict:
+    """Extrae y valida la metadata de experimento desde la config."""
+    exp = config.get("experiment", {})
+    etype = exp.get("type", ExperimentType.HYPOTHESIS.value)
+    if etype not in ExperimentType._value2member_map_:
+        raise ValueError(f"Tipo de experimento no reconocido: {etype}")
+    return {
+        "experiment_type": etype,
+        "parent_experiment_id": exp.get("parent"),
+        "change": exp.get("change"),
+        "hypothesis": exp.get("hypothesis"),
+    }
+
+
 ALLOWED_TRANSITIONS = {
     ExperimentStatus.DRAFT: {ExperimentStatus.RUNNING, ExperimentStatus.ABANDONED},
     ExperimentStatus.RUNNING: {ExperimentStatus.COMPLETED, ExperimentStatus.ABANDONED},

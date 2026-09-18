@@ -1,0 +1,50 @@
+experiment:
+  name: atlas-real-breakout-baseline
+  environment: BACKTEST
+  type: BASELINE
+  hypothesis: h002-real-btc-1h
+
+strategy:
+  strategy_id: atlas-first-breakout
+  strategy_name: "Atlas Breakout (real market)"
+  strategy_family: breakout
+  market: crypto
+  instrument: XXBTZUSD
+  timeframe: 1h
+  version: 1.0.0
+  parameter_set_version: p1
+  data_version: v1
+  params:
+    lookback: 20
+    atr_period: 14
+    stop_atr_mult: 2.0
+
+risk:
+  risk_per_trade: 0.01
+  max_open_positions: 3
+  max_strategy_risk: 0.9
+  max_daily_loss: 0.05
+  max_drawdown: 0.2
+
+costs:
+  spread_ticks: 0
+  tick_size: 0
+  slippage_per_side: 0.05
+  commission_per_unit: 0.1
+  initial_equity: 100000
+
+engine:
+  account_id: BACKTEST-REAL
+  point_value: 1.0
+  min_size: 0.001
+  max_bars_in_trade: 48
+
+# Dataset real: se descarga con `python data/market.py` (manifest fija el
+# rango y el sha256). No se regenera (el CSV vive solo en el entorno).
+dataset:
+  path: experiments/data/market_XXBTZUSD_60min.csv
+  manifest: experiments/data/market_XXBTZUSD_60min.manifest.json
+  n_bars: 721
+  start_epoch: 1787162400
+  interval_seconds: 3600
+  regenerate: false

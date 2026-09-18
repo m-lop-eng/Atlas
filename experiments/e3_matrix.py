@@ -38,12 +38,46 @@ from research.pipeline import run_experiment
 
 EXPERIMENTS = Path(__file__).resolve().parent
 BASELINE_CONFIG = EXPERIMENTS / "first_experiment" / "config.yaml"
+PARENT = "exp-bb2cb3867462"
+
+
+def _exp(type_: str) -> dict:
+    return {"experiment": {"type": type_, "parent": PARENT, "hypothesis": "h001-breakout-env"}}
+
 
 ROWS = [
-    ("E3-A", {"risk": {"max_daily_loss": 0.05}, "engine": {"max_bars_in_trade": 48}}),
-    ("E3-B", {"risk": {"max_daily_loss": 0.20}, "engine": {"max_bars_in_trade": 48}}),
-    ("E3-C", {"risk": {"max_daily_loss": 0.20}, "engine": {"max_bars_in_trade": 120}}),
-    ("E3-D", {"risk": {"max_daily_loss": 0.9999}, "engine": {"max_bars_in_trade": 10000}}),
+    (
+        "E3-A",
+        {
+            **_exp("SENSITIVITY"),
+            "risk": {"max_daily_loss": 0.05},
+            "engine": {"max_bars_in_trade": 48},
+        },
+    ),
+    (
+        "E3-B",
+        {
+            **_exp("SENSITIVITY"),
+            "risk": {"max_daily_loss": 0.20},
+            "engine": {"max_bars_in_trade": 48},
+        },
+    ),
+    (
+        "E3-C",
+        {
+            **_exp("SENSITIVITY"),
+            "risk": {"max_daily_loss": 0.20},
+            "engine": {"max_bars_in_trade": 120},
+        },
+    ),
+    (
+        "E3-D",
+        {
+            **_exp("SENSITIVITY"),
+            "risk": {"max_daily_loss": 0.9999},
+            "engine": {"max_bars_in_trade": 10000},
+        },
+    ),
 ]
 
 

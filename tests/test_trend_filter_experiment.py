@@ -16,7 +16,7 @@ from data.synthetic import generate_ohlc_bars, write_ohlc_csv
 from research.pipeline import build_strategy, run_experiment
 
 EXPERIMENTS = Path(__file__).resolve().parents[1] / "experiments"
-BASELINE_ID = "exp-945890d1b42e"
+BASELINE_ID = "exp-bb2cb3867462"
 
 
 @pytest.fixture()
@@ -61,6 +61,18 @@ class TestControlledComparison:
         for section in ("risk", "costs", "engine", "dataset"):
             assert base[section] == variant[section]
         assert base["experiment"]["environment"] == variant["experiment"]["environment"]
+
+    def test_experiment_type_and_parent_lineage(self, configs) -> None:
+        """E2 es ABLATION con parent = id del baseline; E1 es BASELINE."""
+        base, variant, csv = configs
+        base_report = run_experiment(base, csv)
+        variant_report = run_experiment(variant, csv)
+        assert base_report["lineage"]["experiment_type"] == "BASELINE"
+        assert base_report["lineage"]["parent_experiment_id"] is None
+        assert variant_report["lineage"]["experiment_type"] == "ABLATION"
+        assert variant_report["lineage"]["change"] == "sma50_filter"
+        assert variant_report["lineage"]["parent_experiment_id"] == base_report["experiment_id"]
+        assert variant_report["lineage"]["hypothesis"] == "h001-breakout"
 
     def test_experiment_ids_differ(self, configs) -> None:
         base, variant, csv = configs
