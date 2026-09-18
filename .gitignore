@@ -1,0 +1,54 @@
+# Entornos virtuales
+.venv/
+venv/
+env/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.coverage
+htmlcov/
+.coverage.*
+
+# Datos (nunca commitear datasets históricos)
+*.csv
+*.parquet
+*.feather
+*.h5
+!*/tests/fixtures/*.csv
+data/raw/
+data/cleaned/
+data/processed/
+
+# Secretos y credenciales
+.env
+*.env.local
+.credentials*
+
+# Configuración local
+config/development/local.*
+config/paper/local.*
+config/production/local.*
+
+# IDEs
+.vscode/
+.idea/
+
+# Logs
+logs/
+*.log
+
+# SO
+Thumbs.db
+.DS_Store
+
+# BD local
+*.sqlite
+*.db

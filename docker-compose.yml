@@ -1,0 +1,36 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: atlas_postgres
+    environment:
+      POSTGRES_DB: ${ATLAS_POSTGRES_DB:-atlas}
+      POSTGRES_USER: ${ATLAS_POSTGRES_USER:-atlas}
+      POSTGRES_PASSWORD: ${ATLAS_POSTGRES_PASSWORD:-change_me_dev_only}
+    ports:
+      - "5432:5432"
+    volumes:
+      - atlas_pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${ATLAS_POSTGRES_USER:-atlas} -d ${ATLAS_POSTGRES_DB:-atlas}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  app:
+    build: .
+    container_name: atlas_app
+    environment:
+      ATLAS_ENV: ${ATLAS_ENV:-development}
+      ATLAS_POSTGRES_HOST: postgres
+      ATLAS_POSTGRES_PORT: 5432
+      ATLAS_POSTGRES_DB: ${ATLAS_POSTGRES_DB:-atlas}
+      ATLAS_POSTGRES_USER: ${ATLAS_POSTGRES_USER:-atlas}
+      ATLAS_POSTGRES_PASSWORD: ${ATLAS_POSTGRES_PASSWORD:-change_me_dev_only}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./tests:/app/tests
+
+volumes:
+  atlas_pg_data:
