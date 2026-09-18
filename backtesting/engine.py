@@ -1,15 +1,20 @@
 """Motor de backtest iterativo sin look-ahead (04_BACKTEST_VALIDATION.md §8-9).
 
+Pipeline completo por barra:
+    Strategy → Signal → RiskEngine (veto + sizing) → OrderManager → fill en open[i+1]
+
 Disciplina de ejecución:
-    * Se procesa barra a barra en orden temporal estricto.
+    * Orden temporal estricto, barra a barra.
     * La estrategia SOLO recibe barras cerradas hasta el instante t.
-    * La señal de la barra t se ejecuta en el open de la barra t+1,
-      incorporando costes (spread + slippage + comisión).
+    * La señal de la barra t se ejecuta en el open de la barra t+1.
+    * Stops y salidas temporales intrabar (low/high) sin reordenar.
     * P&L valorado close-to-close mientras la posición está abierta.
 
-Limitaciones del MVP (deben resolverse en Milestone 2):
-    * Sin stops/take-profits intrabar, sin partial fills, sin gaps,
-      sin rollover. La posición se cierra solo por señal contraria.
+Costes: el precio de entrada incorpora per_side para entrar y el de salida
+per_side para salir (comisión+slippage+spread del lado correspondiente).
+
+Limitaciones MVP (Milestone 2): una posición a la vez, sin partial fills
+simulados, sin gaps, sin rollover.
 """
 
 from __future__ import annotations
@@ -17,10 +22,16 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from execution.order import Fill, OrderSide, OrderStatus, OrderType
+from execution.order_manager import OrderManager
+from risk.engine import RiskEngine
+from risk.types import AccountRiskState
 from strategies.base.signal import Action, Signal
 from strategies.base.strategy import BaseStrategy
 
 Bar = dict[str, Any]
+
+TradeRecord = dict[str, Any]
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,7 +56,7 @@ class BacktestResult:
 
     initial_equity: float
     final_equity: float
-    trades: list[dict[str, Any]] = field(default_factory=list)
+    trades: list[TradeRecord] = field(default_factory=list)
     equity_curve: list[float] = field(default_factory=list)
 
     @property
@@ -55,14 +66,25 @@ class BacktestResult:
 
 @dataclass(slots=True)
 class BacktestEngine:
-    """Simula una estrategia sobre datos históricos.
+    """Simula una estrategia sobre datos históricos a través del pipeline real.
 
     Args:
         costs: Supuestos de costes (documentar siempre).
-        slippage_random: reservado para modelos estocásticos en Milestone 2.
+        risk_engine: Autoridad de veto y sizing de cada intención.
+        order_manager: Registra y controla el ciclo de vida de las órdenes.
+        account_id: Cuenta representada en el backtest.
+        point_value: P&L monetario por unidad de precio (sizing fixed-fractional).
+        min_size: Cantidad mínima operada; por debajo no se crea orden.
+        max_bars_in_trade: Regla temporal de salida (None = solo stop).
     """
 
     costs: ExecutionCosts
+    risk_engine: RiskEngine
+    order_manager: OrderManager
+    account_id: str = "BACKTEST-01"
+    point_value: float = 1.0
+    min_size: float = 0.0
+    max_bars_in_trade: int | None = None
     seed: int | None = None
 
     def run(self, strategy: BaseStrategy, bars: list[Bar]) -> BacktestResult:
@@ -70,91 +92,186 @@ class BacktestEngine:
         if len(bars) < 2:
             raise ValueError("Se necesitan al menos 2 barras para ejecutar")
 
-        equity = self.costs.initial_equity
-        curve: list[float] = [equity]
-        trades: list[dict[str, Any]] = []
+        realized = 0.0
+        curve: list[float] = [self.costs.initial_equity]
+        trades: list[TradeRecord] = []
 
-        position_qty: float = 0.0
-        position_entry: float | None = None
-        position_side: str | None = None
-        turnover_counter = 0
+        quantity = 0.0
+        entry: float | None = None
+        side: str | None = None
+        stop: float | None = None
+        entry_idx: int | None = None
+        pending = None
+        per_side = self.costs.per_side_cost
 
-        for i in range(len(bars) - 1):
-            current = bars[i]
-            nxt = bars[i + 1]
-
-            visible = bars[: i + 1]
-            signal = strategy.generate_signal(visible)
-
-            fill_price = float(nxt["open"])
-            per_side = self.costs.per_side_cost
-
-            if signal.action is not Action.NO_TRADE and position_qty == 0:
-                side = "LONG" if signal.action is Action.LONG else "SHORT"
-                size = _sanitize_quantity(signal.target_quantity, equity, fill_price)
-                exec_price = fill_price + per_side if side == "LONG" else fill_price - per_side
-                position_qty = size
-                position_entry = exec_price
-                position_side = side
-                equity -= size * per_side
-                turnover_counter += 1
-                trades.append({"signal": signal, "entry_price": exec_price, "side": side})
-
-            elif signal.action is not Action.NO_TRADE and position_qty != 0:
-                close_price = (
-                    fill_price - per_side if position_side == "LONG" else fill_price + per_side
+        for i, bar in enumerate(bars):
+            if pending is not None:
+                quantity, entry, side, stop, entry_idx = self._fill(
+                    pending, float(bar["open"]), per_side, i, bar["ts"]
                 )
-                pnl = (close_price - position_entry) * position_qty if position_side == "LONG" \
-                    else (position_entry - close_price) * position_qty
-                equity += pnl - abs(position_qty) * per_side
-                trades[-1]["exit_price"] = close_price
-                trades[-1]["pnl"] = pnl
-                trades[-1]["exit_time"] = nxt.get("ts")
+                trades.append(
+                    {
+                        "strategy_id": pending.strategy_id,
+                        "strategy_version": pending.strategy_version,
+                        "instrument": pending.instrument,
+                        "side": side,
+                        "quantity": quantity,
+                        "entry_price": entry,
+                        "entry_time": bar["ts"],
+                        "entry_index": i,
+                        "stop": stop,
+                    }
+                )
+                pending = None
 
-                side = "LONG" if signal.action is Action.LONG else "SHORT"
-                size = _sanitize_quantity(signal.target_quantity, equity, fill_price)
-                exec_price = fill_price + per_side if side == "LONG" else fill_price - per_side
-                position_qty = size
-                position_entry = exec_price
-                position_side = side
-                equity -= size * per_side
-                turnover_counter += 1
-                trades.append({"signal": signal, "entry_price": exec_price, "side": side})
+            if quantity != 0.0:
+                exit_plan = self._evaluate_exit(
+                    bar, side, stop, per_side, i, entry_idx
+                )
+                if exit_plan is not None:
+                    exit_price, reason = exit_plan
+                    pnl = (exit_price - entry) * quantity * (1 if side == "LONG" else -1)
+                    realized += pnl
+                    trades[-1].update(
+                        exit_price=exit_price,
+                        exit_time=bar.get("ts"),
+                        exit_index=i,
+                        exit_reason=reason,
+                        pnl=pnl,
+                    )
+                    quantity = 0.0
+                    entry = None
+                    side = None
+                    stop = None
+                    entry_idx = None
 
-            if position_qty and position_side:
-                close = float(nxt["close"])
-                unrealized = (close - position_entry) * position_qty if position_side == "LONG" \
-                    else (position_entry - close) * position_qty
-                curve.append(equity + unrealized)
+            if quantity != 0.0:
+                close = float(bar["close"])
+                unrealized = (close - entry) * quantity * (1 if side == "LONG" else -1)
+                curve.append(self.costs.initial_equity + realized + unrealized)
             else:
-                curve.append(equity)
+                curve.append(self.costs.initial_equity + realized)
 
-        if position_qty and position_side:
-            last = bars[-1]["close"]
-            per_side = self.costs.per_side_cost
-            exit_price = last - per_side if position_side == "LONG" else last + per_side
-            pnl = (exit_price - position_entry) * position_qty if position_side == "LONG" \
-                else (position_entry - exit_price) * position_qty
-            equity += pnl - abs(position_qty) * per_side
-            trades[-1]["exit_price"] = exit_price
-            trades[-1]["pnl"] = pnl
-            trades[-1]["exit_time"] = bars[-1].get("ts")
+            if quantity == 0.0 and i < len(bars) - 1:
+                order = self._plan_order(
+                    strategy, bars[: i + 1], curve[-1], realized, bar["ts"]
+                )
+                if order is not None:
+                    pending = order
 
-        curve[-1] = equity
+        if quantity != 0.0:
+            bar = bars[-1]
+            close = float(bar["close"])
+            exit_price = self._exit_price(side, close, per_side)
+            pnl = (exit_price - entry) * quantity * (1 if side == "LONG" else -1)
+            realized += pnl
+            trades[-1].update(
+                exit_price=exit_price,
+                exit_time=bar.get("ts"),
+                exit_index=len(bars) - 1,
+                exit_reason="END",
+                pnl=pnl,
+            )
+
+        curve[-1] = self.costs.initial_equity + realized
         return BacktestResult(
             initial_equity=self.costs.initial_equity,
-            final_equity=equity,
+            final_equity=self.costs.initial_equity + realized,
             trades=trades,
             equity_curve=curve,
         )
 
+    def _fill(
+        self,
+        order,
+        open_price: float,
+        per_side: float,
+        index: int,
+        ts: str,
+    ) -> tuple[float, float, str, float | None, int]:
+        side = "LONG" if order.side is OrderSide.BUY else "SHORT"
+        fill_price = self._entry_price(side, open_price, per_side)
+        filled = self.order_manager.apply_fill(
+            order.order_id,
+            Fill(
+                order_id=order.order_id,
+                quantity=order.quantity,
+                price=fill_price,
+                commission=0.0,
+                slippage=per_side if per_side else None,
+            ),
+        )
+        return filled.fill_quantity, fill_price, side, order.stop_price, index
 
-def _sanitize_quantity(target_quantity, equity: float, price: float) -> float:
-    """Cantidad con las que operar en ausencia de RiskEngine.
+    def _evaluate_exit(
+        self,
+        bar: Bar,
+        side: str | None,
+        stop: float | None,
+        per_side: float,
+        index: int,
+        entry_idx: int | None,
+    ) -> tuple[float, str] | None:
+        low = float(bar["low"])
+        high = float(bar["high"])
 
-    IMPORTANTE: en producción la cantidad SIEMPRE la determina el RiskEngine.
-    Este valor (1 unidad) es un placeholder del simulador para el MVP.
-    """
-    if target_quantity is None or target_quantity <= 0:
-        return 1.0
-    return float(target_quantity)
+        if side == "LONG" and stop is not None and low <= stop:
+            return self._exit_price(side, stop, per_side), "STOP"
+        if side == "SHORT" and stop is not None and high >= stop:
+            return self._exit_price(side, stop, per_side), "STOP"
+        snapped = index - entry_idx if entry_idx is not None else 0
+        if (
+            self.max_bars_in_trade is not None
+            and snapped >= self.max_bars_in_trade
+        ):
+            close = float(bar["close"])
+            return self._exit_price(side, close, per_side), "TIME"
+        return None
+
+    def _plan_order(
+        self,
+        strategy: BaseStrategy,
+        visible: list[Bar],
+        equity: float,
+        realized: float,
+        bar_ts: str,
+    ):
+        signal = strategy.generate_signal(visible)
+        if signal.action is Action.NO_TRADE:
+            return None
+
+        state = AccountRiskState(
+            equity=equity,
+            balance=self.costs.initial_equity,
+            open_positions=0,
+            current_daily_pnl=realized,
+            current_drawdown=0.0,
+        )
+        decision = self.risk_engine.validate(
+            signal, state, point_value=self.point_value
+        )
+        if not decision.approved or decision.approved_quantity < self.min_size:
+            return None
+
+        side = OrderSide.BUY if signal.action is Action.LONG else OrderSide.SELL
+        client_order_id = f"{signal.strategy_id}:{signal.instrument}:{bar_ts}"
+        order = self.order_manager.create_order(
+            strategy_id=signal.strategy_id,
+            strategy_version=signal.strategy_version,
+            account_id=self.account_id,
+            instrument=signal.instrument,
+            side=side,
+            quantity=decision.approved_quantity,
+            order_type=OrderType.MARKET,
+            client_order_id=client_order_id,
+            stop_price=signal.stop_price,
+        )
+        self.order_manager.approve(order.order_id)
+        self.order_manager.submit(order.order_id)
+        return order
+
+    def _entry_price(self, side: str | None, price: float, per_side: float) -> float:
+        return price + per_side if side == "LONG" else price - per_side
+
+    def _exit_price(self, side: str | None, price: float, per_side: float) -> float:
+        return price - per_side if side == "LONG" else price + per_side

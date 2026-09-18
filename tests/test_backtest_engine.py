@@ -1,11 +1,20 @@
-"""Tests del motor de backtest (backtesting/engine.py)."""
+"""Tests del motor de backtest (backtesting/engine.py).
+
+Verifican mecánica básica de ejecución con el pipeline completo
+(única posición activa, entrada en open[t+1], salida por stop/END).
+Las propiedades e2e del primer experimento viven en
+test_experiment_pipeline.py.
+"""
 
 from __future__ import annotations
 
 import pytest
 
 from backtesting.engine import BacktestEngine, ExecutionCosts
+from execution.order_manager import OrderManager
 from reporting.metrics import calculate_metrics
+from risk.engine import RiskEngine
+from risk.types import RiskConfig
 from strategies.base.signal import Action, Signal
 from strategies.base.strategy import BaseStrategy, StrategyMetadata
 
@@ -28,15 +37,15 @@ class AlwaysLong(BaseStrategy):
     )
 
     def generate_signal(self, data) -> Signal:
-        last = data[-1]["close"]
+        last = float(data[-1]["close"])
         return Signal(
             strategy_id=self.metadata.strategy_id,
             strategy_version=self.metadata.version,
             instrument=self.metadata.instrument,
             action=Action.LONG,
-            reference_price=float(last),
-            stop_price=float(last) - 1.0,
-            target_quantity=1,
+            reference_price=last,
+            stop_price=last - 10.0,
+            target_quantity=None,
         )
 
 
@@ -54,20 +63,32 @@ class NoTrade(BaseStrategy):
     )
 
     def generate_signal(self, data) -> Signal:
-        last = data[-1]["close"]
+        last = float(data[-1]["close"])
         return Signal(
             strategy_id=self.metadata.strategy_id,
             strategy_version=self.metadata.version,
             instrument=self.metadata.instrument,
             action=Action.NO_TRADE,
-            reference_price=float(last),
+            reference_price=last,
         )
 
 
 def _engine(**cost_kwargs) -> BacktestEngine:
+    """Engine con sizing que produce cantidades pequeñas y estables.
+
+    risk_per_trade=1e-5 sobre 100k → cap $1; distancia de stop 10 pts y
+    point_value 1 → qty 0.1 (> min_size 0.05).
+    """
     defaults = dict(initial_equity=100_000.0)
     defaults.update(cost_kwargs)
-    return BacktestEngine(costs=ExecutionCosts(**defaults))
+    risk = RiskEngine(config=RiskConfig(risk_per_trade=1e-5))
+    return BacktestEngine(
+        costs=ExecutionCosts(**defaults),
+        risk_engine=risk,
+        order_manager=OrderManager(),
+        point_value=1.0,
+        min_size=0.05,
+    )
 
 
 class TestEngineExecution:
@@ -121,7 +142,7 @@ class TestMetrics:
         assert metrics.max_drawdown > 0.0
         assert metrics.net_return < 0.0
 
-    def test_trade_count_matches(self) -> None:
+    def test_trade_count_matches_single_position(self) -> None:
         bars = [_bar(100, 1), _bar(101, 2), _bar(102, 3)]
         result = _engine().run(AlwaysLong(), bars)
-        assert len(result.trades) == 2
+        assert len(result.trades) == 1

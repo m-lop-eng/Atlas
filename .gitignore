@@ -45,6 +45,9 @@ config/production/local.*
 logs/
 *.log
 
+# Resultados de experimentos (generados; reproducibles desde config.yaml)
+experiments/*/outputs/
+
 # SO
 Thumbs.db
 .DS_Store
