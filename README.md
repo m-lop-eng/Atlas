@@ -68,9 +68,11 @@ No hay ejecución real de órdenes todavía (solo `development`/backtest).
   y `tests/test_evidence.py`.
 * Nuevo: `research/decisions/H004B_PRE_REGISTRATION.json` — esquema **congelado
   antes de ejecutar** de H004-B como DIAGNOSTICO (no ciclo de rendimiento):
-  12 ventanas trimestrales re-ancladas 2021-04→2024-04, `fixed-parameter`,
-  criterios de lectura pre-escritos. Estado `PRE_REGISTERED`, ejecución
-  `PENDING` (requiere autorización; no se corre todavía).
+  12 ventanas trimestrales re-ancladas 2021-04→2024-04, `fixed-parameter`
+  (estrategia fija × ventana, NO walk-forward que recalibre), semántica de
+  límites `[start,end)` igual a e9/e10, criterios de lectura pre-escritos y
+  validación mecánica en `tests/test_h004b_scheme.py`. Estado `PRE_REGISTERED`,
+  ejecución `PENDING` (requiere autorización; no se corre todavía).
 * Nuevo: `experiments/e10_h005_w2_diagnosis.py` y `research/decisions/H005_W2_DIAGNOSIS.json`
   (causa de W2: beta direccional adversa del filtro LONG en un bear estructural, ver más abajo).
 * Nuevo: `research/data_role.py` (rol `DEVELOPMENT/VALIDATION/FINAL_OOS/OBSERVED`
