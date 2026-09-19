@@ -58,8 +58,10 @@ Arquitectura, motor de backtest, riesgo, ejecución, diagnóstico por trade,
 controles nulos, lineage de experimentos y datos reales funcionando.
 No hay ejecución real de órdenes todavía (solo `development`/backtest).
 
-* Última sesión: ciclo **H004 (walk-forward de parámetros fijos)**.
+* Última sesión: ciclo **H004 (walk-forward de parámetros fijos)** + **diagnóstico H005-W2** (causa del fallo 2022).
 * Suite de tests: **210 passed** (`python -m pytest`).
+* Nuevo: `experiments/e10_h005_w2_diagnosis.py` y `research/decisions/H005_W2_DIAGNOSIS.json`
+  (causa de W2: beta direccional adversa del filtro LONG en un bear estructural, ver más abajo).
 * Nuevo: `research/data_role.py` (rol `DEVELOPMENT/VALIDATION/FINAL_OOS/OBSERVED`
   + guard anti-reutilización de OOS), `research/data_roles.json`,
   `experiments/e9_h004_walk_forward.py` y `tests/test_data_role.py`.
@@ -99,6 +101,7 @@ python data/market.py kraken  XXBTZUSD 60 2019-01-01
 | **H002** | ¿Existe asimetría LONG vs SHORT? | `RESEARCH_REQUIRED` (observación persistente) | `research/decisions/H002_LONG_SHORT_ASYMMETRY.json` |
 | **H003** | ¿Breakout LONG o beta de BTC? | `RESEARCH_REQUIRED` (Caso A: timing preliminar, no beta pura) | `research/decisions/H003_BREAKOUT_VS_BUYHOLD.json` |
 | **H004** | ¿Es estable temporalmente el timing LONG? | `RESEARCH_REQUIRED` (ventaja en 4/4 validaciones pero inestable) | `research/decisions/H004_WALK_FORWARD.json` |
+| **H005-W2** | ¿Qué característica del entorno de 2022 explica la pérdida? | `RESEARCH_REQUIRED` (causa documentada: beta direccional adversa) | `research/decisions/H005_W2_DIAGNOSIS.json` |
 
 * **H001**: en sintético (GBM) breakout ≈ random; en BTC 1h real breakout > random
   pero sin edge neto con solo 30 días. No se optimizaron parámetros.
@@ -127,6 +130,19 @@ python data/market.py kraken  XXBTZUSD 60 2019-01-01
   dataset (`DEVELOPMENT/VALIDATION/FINAL_OOS/OBSERVED`) y el `guard_final_oos`
   impide presentar el tramo OBSERVED (2024-10→2026-08) como OOS desconocido.
   No hay FINAL_OOS limpio: requiere datos nuevos antes de declararlo.
+* **H005-W2**: **diagnóstico de la causa de W2 (2022)** con config congelada.
+  Conclusión: W2 no invalida el edge, lo expone. La pérdida (-12.0%, PF 0.84)
+  procede de **beta direccional adversa** (mercado -64.5% en 2022), no de:
+  trades extremos (bottom-5 = 6.6% del gross-, stop medio *menor* que el resto),
+  costes (0.09% del equity) ni un evento concentrado (7/12 meses negativos).
+  Evidencia: win rate 23% (vs 26-32%), avg win $2.280 (vs hasta $5.819), MFE/MAE
+  1.42 (el más bajo) con mediana MFE < MAE (sin follow-through alcista), TIME-exits
+  ganan 78% (vs 87-91% en W1/W3/W4). Operando **ambas** direcciones 2022 ≈ -2.7%
+  (PF 0.98): la lógica breakout no desaparece; el filtro LONG concentra el riesgo
+  en un bear. Incluso perdiendo, LONG supera a B&H puro (-64%), B&H escalado
+  (-13%) y control neutral (-30%) dentro de W2. **Implicación**: limitación
+  estructural es la restricción LONG (H002). Sin cambio de estrategia (prohibido
+  hasta FINAL_OOS limpio).
 
 ### Cómo retomar
 
@@ -135,16 +151,21 @@ python -m pytest                                     # 210 tests (baseline de re
 python experiments/e7_h002_asymmetry.py              # H002 train/test + métricas
 python experiments/e8_h003_breakout_vs_buyhold.py    # H003 A-E: benchmarks/régimen/decisión
 python experiments/e9_h004_walk_forward.py           # H004: walk-forward fijo + DATA_ROLE + decisión
+python experiments/e10_h005_w2_diagnosis.py          # H005-W2: causa del fallo 2022 (diagnóstico)
 python experiments/post_mortem.py <report1.json> <report2.json>
 python experiments/e6_real_market.py                 # breakout vs controles (real)
 ```
 
-**Siguiente paso acordado — H005 (o H004-B):** antes de otro ciclo,
-(1) ampliar datos para declarar y **proteger** un `FINAL_OOS` limpio;
-(2) analizar por qué W2 (2022) falla en los tres regímenes (volatilidad, costes,
-rachas); (3) opcional H004-B con más folds/re-anclaje de ventanas, siempre
-`fixed-parameter`. **Nunca** reutilizar 2024–2026 como OOS ni optimizar
-lookback/ATR/stops/SMA.
+**Siguiente paso acordado — H004-B o nueva hipótesis (según decisión):**
+causa de W2 documento (beta direccional adversa del filtro LONG en bears).
+Antes de otro ciclo:
+(1) ampliar datos para declarar y **proteger** un `FINAL_OOS` limpio
+    (`FINAL_OOS` hoy en estado `BLOCKED_BY_DATA_AVAILABILITY`: binance.vision aún
+    no publica el dump mensual de 2026-09; el feed corta en 2026-08-31);
+(2) decidir entre H004-B (más folds/re-anclaje de ventanas, siempre
+    `fixed-parameter`) o una hipótesis formal sobre dirección por régimen,
+    pre-registrada y evaluada SOLO contra el FINAL_OOS limpio.
+**Nunca** reutilizar 2024–2026 como OOS ni optimizar lookback/ATR/stops/SMA.
 
 ### Métricas y análisis
 
@@ -164,5 +185,6 @@ requisito para pasar de BTC a EURUSD/NQ/ES.
 ## Próximos hitos
 
 Según `00_MASTER_SPECIFICATION.md`; el foco inmediato es ampliar datos para un
-`FINAL_OOS` limpio y entender la inestabilidad de W2 (2022), no más complejidad
-estratégica ni optimización.
+`FINAL_OOS` limpio (bloqueado por el calendario del proveedor, no por Atlas) y
+decidir entre H004-B o una hipótesis de dirección por régimen con la causa de W2
+documentada. No más complejidad estratégica ni optimización.
