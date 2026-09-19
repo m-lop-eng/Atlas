@@ -1,0 +1,52 @@
+{
+  "hypothesis": "H003",
+  "title": "Breakout LONG vs Buy & Hold: beta de BTC o señal de timing?",
+  "strategy": "ATLAS_FIRST_BREAKOUT",
+  "status": "RESEARCH_REQUIRED",
+  "decided_at": "2026-09-19",
+  "reason": "El breakout LONG supera al B&H puro (lejano en rentabilidad bruta pero con la mitad de drawdown), supera al B&H escalado a la misma exposición de capital (H003-C), y supera al control de exposición temporal neutra (H003-E) tanto en train como en test. La ventaja persiste por regímenes excepto BULL-test. Es evidencia preliminar de timing, no beta pura.",
+  "observation": {
+    "method": "Split temporal 75/25 ALREADY OBSERVED by H002 (test no es desconocido). TRATAMIENTO IDENTICO a H002-A (direction=long): cero parámetros tocados (lookback/ATR/stop/risk/entradas intactos).",
+    "annualization": "retorno simple por barra (1h), Sharpe/Sortino/vol con sqrt(8766)/año; CAGR sobre 365.25 dias.",
+    "train": {
+      "breakout_long": {"net_return": 8.284, "cagr": 0.4739, "max_drawdown": 0.3491, "sharpe": 1.62, "sortino": 1.44, "return_over_dd": 23.73, "exposure_time": 0.388, "trades": 757},
+      "buy_and_hold": {"net_return": 15.985, "cagr": 0.6373, "max_drawdown": 0.7720, "sharpe": 1.08, "return_over_dd": 20.71, "exposure_time": 1.0, "trades": 1},
+      "bnh_exposure_scaled": {"net_return": 4.498, "max_drawdown": 0.6785, "capital_exposure": 0.281},
+      "exposure_matched_neutral": {"net_return": 1.429, "max_drawdown": 0.1824, "exposure_time": 0.396},
+      "delta_vs_bh_scaled": 3.786,
+      "delta_vs_exposure_matched": 6.855,
+      "regime_net_usd": {"BULL": 392555.9, "BEAR": 114616.1, "LATERAL": 321273.0},
+      "regime_positive": ["BULL", "BEAR", "LATERAL"]
+    },
+    "test": {
+      "breakout_long": {"net_return": 0.532, "cagr": 0.2496, "max_drawdown": 0.2209, "sharpe": 0.99, "sortino": 0.95, "return_over_dd": 2.41, "exposure_time": 0.409, "trades": 275},
+      "buy_and_hold": {"net_return": 0.250, "cagr": 0.1236, "max_drawdown": 0.5374, "sharpe": 0.48, "return_over_dd": 0.47, "exposure_time": 1.0, "trades": 1},
+      "bnh_exposure_scaled": {"net_return": 0.103, "max_drawdown": 0.3134, "capital_exposure": 0.411},
+      "exposure_matched_neutral": {"net_return": 0.301, "max_drawdown": 0.2611, "exposure_time": 0.417},
+      "delta_vs_bh_scaled": 0.429,
+      "delta_vs_exposure_matched": 0.231,
+      "regime_net_usd": {"BULL": -21605.9, "BEAR": 11307.1, "LATERAL": 63524.1},
+      "regime_positive": ["BEAR", "LATERAL"]
+    },
+    "contrast": {
+      "vs_buy_and_hold": "Breakout LONG rinde menos en bruto que B&H (train) por menor exposición, pero con ~mitad de drawdown y Sharpe mayor en train y test.",
+      "vs_exposure": "Con la MISMA exposición de capital (H003-C) el B&H negativo/escaso; con control de exposición temporal neutra (H003-E) el breakout gana en ambos períodos."
+    },
+    "caveat": "Test ya observado (H002): no tratarlo como OOS desconocido. Regimen BULL del test es el unico neto negativo del breakout. Data es un solo activo (BTC 1h), un solo regimen direccional alcista estructural; separar beta direccional requiere walk-forward y regimenes contrarios."
+  },
+  "evidence": {
+    "e8_script": "experiments/e8_h003_breakout_vs_buyhold.py",
+    "e8_output": "experiments/outputs/h003_breakout_vs_buyhold.json",
+    "benchmarking_module": "research/benchmarking.py",
+    "tests": "tests/test_benchmarking.py (10 nuevos)",
+    "dataset": "experiments/data/market_BTCUSDT_60min.csv",
+    "n_bars": 67141,
+    "engine_version": 2,
+    "tests_passing": 198
+  },
+  "decision_criteria_applied": "Caso A: ventaja vs exposicion comparable y vs control neutro en train y test, retorno/riesgo mayor; NO caso D porque regimen BULL-test es neto negativo.",
+  "optimization": "NOT_PERFORMED (prohibido hasta H004/OOS final)",
+  "oos": "OBSERVADO_75_25 (test reutilizado de H002; se protege de aqui en adelante)",
+  "production": "NOT_ELIGIBLE",
+  "next_step": "H004: robustez con walk-forward (TRAIN -> VALIDATION -> FINAL OOS), sin optimizar parametros; si la ventaja persiste vs B&H y control neutro en regimenes contrarios, plantear paper deployment. No reutilizar el test 2024-2026 para seleccionar variantes."
+}

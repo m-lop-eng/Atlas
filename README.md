@@ -58,8 +58,13 @@ Arquitectura, motor de backtest, riesgo, ejecución, diagnóstico por trade,
 controles nulos, lineage de experimentos y datos reales funcionando.
 No hay ejecución real de órdenes todavía (solo `development`/backtest).
 
-* Última sesión: `93f22db` — ciclo **H002 (Long/Short Asymmetry)**.
-* Suite de tests: **188 passed** (`python -m pytest`).
+* Última sesión: ciclo **H004 (walk-forward de parámetros fijos)**.
+* Suite de tests: **210 passed** (`python -m pytest`).
+* Nuevo: `research/data_role.py` (rol `DEVELOPMENT/VALIDATION/FINAL_OOS/OBSERVED`
+  + guard anti-reutilización de OOS), `research/data_roles.json`,
+  `experiments/e9_h004_walk_forward.py` y `tests/test_data_role.py`.
+* `research/benchmarking.py` (de H003): B&H normalizado, B&H por exposición,
+  control de exposición temporal neutra, régimen exógeno + `tests/test_benchmarking.py`.
 * Motor: `ENGINE_VERSION = 2` (reset diario de `max_daily_loss` + monetización
   por `point_value`; invariante para `point_value=1`, por eso el grafo H001
   conserva sus `experiment_id`).
@@ -92,6 +97,8 @@ python data/market.py kraken  XXBTZUSD 60 2019-01-01
 | --- | --- | --- | --- |
 | **H001** | ¿El breakout supera controles nulos? | `RESEARCH_REQUIRED` | `research/decisions/ATLAS_FIRST_BREAKOUT.json` |
 | **H002** | ¿Existe asimetría LONG vs SHORT? | `RESEARCH_REQUIRED` (observación persistente) | `research/decisions/H002_LONG_SHORT_ASYMMETRY.json` |
+| **H003** | ¿Breakout LONG o beta de BTC? | `RESEARCH_REQUIRED` (Caso A: timing preliminar, no beta pura) | `research/decisions/H003_BREAKOUT_VS_BUYHOLD.json` |
+| **H004** | ¿Es estable temporalmente el timing LONG? | `RESEARCH_REQUIRED` (ventaja en 4/4 validaciones pero inestable) | `research/decisions/H004_WALK_FORWARD.json` |
 
 * **H001**: en sintético (GBM) breakout ≈ random; en BTC 1h real breakout > random
   pero sin edge neto con solo 30 días. No se optimizaron parámetros.
@@ -99,19 +106,45 @@ python data/market.py kraken  XXBTZUSD 60 2019-01-01
   **persiste en OOS** (train +1170$ → test +252$). La señal bruta (gross) es
   positiva en el histórico profundo. **Caveat**: BTC 2019–2026 es alcista
   estructural → la asimetría puede ser beta direccional, no edge idiosincrático.
+* **H003**: tratamiento `direction=long` **idéntico** a H002-A (cero parámetros
+  tocados). Contra benchmark B&H (100% expuesto), B&H escalado a la misma
+  exposición de capital, y control de exposición temporal **neutra** a señales.
+  Breakout LONG > B&H-scaled y > control neutro en train **y** test, con ~mitad
+  de drawdown que B&H puro. Por régimen: neto positivo en bull/bear/lateral en
+  train; en test BULL es el único régimen neto negativo. **Conclusión**
+  `Caso A` (evidencia preliminar de timing) pero el test 2024–2026 ya fue
+  observado por H002 → no es OOS desconocido.
+* **H004**: **walk-forward de parámetros fijos** (sin recalibrar, sin seleccionar
+  por ventana). Config congelada = H002-A/H003-A (`params_hash` idéntico). Cuatro
+  validaciones ~1 año dentro de `DEVELOPMENT` (2021, 2022, 2023, 2024→oct).
+  Resultado: el breakout LONG supera al control neutro y al B&H escalado en
+  **4/4** ventanas (delta vs neutro +10 a +33 pp), `+ + - ++`, media +21.7%,
+  mediana +17.9%, 3/4 positivas. **Caveat**: W2 (2022) es netamente negativa en
+  bull+bear+lateral y W3 aporta el 63.7% del P&L positivo → robustez temporal
+  **no** demostrada pero tampoco rechazada. El fallo BULL de H003 no recurre de
+  forma sistemática (solo W2). `previous_oos_consumed=true`, `final_oos_consumed=false`.
+* **DATA_ROLE** (nuevo en H004): `research/data_role.py` etiqueta cada tramo del
+  dataset (`DEVELOPMENT/VALIDATION/FINAL_OOS/OBSERVED`) y el `guard_final_oos`
+  impide presentar el tramo OBSERVED (2024-10→2026-08) como OOS desconocido.
+  No hay FINAL_OOS limpio: requiere datos nuevos antes de declararlo.
 
 ### Cómo retomar
 
 ```powershell
-python -m pytest                                     # 188 tests (baseline de regresión)
+python -m pytest                                     # 210 tests (baseline de regresión)
 python experiments/e7_h002_asymmetry.py              # H002 train/test + métricas
+python experiments/e8_h003_breakout_vs_buyhold.py    # H003 A-E: benchmarks/régimen/decisión
+python experiments/e9_h004_walk_forward.py           # H004: walk-forward fijo + DATA_ROLE + decisión
 python experiments/post_mortem.py <report1.json> <report2.json>
 python experiments/e6_real_market.py                 # breakout vs controles (real)
 ```
 
-**Siguiente paso acordado — H003:** contrastar el sesgo LONG contra *buy & hold*
-y por régimen de mercado (bull/bear/lateral) para separar beta direccional de
-edge. **No** optimizar lookback/ATR/SMA/stops hasta entonces.
+**Siguiente paso acordado — H005 (o H004-B):** antes de otro ciclo,
+(1) ampliar datos para declarar y **proteger** un `FINAL_OOS` limpio;
+(2) analizar por qué W2 (2022) falla en los tres regímenes (volatilidad, costes,
+rachas); (3) opcional H004-B con más folds/re-anclaje de ventanas, siempre
+`fixed-parameter`. **Nunca** reutilizar 2024–2026 como OOS ni optimizar
+lookback/ATR/stops/SMA.
 
 ### Métricas y análisis
 
@@ -130,5 +163,6 @@ requisito para pasar de BTC a EURUSD/NQ/ES.
 
 ## Próximos hitos
 
-Según `00_MASTER_SPECIFICATION.md`; el foco inmediato es profundidad de datos y
-análisis de hipótesis (H003), no más complejidad estratégica ni optimización.
+Según `00_MASTER_SPECIFICATION.md`; el foco inmediato es ampliar datos para un
+`FINAL_OOS` limpio y entender la inestabilidad de W2 (2022), no más complejidad
+estratégica ni optimización.

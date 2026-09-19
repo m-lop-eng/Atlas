@@ -1,0 +1,28 @@
+{
+  "version": 1,
+  "chunks": [
+    {
+      "label": "development_2019_2024",
+      "start_epoch": 1546300800,
+      "end_epoch": 1727787600,
+      "role": "DEVELOPMENT",
+      "consumed": false,
+      "note": "2019-01-01 -> 2024-10-01. Train de H001-H003; el walk-forward de parametros fijos H004 se ancla aqui (train expandido + validaciones 2021-2024). NO se usa para calibracion."
+    },
+    {
+      "label": "observed_2024_2026",
+      "start_epoch": 1727787600,
+      "end_epoch": 1788217200,
+      "role": "OBSERVED",
+      "consumed": true,
+      "note": "2024-10-01 -> 2026-08-31. Test 75/25 YA usado por H002 (asimetria LONG/SHORT) y H003 (benchmarks). Atlas NO permite volver a presentarlo como FINAL_OOS (ver guard_final_oos)."
+    }
+  ],
+  "final_oos": null,
+  "notes": {
+    "previous_oos_consumed": true,
+    "final_oos_consumed": false,
+    "final_oos": "Sin datos posteriores a 2026-08 el tramo OBSERVED llega hasta el final de la serie. Se exige incorporar datos nuevos (>= 1 ano recomendado) antes de declarar un FINAL_OOS limpio.",
+    "semantics": "Roles: DEVELOPMENT (train/validacion), VALIDATION (sub-tramo WF), FINAL_OOS (reservado, una sola evaluacion), OBSERVED (ya usado como OOS; no presentable como desconocido)."
+  }
+}
