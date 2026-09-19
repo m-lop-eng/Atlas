@@ -58,8 +58,12 @@ Arquitectura, motor de backtest, riesgo, ejecución, diagnóstico por trade,
 controles nulos, lineage de experimentos y datos reales funcionando.
 No hay ejecución real de órdenes todavía (solo `development`/backtest).
 
-* Última sesión: ciclo **H004 (walk-forward de parámetros fijos)** + **diagnóstico H005-W2** (causa del fallo 2022) + capa formal **EVIDENCE** de estados de decisión y **pre-registro de H004-B congelado**.
-* Suite de tests: **224 passed** (`python -m pytest`).
+* Última sesión: **H004-B ejecutado** (diagnóstico de localización temporal, veredicto **SISTEMÁTICO**), sobre el pre-registro congelado.
+* Nuevo: `experiments/e11_h004b_diagnosis.py`, `experiments/outputs/h004b_diagnosis.json` y
+  `research/decisions/H004B_RESULT.json` (con el pre-registro embebido como prueba
+  de que el criterio existía antes de ver los números). `research/decisions/H004B_PRE_REGISTRATION.json`
+  queda en `estado: COMPLETE`.
+* Suite de tests: **232 passed** (`python -m pytest`).
 * Nuevo: `research/evidence.py` + `research/evidence.json` (estado de evidencia por
   hipótesis `HYPOTHESIS → RESEARCH_REQUIRED → ROBUSTNESS_SUPPORTED → FINAL_OOS_PENDING
   → FINAL_OOS_PASSED/FAILED → PAPER`, ciclo de vida de `FINAL_OOS`
@@ -115,7 +119,7 @@ python data/market.py kraken  XXBTZUSD 60 2019-01-01
 | **H003** | ¿Breakout LONG o beta de BTC? | `RESEARCH_REQUIRED` (Caso A: timing preliminar, no beta pura) | `research/decisions/H003_BREAKOUT_VS_BUYHOLD.json` |
 | **H004** | ¿Es estable temporalmente el timing LONG? | `RESEARCH_REQUIRED` (ventaja en 4/4 validaciones pero inestable) | `research/decisions/H004_WALK_FORWARD.json` |
 | **H005-W2** | ¿Qué característica del entorno de 2022 explica la pérdida? | `RESEARCH_REQUIRED` (causa documentada: beta direccional adversa) | `research/decisions/H005_W2_DIAGNOSIS.json` |
-| **H004-B** | ¿Es la inestabilidad LOCALIZADA (2022-2023) o SISTEMÁTICA? | `PRE_REGISTERED` (esquema congelado; NO ejecutado) | `research/decisions/H004B_PRE_REGISTRATION.json` |
+| **H004-B** | ¿Es la inestabilidad LOCALIZADA (2022-2023) o SISTEMÁTICA? | `COMPLETE` — **SISTEMÁTICO** (6/12 folds positivas, 3 vecindades negativas) | `research/decisions/H004B_RESULT.json` |
 
 * **H001**: en sintético (GBM) breakout ≈ random; en BTC 1h real breakout > random
   pero sin edge neto con solo 30 días. No se optimizaron parámetros.
@@ -144,6 +148,15 @@ python data/market.py kraken  XXBTZUSD 60 2019-01-01
   dataset (`DEVELOPMENT/VALIDATION/FINAL_OOS/OBSERVED`) y el `guard_final_oos`
   impide presentar el tramo OBSERVED (2024-10→2026-08) como OOS desconocido.
   No hay FINAL_OOS limpio: requiere datos nuevos antes de declararlo.
+* **H004-B** (ejecutado): **estrategia fija × 12 ventanas trimestrales re-ancladas**
+  (2021-04 → 2024-04), cold-start por ventana, sin recalibración ni selección.
+  Resultado trimestral: `-4.6 +5.4 -9.5 -4.3 -14.4 -3.6 +11.1 +56.4 +4.3 -24.5 +25.9 +23.0`
+  (2021Q2→2024Q1), media +5.4%, mediana +0.3%, **6/12 positivas** y **3 vecindades
+  negativas** (2021Q2 · 2021Q4→2022Q3 · 2023Q3). A la granularidad trimestral la
+  inestabilidad **no se localiza** en 2022-2023: es un patrón recurrente
+  intercalado con trimestres fuertes (`+56.4%` en 2023Q1). VEREDICTO pre-registrado:
+  **SISTEMÁTICO**. Diagnóstico de ubicación: no modifica la estrategia, no abre
+  H006, no desbloquea el FINAL_OOS.
 * **H005-W2**: **diagnóstico de la causa de W2 (2022)** con config congelada.
   Conclusión: W2 no invalida el edge, lo expone. La pérdida (-12.0%, PF 0.84)
   procede de **beta direccional adversa** (mercado -64.5% en 2022), no de:
@@ -166,17 +179,16 @@ python experiments/e7_h002_asymmetry.py              # H002 train/test + métric
 python experiments/e8_h003_breakout_vs_buyhold.py    # H003 A-E: benchmarks/régimen/decisión
 python experiments/e9_h004_walk_forward.py           # H004: walk-forward fijo + DATA_ROLE + decisión
 python experiments/e10_h005_w2_diagnosis.py          # H005-W2: causa del fallo 2022 (diagnóstico)
+python experiments/e11_h004b_diagnosis.py            # H004-B: localización temporal (SISTEMÁTICO)
 python experiments/post_mortem.py <report1.json> <report2.json>
 python experiments/e6_real_market.py                 # breakout vs controles (real)
 ```
 
-**Siguiente paso acordado — H004-B pre-registrado (esquema congelado, sin ejecutar):**
-causa de W2 documentada (beta direccional adversa del filtro LONG en bears).
-`research/decisions/H004B_PRE_REGISTRATION.json` congela el diseño de H004-B:
-12 trimestres re-anclados (2021-04 → 2024-04) en `fixed-parameter`, criterios
-`LOCALIZADO` / `SISTEMÁTICO` / `INCONCLUSO` escritos antes de correr. NO se
-ejecutará hasta autorización explícita, y sus resultados irán a una decisión
-separada sin tocar el pre-registro. Antes de otro ciclo:
+**Siguiente paso acordado — H004-B ejecutado; decisión madre pendiente del FINAL_OOS limpio:**
+causa de W2 documentada (beta direccional adversa del filtro LONG en bears) y la
+inestabilidad temporal, a granularidad trimestral, es **SISTEMÁTICA** (no se localiza
+en 2022-2023; 6/12 folds positivas, 3 vecindades negativas). H004-B fue diagnóstico:
+**no** justifica por sí mismo modificar la estrategia. Antes de otro ciclo:
 (1) ampliar datos para declarar y **proteger** un `FINAL_OOS` limpio
     (`FINAL_OOS` hoy en estado `BLOCKED_BY_DATA_AVAILABILITY`: binance.vision aún
     no publica el dump mensual de 2026-09; el feed corta en 2026-08-31;

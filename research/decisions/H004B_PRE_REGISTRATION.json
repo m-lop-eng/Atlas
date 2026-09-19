@@ -6,7 +6,7 @@
   "clasificacion": "DIAGNOSTICO",
   "tipo_de_ejercicio": "EVALUACION_DE_ESTRATEGIA_FIJA_POR_VENTANA",
   "nota_sobre_tipo": "El boceto inicial rotulaba el eje como TRAIN -> VALIDATION; ese rotulo se corrige: NO hay walk-forward que recalibre (no hay train que seleccione ni recalibracion por ventana). Es la ESTRATEGIA CONGELADA evaluada sobre 12 ventanas independientes (fixed strategy x window), mismas metricas y benchmarks que e9/e10. El historico previo solo es el necesario para el warm-up de indicadores, computado por el engine en frio al inicio de cada ventana, identico a e9 _run(cfg, valid_bars).",
-  "estado": "PRE_REGISTERED",
+  "estado": "COMPLETE",
   "ciclo_estado": ["PRE_REGISTERED", "VALIDATED", "AUTHORIZED", "RUN_IN_PROGRESS", "COMPLETE"],
   "estrategia": {
     "fuente": "experiments/h002/config.yaml",
@@ -114,9 +114,9 @@
     ]
   },
   "ejecucion": {
-    "estado": "PENDING",
+    "estado": "COMPLETE",
     "autorizacion_requerida": true,
     "gate": "Se corre unicamente si: (a) la validacion mecanica pasa, (b) el esquema sigue identico a este archivo, (c) hay autorizacion explicita. Tras el run los resultados van a una decision separada (H004B_RESULT) sin modificar este archivo.",
-    "note": "Pre-registrado y congelado. No ejecutado."
+    "note": "Ejecutado una unica vez (veredicto en H004B_RESULT). El esquema, criterios y configuracion no fueron modificados."
   }
 }
