@@ -1,0 +1,40 @@
+{
+  "version": 1,
+  "dataset": {
+    "observed_through": 1788217200,
+    "observed_through_iso": "2026-08-31T23:00:00Z",
+    "final_oos": {
+      "status": "BLOCKED_BY_DATA_AVAILABILITY",
+      "minimum_start": 1788220800,
+      "minimum_start_iso": "2026-09-01T00:00:00Z",
+      "note": "El dataset BTC 1h (binance.vision) llega hasta 2026-08-31T23:00Z. No existen barras posteriores: binance.vision aun no publica el dump mensual de 2026-09 (404). Un FINAL_OOS solo puede formarse con datos nuevos (>= 2026-09-01T00:00Z), jamas reutilizando el tramo OBSERVED 2024-10->2026-08. Cuando el dump aparezca: ampliar dataset (nuevo manifest + sha256) y desbloquear via EvidenceRegistry.unblock_final_oos."
+    }
+  },
+  "hypotheses": {
+    "H001": {
+      "state": "RESEARCH_REQUIRED",
+      "decided_at": "2026-09-19T00:00:00Z",
+      "note": "Breakout vs controles nulos: edge bruto pero sin neto en 30 dias; no se optimizo."
+    },
+    "H002": {
+      "state": "RESEARCH_REQUIRED",
+      "decided_at": "2026-09-19T00:00:00Z",
+      "note": "Asimetria LONG/SHORT persiste en OOS; caveat: BTC 2019-2026 alcista estructural, la asimetria puede ser beta."
+    },
+    "H003": {
+      "state": "RESEARCH_REQUIRED",
+      "decided_at": "2026-09-19T00:00:00Z",
+      "note": "Breakout LONG > B&H escalado y > control neutro en train y test; Caso A timing preliminar; test 2024-2026 ya observado."
+    },
+    "H004": {
+      "state": "RESEARCH_REQUIRED",
+      "decided_at": "2026-09-19T00:00:00Z",
+      "note": "Walk-forward fixed-parameter: 4/4 ventanas superan neutral y B&H escalado pero W2 (2022) es neta en los 3 regimenes y W3 concentra 63.7% del P&L positivo."
+    },
+    "H005": {
+      "state": "RESEARCH_REQUIRED",
+      "decided_at": "2026-09-19T00:00:00Z",
+      "note": "Diagnostico W2: causa = beta direccional adversa del filtro LONG en bear estructural (-64.5% en 2022), no trades extremos, costes ni evento concentrado. La logica breakout no desaparece (ambas direcciones ~ -2.7%). H006 NO abierto."
+    }
+  }
+}

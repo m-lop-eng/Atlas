@@ -1,0 +1,77 @@
+{
+  "id": "H004B_PRE_REGISTRATION",
+  "titulo": "Pre-registro: re-anclaje de ventanas temporales para diagnosticar la inestabilidad de H004",
+  "pregunta": "La inestabilidad observada en H004 (W2 neta en los 3 regimenes; W3 concentra 63.7% del P&L positivo) es un fenomeno LOCALIZADO en la vecindad 2022-2023 o aparece SISTEMATICAMENTE a traves de ventanas temporales?",
+  "clasificacion": "DIAGNOSTICO",
+  "estado": "PRE_REGISTERED",
+  "note": "Esquema congelado ANTES de ejecutar. Los criterios de lectura estan escritos aqui y no pueden cambiarse despues del run. No toca FINAL_OOS (BLOCKED_BY_DATA_AVAILABILITY) ni el tramo OBSERVED.",
+  "estrategia": {
+    "fuente": "experiments/h002/config.yaml",
+    "hash_config": "491ed76d79f1034452e98f72453141a4c69110cc8d487f166a89072df332687f",
+    "parametros_congelados": {
+      "lookback": 20,
+      "atr_period": 14,
+      "stop_atr_mult": 2.0,
+      "direction": "long",
+      "risk_per_trade": 0.01,
+      "initial_equity": 100000.0,
+      "max_bars_in_trade": 48,
+      "point_value": 1.0
+    },
+    "costes": {
+      "slippage_per_side": 0.0005,
+      "commission_per_side": 0.001
+    }
+  },
+  "diseno_de_folds": {
+    "tipo": "VENTANAS_TRIMESTRALES_RE_ANCLADAS",
+    "n_folds": 12,
+    "referencia": "12 trimestres calendario consecutivos 2021-Q2..2024-Q1 (3 anos completos): cubre la vecindad W2/W3 (2022-2023) con 8 folds de cobertura anual equivalente.",
+    "train": {
+      "tipo": "EXPANDING_DESDE_DATASET_START",
+      "inicio_epoch": 1546300800,
+      "iso_inicio": "2019-01-01T00:00:00Z"
+    },
+    "folds": [
+      {"fold": "F1", "label": "2021Q2", "start_epoch": 1617235200, "end_epoch": 1625097600},
+      {"fold": "F2", "label": "2021Q3", "start_epoch": 1625097600, "end_epoch": 1633046400},
+      {"fold": "F3", "label": "2021Q4", "start_epoch": 1633046400, "end_epoch": 1640995200},
+      {"fold": "F4", "label": "2022Q1", "start_epoch": 1640995200, "end_epoch": 1648771200},
+      {"fold": "F5", "label": "2022Q2", "start_epoch": 1648771200, "end_epoch": 1656633600},
+      {"fold": "F6", "label": "2022Q3", "start_epoch": 1656633600, "end_epoch": 1664582400},
+      {"fold": "F7", "label": "2022Q4", "start_epoch": 1664582400, "end_epoch": 1672531200},
+      {"fold": "F8", "label": "2023Q1", "start_epoch": 1672531200, "end_epoch": 1680307200},
+      {"fold": "F9", "label": "2023Q2", "start_epoch": 1680307200, "end_epoch": 1688169600},
+      {"fold": "F10", "label": "2023Q3", "start_epoch": 1688169600, "end_epoch": 1696118400},
+      {"fold": "F11", "label": "2023Q4", "start_epoch": 1696118400, "end_epoch": 1704067200},
+      {"fold": "F12", "label": "2024Q1", "start_epoch": 1704067200, "end_epoch": 1711929600}
+    ]
+  },
+  "metricas_por_fold": [
+    "net_return_pct",
+    "profit_factor",
+    "n_trades",
+    "delta_vs_neutral_pct",
+    "delta_vs_bh_scaled_pct",
+    "mfe_mae_ratio",
+    "time_exit_win_rate"
+  ],
+  "criterios_de_lectura_preregistrados": {
+    "LOCALIZADO": "Los folds negativos forman <=2 vecindades contiguas (un fold negativo adyacente a otro negativo cuenta como la misma vecindad) Y >=9/12 folds con net_return_pct > 0 Y delta_vs_neutral_pct > 0 en todo fold fuera de las vecindades negativas.",
+    "SISTEMATICO": ">=3 vecindades no contiguas de folds negativos O <=8/12 folds con net_return_pct > 0.",
+    "INCONCLUSO": "No se cumple LOCALIZADO ni SISTEMATICO (caso limite de frontera)."
+  },
+  "data_roles": {
+    "rango_total_diagnostico": {"start_epoch": 1617235200, "end_epoch": 1711929600},
+    "pertenece_a": "DEVELOPMENT",
+    "frontera_development": 1727787600,
+    "iso_frontera_development": "2024-10-01T00:00:00Z",
+    "guard_aplicados": ["guard_final_oos", "evidence.guard"],
+    "note": "Ningun fold toca el tramo OBSERVED (desde 2024-10-01) ni el FINAL_OOS. El run debe pasar el guard de DATA_ROLE + EVIDENCE antes de ejecutarse."
+  },
+  "ejecucion": {
+    "estado": "PENDING",
+    "autorizacion_requerida": true,
+    "note": "Pre-registrado y congelado. No ejecutado. No se corre hasta autorizacion explicita; tras el run, los resultados se escriben en una decision separada (H004B_RESULT) sin modificar este archivo."
+  }
+}
