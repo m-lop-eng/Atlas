@@ -25,6 +25,11 @@
     "both": {"train_net_return": 9.519, "test_net_return": 0.723}
   },
   "caveat": "BTC had a strong structural uptrend over 2019-2026, so a long-biased breakout can capture directional beta rather than an idiosyncratic edge. The asymmetry may be TREND/BETA, not skill. Breakout dominates the random control only on real data; it must be contrasted against buy&hold and market regimes before any directional conclusion.",
+  "temporal_stability_followup": {
+    "decided_at": "2026-09-19",
+    "source": "H004-B (research/decisions/H004B_RESULT.json)",
+    "note": "La ventaja LONG no es temporalmente estable: 6/12 folds trimestrales positivas, 3 vecindades negativas en 2021-2023, y la ventaja frente al control neutro no es consistente por ventana. Refuerza el caveat de que la asimetria puede ser beta direccional, no edge idiosincratico. No justifica pasar a BOTH ni a SHORT."
+  },
   "evidence": {
     "e7_script": "experiments/e7_h002_asymmetry.py",
     "e7_output": "experiments/outputs/h002_asymmetry.json",

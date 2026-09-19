@@ -119,7 +119,7 @@ python data/market.py kraken  XXBTZUSD 60 2019-01-01
 | **H003** | ¿Breakout LONG o beta de BTC? | `RESEARCH_REQUIRED` (Caso A: timing preliminar, no beta pura) | `research/decisions/H003_BREAKOUT_VS_BUYHOLD.json` |
 | **H004** | ¿Es estable temporalmente el timing LONG? | `RESEARCH_REQUIRED` (ventaja en 4/4 validaciones pero inestable) | `research/decisions/H004_WALK_FORWARD.json` |
 | **H005-W2** | ¿Qué característica del entorno de 2022 explica la pérdida? | `RESEARCH_REQUIRED` (causa documentada: beta direccional adversa) | `research/decisions/H005_W2_DIAGNOSIS.json` |
-| **H004-B** | ¿Es la inestabilidad LOCALIZADA (2022-2023) o SISTEMÁTICA? | `COMPLETE` — **SISTEMÁTICO** (6/12 folds positivas, 3 vecindades negativas) | `research/decisions/H004B_RESULT.json` |
+| **H004-B** | ¿Es la inestabilidad LOCALIZADA (2022-2023) o SISTEMÁTICA? | `RESEARCH_REQUIRED` — cierre: **SISTEMÁTICO** (inestabilidad temporal; 6/12 folds positivas) | `research/decisions/H004B_RESULT.json` |
 
 * **H001**: en sintético (GBM) breakout ≈ random; en BTC 1h real breakout > random
   pero sin edge neto con solo 30 días. No se optimizaron parámetros.

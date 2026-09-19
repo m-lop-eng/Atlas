@@ -58,7 +58,8 @@
   "decision_criteria_applied": {
     "state": "RESEARCH_REQUIRED",
     "criteria": "ROBUSTNESS_SUPPORTED exige mayoria de ventanas con ventaja vs neutral y B&H escalado, neto>0, BULL negativo no recurrente, >=2 regimenes positivos y ninguna ventana >60% del total positivo.",
-    "why_not_robust": "largest_window_share=0.637 (>0.60) y W2 sin neto positivo. " "why_not_rejected": "4/4 ventanas superan neutral y B&H escalado.",
+    "why_not_robust": "largest_window_share=0.637 (>0.60) y W2 sin neto positivo.",
+    "why_not_rejected": "4/4 ventanas superan neutral y B&H escalado.",
     "note": "Heuristica de contabilidad del grafo, no umbral de rentabilidad."
   },
   "evidence": {
@@ -71,5 +72,29 @@
     "engine_version": 2
   },
   "production": "NOT_ELIGIBLE",
-  "next_step": "Antes de mas ciclos: (1) ampliar datos para declarar un FINAL_OOS limpio y protegerlo; (2) analizar por que W2 (2022) falla en los tres regimenes (¿volatilidad/costes/rachas?); (3) evaluar una variante H004-B con re-anclaje de ventanas y mayor numero de folds (mas granularidad, mismo fixed-parameter). No reutilizar 2024-2026 como OOS ni optimizar parametros."
+  "next_step": "Antes de mas ciclos: (1) ampliar datos para declarar un FINAL_OOS limpio y protegerlo; (2) evaluar el FINAL_OOS SOLO contra la estrategia congelada (sin usarlo para elegir LONG/BOTH/regime filter); (3) recien entonces formular una nueva hipotesis (H006) si procede. H004-B ya respondio la pregunta de ubicacion: la inestabilidad es sistematica, no localizada en 2022. No reutilizar 2024-2026 como OOS ni optimizar parametros.",
+  "h004b_closure": {
+    "hypothesis_id": "H004-B",
+    "decided_at": "2026-09-19",
+    "verdict": "SYSTEMATIC (pre-registrado: LOCALIZADO / SISTEMATICO / INCONCLUSO)",
+    "temporal_stability": {
+      "verdict": "SYSTEMATIC_INSTABILITY",
+      "folds_positive": "6/12",
+      "median_return": "+0.3%",
+      "mean_return": "+5.4%",
+      "concentration": "HIGH",
+      "concentration_detail": "los 3 folds mas positivos (2023Q1 +56.4, 2023Q4 +25.9, 2024Q1 +23.0) suman ~83% del P&L positivo; la ventaja frente al control neutro no es consistente por ventana (en 2023Q4 y 2024Q1 el control neutro supero al breakout: -5.0pp y -17.9pp).",
+      "negative_windows": ["2021Q2", "2021Q4", "2022Q1", "2022Q2", "2022Q3", "2023Q3"],
+      "vecindades_negativas": 3
+    },
+    "statement": "Los resultados positivos agregados estan concentrados en pocas ventanas y la ventaja frente a los controles no es consistente por ventana: la hipotesis LONG-only NO presenta una ventaja temporal estable a traves de los 12 folds.",
+    "consequence": "Reduce la confianza en que el problema sea 'arreglar 2022'. La pregunta correcta deviene 'existe una senal generalizable detras del rendimiento observado?'. Estado de evidencia: RESEARCH_REQUIRED (NO se sube a ROBUSTNESS_SUPPORTED).",
+    "evidence_file": "research/decisions/H004B_RESULT.json",
+    "rules_untouched": {
+      "esquema": "congelado en H004B_PRE_REGISTRATION.json, sin modificacion",
+      "criterios": "evaluados tal como escritos antes de conocer los numeros",
+      "config": "hash 491ed76d... inmutado",
+      "no_se_hizo": "nada: ni seleccionar mejores trimestres, ni eliminar folds, ni filtro por regimen, ni re-escalado de riesgo"
+    }
+  }
 }
