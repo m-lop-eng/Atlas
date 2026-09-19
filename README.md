@@ -58,11 +58,12 @@ Arquitectura, motor de backtest, riesgo, ejecución, diagnóstico por trade,
 controles nulos, lineage de experimentos y datos reales funcionando.
 No hay ejecución real de órdenes todavía (solo `development`/backtest).
 
-* Última sesión: **H004-B ejecutado** (diagnóstico de localización temporal, veredicto **SISTEMÁTICO**), sobre el pre-registro congelado.
+* Última sesión: **H004-B ejecutado y cerrado formalmente** (diagnóstico de localización temporal, veredicto pre-registrado **SISTEMÁTICO**), sobre el esquema congelado. La evidencia de **inestabilidad temporal** (`SYSTEMATIC_INSTABILITY`) quedó incorporada al registro EVIDENCE y a las decisiones H004 y H002. Ningún esquema/criterio/config fue modificado por el resultado.
+* Nuevo (cierre H004-B): `research/evidence.json` registra **H004-B → `RESEARCH_REQUIRED`** con nota `SYSTEMATIC_INSTABILITY` (6/12 folds positivas, mediana +0.3%, media +5.4%, concentración ALTA, 3 vecindades negativas); notas de H004 y H002 ampliadas; `research/decisions/H004_WALK_FORWARD.json` incorpora `h004b_closure` embebiendo `temporal_stability`; `research/decisions/H002_LONG_SHORT_ASYMMETRY.json` añade `temporal_stability_followup` (la inestabilidad refuerza el caveat de beta direccional; no autoriza BOTH/SHORT). Ver `git log -1 fa8b51a`.
 * Nuevo: `experiments/e11_h004b_diagnosis.py`, `experiments/outputs/h004b_diagnosis.json` y
   `research/decisions/H004B_RESULT.json` (con el pre-registro embebido como prueba
   de que el criterio existía antes de ver los números). `research/decisions/H004B_PRE_REGISTRATION.json`
-  queda en `estado: COMPLETE`.
+  queda en `estado: COMPLETE` con esquema y criterios intactos.
 * Suite de tests: **232 passed** (`python -m pytest`).
 * Nuevo: `research/evidence.py` + `research/evidence.json` (estado de evidencia por
   hipótesis `HYPOTHESIS → RESEARCH_REQUIRED → ROBUSTNESS_SUPPORTED → FINAL_OOS_PENDING
@@ -75,8 +76,9 @@ No hay ejecución real de órdenes todavía (solo `development`/backtest).
   12 ventanas trimestrales re-ancladas 2021-04→2024-04, `fixed-parameter`
   (estrategia fija × ventana, NO walk-forward que recalibre), semántica de
   límites `[start,end)` igual a e9/e10, criterios de lectura pre-escritos y
-  validación mecánica en `tests/test_h004b_scheme.py`. Estado `PRE_REGISTERED`,
-  ejecución `PENDING` (requiere autorización; no se corre todavía).
+  validación mecánica en `tests/test_h004b_scheme.py`. Estado `COMPLETE`
+  (ejecutado; lifecycle `PRE_REGISTERED → AUTHORIZED/RUN_IN_PROGRESS → COMPLETE`,
+  esquema intacto).
 * Nuevo: `experiments/e10_h005_w2_diagnosis.py` y `research/decisions/H005_W2_DIAGNOSIS.json`
   (causa de W2: beta direccional adversa del filtro LONG en un bear estructural, ver más abajo).
 * Nuevo: `research/data_role.py` (rol `DEVELOPMENT/VALIDATION/FINAL_OOS/OBSERVED`
@@ -173,8 +175,13 @@ python data/market.py kraken  XXBTZUSD 60 2019-01-01
 
 ### Cómo retomar
 
+Punto de partida de la próxima sesión: **H004-B cerrado** (SISTEMÁTICO · inestabilidad temporal).
+Verificar que `research/evidence.json` mantiene H001–H005 y H004-B en `RESEARCH_REQUIRED`
+y `final_oos: BLOCKED_BY_DATA_AVAILABILITY` con `minimum_start=1788220800` (2026-09-01T00:00Z).
+No abrir H006 ni ejecutar experimentos nuevos antes de un FINAL_OOS limpio.
+
 ```powershell
-python -m pytest                                     # 224 tests (baseline de regresión)
+python -m pytest                                     # 232 tests (baseline de regresión)
 python experiments/e7_h002_asymmetry.py              # H002 train/test + métricas
 python experiments/e8_h003_breakout_vs_buyhold.py    # H003 A-E: benchmarks/régimen/decisión
 python experiments/e9_h004_walk_forward.py           # H004: walk-forward fijo + DATA_ROLE + decisión
@@ -184,19 +191,25 @@ python experiments/post_mortem.py <report1.json> <report2.json>
 python experiments/e6_real_market.py                 # breakout vs controles (real)
 ```
 
-**Siguiente paso acordado — H004-B ejecutado; decisión madre pendiente del FINAL_OOS limpio:**
-causa de W2 documentada (beta direccional adversa del filtro LONG en bears) y la
-inestabilidad temporal, a granularidad trimestral, es **SISTEMÁTICA** (no se localiza
-en 2022-2023; 6/12 folds positivas, 3 vecindades negativas). H004-B fue diagnóstico:
-**no** justifica por sí mismo modificar la estrategia. Antes de otro ciclo:
-(1) ampliar datos para declarar y **proteger** un `FINAL_OOS` limpio
-    (`FINAL_OOS` hoy en estado `BLOCKED_BY_DATA_AVAILABILITY`: binance.vision aún
-    no publica el dump mensual de 2026-09; el feed corta en 2026-08-31;
-    `research/evidence.json` registra `observed_through=2026-08-31T23:00Z` y
-    `minimum_start=2026-09-01T00:00Z`);
+**Siguiente paso acordado — H004-B cerrado; decisión madre pendiente del FINAL_OOS limpio:**
+la causa de W2 está documentada (beta direccional adversa del filtro LONG en bears) y la
+inestabilidad temporal, a granularidad trimestral, es **SISTEMÁTICA** (no se localiza en
+2022-2023; 6/12 folds positivas, 3 vecindades negativas: 2021Q2 · 2021Q4→2022Q3 · 2023Q3).
+Lección clave de H004-B: **los positivos se concentran en pocas ventanas (~83% en 3 folds) y
+la ventaja frente al control neutro no es consistente por ventana** (en 2023Q4 y 2024Q1 el
+control neutro superó al breakout). La hipótesis LONG-only **no** presenta ventaja temporal
+estable → la pregunta correcta ya no es "cómo hacer que LONG funcione mejor", sino
+"¿existe una señal generalizable detrás del rendimiento observado?". H004-B fue diagnóstico:
+**no** justifica modificar la estrategia, no abre H006 ni desbloquea el FINAL_OOS.
+Antes de otro ciclo:
+(1) comprobar si binance.vision ya publicó el dump mensual de 2026-09 (el feed corta en
+    2026-08-31; `research/evidence.json` registra `observed_through=2026-08-31T23:00Z` y
+    `minimum_start=2026-09-01T00:00Z`) y, si existe, declarar y **proteger** un `FINAL_OOS`
+    limpio con los datos nuevos (`estado` hoy: `BLOCKED_BY_DATA_AVAILABILITY`);
 (2) evaluar el FINAL_OOS limpio contra la estrategia **congelada** (sin tocar
     parámetros) y recién entonces abrir H006 si procede.
-**Nunca** reutilizar 2024–2026 como OOS ni optimizar lookback/ATR/stops/SMA.
+**Nunca** reutilizar 2024–2026 como OOS, seleccionar trimestres, filtrar por régimen ni
+optimizar lookback/ATR/stops/SMA.
 
 ### Métricas y análisis
 
@@ -217,6 +230,7 @@ requisito para pasar de BTC a EURUSD/NQ/ES.
 
 Según `00_MASTER_SPECIFICATION.md`; el foco inmediato es ampliar datos para un
 `FINAL_OOS` limpio (bloqueado por el calendario del proveedor, no por Atlas) y
-correr H004-B pre-registrado (diagnóstico de localización de la inestabilidad)
-y, tras el FINAL_OOS, decidir sobre dirección por régimen con la causa de W2
-documentada. No más complejidad estratégica ni optimización.
+decidir, tras el FINAL_OOS, si existe una señal generalizable (H006) con el
+diagnóstico H004-B (inestabilidad temporal SISTEMÁTICA) y la causa de W2
+(beta direccional adversa del filtro LONG) documentados. No más complejidad
+estratégica ni optimización.
