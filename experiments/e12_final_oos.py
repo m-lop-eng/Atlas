@@ -3,13 +3,22 @@
 `research/final_oos_pipeline.py` + `research/decisions/FINAL_OOS_PRE_REGISTRATION.json`
 fijan ANTES de ver numeros: rango, metricas, benchmarks, criterios y guards.
 
+SEMANTICA DEL DESBLOQUEO (congelada): la evaluacion se autoriza UNICAMENTE cuando el
+dataset de datos nuevos cubre [start_epoch, start_epoch + min_span) con
+start_epoch=1788220800 (2026-09-01T00:00Z) y min_span=31536000 (365 dias), es decir
+hasta >= 2027-09-01T00:00Z. LA APARICION DE UN ZIP MENSUAL CONCRETO (p. ej.
+BTCUSDT-1h-2026-09.zip) NO DESBLOQUEA EL FINAL_OOS: monthly/daily son solo mecanismos
+de adquisicion; la unidad relevante es el dataset congelado (CSV + manifest sha256).
+Hasta que el manifest no cubra [2026-09-01, 2027-09-01), el estado permanece
+BLOCKED_BY_DATA_AVAILABILITY (matriz verificada en tests/test_final_oos_semantics.py).
+
 Este runner tiene DOS modos:
 
 1) Preparacion (sin --authorize): valida el estado real del sistema y, si recibe
    --csv/--manifest, ejecuta TODO el protocolo sobre COPIES temporales de los
    registros (outputs/dry_run_*) para NO mutar evidence.json / data_roles.json.
-   Sin --csv/--manifest imprime solo el status (lo que corresponde hacer mientras
-   binance.vision no publique el dump 2026-09).
+   Sin --csv/--manifest imprime solo el status (lo que corresponde hacer mientras el
+   dataset nuevo no cubra [2026-09-01, 2027-09-01)).
 
 2) Autorizacion (--csv/--manifest --authorize): ejecuta el protocolo REAL con
    consumo irreversible (CONSUMED) y persiste evidence.json / data_roles.json.
@@ -217,7 +226,7 @@ def main(argv: list[str] | None = None) -> int:
     cfg = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8"))
 
     if not args.csv or not args.manifest:
-        print("E12 — RESTAURAR: sin dataset no hay FINAL_OOS (esperar dump mensual 2026-09).\n")
+        print("E12 — RESTAURAR: sin dataset no hay FINAL_OOS (requiere cobertura de datos nuevos [2026-09-01, 2027-09-01)).\n")
         _print_status(plan, cfg)
         if args.csv or args.manifest:
             raise SystemExit("[e12] se requiere --csv Y --manifest juntos")
