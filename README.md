@@ -58,13 +58,15 @@ Arquitectura, motor de backtest, riesgo, ejecución, diagnóstico por trade,
 controles nulos, lineage de experimentos y datos reales funcionando.
 No hay ejecución real de órdenes todavía (solo `development`/backtest).
 
-* Última sesión (`git log -1 21ae515`): **preparada la infraestructura del FINAL_OOS** (estado `BLOCKED_BY_DATA_AVAILABILITY`: requiere cobertura completa ≥ 365 días de datos nuevos, fin ≥ 2027-09-01 — ver «Semántica del FINAL_OOS»; el dump mensual 2026-09, aún 404, NO desbloquea el OOS): pre-registro congelado (`research/decisions/FINAL_OOS_PRE_REGISTRATION.json`, estado FROZEN, criterios de lectura NULL de falsación), config de ejecución congelada (`config/final_oos/config.yaml`, `config_hash=cb639bbf…`, strategy hash `491ed76d…` idéntico a H004/H004-B), pipeline mecánico (`research/final_oos_pipeline.py`) verificado por tests de integración con dataset sintético (`tests/test_final_oos_pipeline.py`) y validación mecánica del plan (`tests/test_final_oos_preregistration.py`), y runner `experiments/e12_final_oos.py` (modo status/preparación/autorización; el consumo es irreversible). Corregido además `data/quality.py` (`_ts_delta_seconds` ahora UTC-aware: los gaps de 1h ya no dependen del timezone/DST de la máquina). **Todo verificado y commiteado: 259 tests verdes, working tree limpio.**
+* Última sesión (`git log -1 066a00d`): **construcción del dataset FINAL_OOS con adquisición real + builder** — `research/final_oos_acquisition.py` conecta `FinalOosDatasetBuilder` con binance.vision **monthly preferred / daily fallback** y es **offline-first** (`data/raw/` como caché de inputs inmutables con sha256 → el dataset se reconstruye sin volver a la red). Devuelve `BLOCKED_BY_DATA_AVAILABILITY` o `ELIGIBLE_PARA_DRY_RUN` **sin nunca autorizar ni consumir** (adquisición ≠ autorización; verificado por `tests/test_final_oos_acquisition.py`: monthly completo sin daily innecesario, monthly 404→daily, combinación monthly+daily, gap real→BLOCKED sin rellenado, reproducibilidad idempotente, no consumo, no mutación de registros). Suite **293 tests verdes** (`python -m pytest`); el perímetro congelado del FINAL_OOS sigue intacto.
+* Sesión previa (`git log -1 c23cbd3`): **semántica del desbloqueo del FINAL_OOS** (min_span 365d: un zip mensual NO desbloquea; monthly/daily = solo adquisición) verificada por `tests/test_final_oos_semantics.py`.
+* Sesión previa (`git log -1 21ae515`): **infraestructura del FINAL_OOS** (estado `BLOCKED_BY_DATA_AVAILABILITY`: requiere cobertura completa ≥ 365 días de datos nuevos, fin ≥ 2027-09-01 — ver «Semántica del FINAL_OOS»; el dump mensual 2026-09, aún 404, NO desbloquea el OOS): pre-registro congelado (`research/decisions/FINAL_OOS_PRE_REGISTRATION.json`, estado FROZEN, criterios de lectura NULL de falsación), config de ejecución congelada (`config/final_oos/config.yaml`, `config_hash=cb639bbf…`, strategy hash `491ed76d…` idéntico a H004/H004-B), pipeline mecánico (`research/final_oos_pipeline.py`) verificado por tests de integración con dataset sintético (`tests/test_final_oos_pipeline.py`) y validación mecánica del plan (`tests/test_final_oos_preregistration.py`), y runner `experiments/e12_final_oos.py` (modo status/preparación/autorización; el consumo es irreversible). Corregido además `data/quality.py` (`_ts_delta_seconds` ahora UTC-aware).
 * Nuevo (cierre H004-B): `research/evidence.json` registra **H004-B → `RESEARCH_REQUIRED`** con nota `SYSTEMATIC_INSTABILITY` (6/12 folds positivas, mediana +0.3%, media +5.4%, concentración ALTA, 3 vecindades negativas); notas de H004 y H002 ampliadas; `research/decisions/H004_WALK_FORWARD.json` incorpora `h004b_closure` embebiendo `temporal_stability`; `research/decisions/H002_LONG_SHORT_ASYMMETRY.json` añade `temporal_stability_followup` (la inestabilidad refuerza el caveat de beta direccional; no autoriza BOTH/SHORT). Ver `git log -1 fa8b51a`.
 * Nuevo: `experiments/e11_h004b_diagnosis.py`, `experiments/outputs/h004b_diagnosis.json` y
   `research/decisions/H004B_RESULT.json` (con el pre-registro embebido como prueba
   de que el criterio existía antes de ver los números). `research/decisions/H004B_PRE_REGISTRATION.json`
   queda en `estado: COMPLETE` con esquema y criterios intactos.
-* Suite de tests: **267 passed** (`python -m pytest`).
+* Suite de tests: **293 passed** (`python -m pytest`).
 * Nuevo: `research/evidence.py` + `research/evidence.json` (estado de evidencia por
   hipótesis `HYPOTHESIS → RESEARCH_REQUIRED → ROBUSTNESS_SUPPORTED → FINAL_OOS_PENDING
   → FINAL_OOS_PASSED/FAILED → PAPER`, ciclo de vida de `FINAL_OOS`
@@ -99,8 +101,24 @@ el backtester no sabe de dónde vienen los datos.
 | --- | --- | --- |
 | `KrakenSource` | API pública Kraken | ~720 barras (~30 días) |
 | `BinanceVisionSource` | `data.binance.vision` (klines mensuales) | histórica completa |
+| `BinanceVisionDailySource` | `data.binance.vision` (klines diarias 1h) | mecanismo diario de adquisición |
 | `CsvSource` | CSV local normalizado | — |
 | `ParquetSource` | pyarrow (opcional, futuro) | — |
+
+El orquestador `research/final_oos_acquisition.py` (commit 3) automatiza la
+adquisición del dataset congelado del FINAL_OOS:
+
+```text
+Binance Vision → monthly (preferred) / daily (fallback)
+              → data/raw/ (inputs inmutables con sha256; offline-first)
+              → FinalOosDatasetBuilder (lee SOLO de data/raw/)
+              → quality + coverage + lineage → dataset congelado (CSV + manifest)
+              → BLOCKED_BY_DATA_AVAILABILITY | ELIGIBLE_PARA_DRY_RUN
+```
+
+`python research/final_oos_acquisition.py` reporta el estado (nunca autoriza ni
+consume: adquisición ≠ autorización; dataset disponible ≠ FINAL_OOS consumido;
+verificado por `tests/test_final_oos_acquisition.py`).
 
 Datasets (CSV gitignored; manifest JSON versionado):
 
@@ -228,7 +246,9 @@ Secuencia de retoma (en orden):
    `BLOCKED_BY_DATA_AVAILABILITY` y `config congelada ... SI`. Sin dataset con cobertura
    completa ≥ 365 días, aquí termina la sesión (no hay nada más que hacer: **no abrir H006**).
 3. Cuando el dataset nuevo cubra `[2026-09-01, 2027-09-01)` (última barra ≥
-   2027-08-31T23:00 UTC) → ampliarlo con los mecanismos de adquisición vigentes y repetir:
+   2027-08-31T23:00 UTC) → el orquestador de adquisición (`research/final_oos_acquisition.py`,
+   offline-first: reutiliza `data/raw/` sin red) construye el dataset congelado
+   (CSV + manifest sha256) y reporta `ELIGIBLE_PARA_DRY_RUN`; entonces
    `e12_final_oos.py --status` → `--dry-run` (sobre copias, nunca toca los
    registros reales) → autorización humana explícita (`estado: AUTHORIZED` en
    `FINAL_OOS_PRE_REGISTRATION.json`) → `e12_final_oos.py --csv <csv> --manifest <m> --authorize --yes-consume`

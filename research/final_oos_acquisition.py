@@ -1,0 +1,495 @@
+"""Adquisicion real del dataset FINAL_OOS: monthly preferred / daily fallback, OFFLINE-FIRST.
+
+Flujo (commit 3, sin tocar el protocolo estadistico ni consumir el FINAL_OOS)::
+
+    Binance Vision
+        |-- monthly (dumps mensuales)
+        `-- daily   (dumps diarios)
+              |
+              v
+    planificacion de archivos necesarios      (monthly preferred; daily fallback)
+              |
+              v
+    adquirir -> data/raw/ (cache de inputs INMUTABLES, sha256 por archivo)
+              |
+              v
+    manifest de inputs                        (reproducible: mismo raw -> mismo dataset)
+              |
+              v
+    FinalOosDatasetBuilder                     (OFFLINE: lee SOLO de data/raw/)
+              |
+              v
+    quality + coverage + lineage  ->  Frozen dataset (CSV + manifest sha256)
+              |
+              v
+    estado: BLOCKED_BY_DATA_AVAILABILITY | ELIGIBLE_PARA_DRY_RUN
+
+PRINCIPIOS (identicos a tests/test_final_oos_semantics.py):
+
+  * adquisicion != autorizacion: este modulo JAMAS consume el FINAL_OOS,
+    no ejecuta --authorize, no llama a run_final_oos y no muta
+    evidence.json / data_roles.json / el preregistro / la config.
+  * dataset disponible != FINAL_OOS consumido: ELIGIBLE_PARA_DRY_RUN significa
+    solo que la cobertura [start_epoch, end_epoch) esta completa y puede
+    pasarse a e12 --dry-run (que opera sobre COPIES temporales).
+  * Los zips de binance.vision son inputs inmutables y versionados (sha256):
+    una vez en data/raw/, el dataset se reconstruye SIN volver a internet
+    (dentro de un ano se puede reproducir el mismo CSV).
+  * No se "rellena" silenciosamente: cualquier hueco (archivo esperado que
+    no existe ni 404 produce datos) deja el estado BLOCKED_BY_DATA_AVAILABILITY.
+
+Este modulo no depende de la estrategia, no calibra parametros y no abre H006.
+"""
+
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
+from enum import Enum
+from pathlib import Path
+from typing import Any, Callable
+
+from data.sources import (
+    BINANCE_VISION_DAILY_KLINE_URL,
+    BINANCE_VISION_KLINE_URL,
+    BinanceVisionSource,
+    DataSource,
+    _http_get_bytes,
+    _sorted_unique_in_range,
+)
+from data.synthetic import sha256_of_file
+from research.final_oos_dataset import (
+    DatasetBuilderError,
+    FinalOosDatasetBuilder,
+    binsance_required_files,
+)
+
+
+class AcquisitionStatus(str, Enum):
+    """Estado de la adquisicion respecto al tramo objetivo.
+
+    - BLOCKED_BY_DATA_AVAILABILITY: la cobertura [start, end) esta incompleta
+      (mes/dia sin publicar, hueco real, o span menor que el minimo preregistrado).
+    - ELIGIBLE_PARA_DRY_RUN: el dataset congelado cubre [start, end) con calidad
+      y puede someterse al protocolo de PREPARACION (e12 --dry-run, sobre copias).
+    """
+
+    BLOCKED_BY_DATA_AVAILABILITY = "BLOCKED_BY_DATA_AVAILABILITY"
+    ELIGIBLE_PARA_DRY_RUN = "ELIGIBLE_PARA_DRY_RUN"
+
+
+@dataclass(frozen=True, slots=True)
+class RawInputRecord:
+    """Un input inmutable de la adquisicion (un zip de binance.vision).
+
+    `sha256` ancla el contenido: dos descargas del mismo archivo deben dar el
+    mismo hash; el dataset se reconstruye SOLO a partir de estos archivos.
+    """
+
+    kind: str  # 'monthly' | 'daily'
+    date_key: str  # '2026-09' | '2026-09-01'
+    url: str
+    local_path: str
+    sha256: str
+
+    def to_dict(self) -> dict:
+        return {
+            "kind": self.kind,
+            "date_key": self.date_key,
+            "url": self.url,
+            "sha256": self.sha256,
+        }
+
+
+class RawZipSource(DataSource):
+    """Fuente OFFLINE: lee zips locales (data/raw/) y los parsea a barras Atlas.
+
+    Igual parseo que BinanceVisionSource (klines binance.vision), pero sin red:
+    el orquestador garantiza que estos archivos ya existen y estan versionados.
+    """
+
+    def __init__(self, paths: list[str | Path]) -> None:
+        self.paths = [Path(p) for p in paths]
+
+    def fetch(self, start_epoch: int, end_epoch: int) -> list[dict]:
+        rows: list[dict] = []
+        for p in sorted(self.paths):
+            rows.extend(BinanceVisionSource._parse_zip(p.read_bytes()))
+        return [
+            b for b in _sorted_unique_in_range(rows, start_epoch, end_epoch)
+        ]
+
+
+class FinalOosAcquisition:
+    """Orquesta la adquisicion del dataset congelado (commit 3).
+
+    - Planifica los archivos necesarios: monthly preferred; cuando un mes NO
+      tiene dump mensual (aun no publicado, 404), cae a los daily de ese mes.
+    - Offline-first: si el input ya esta en `raw_dir`, no vuelve a la red
+      (reproducibilidad); si falta, lo descarga y lo versiona (sha256).
+    - Construye el dataset con FinalOosDatasetBuilder leyendo SOLO `raw_dir`.
+    - Devuelve un dict de estado (BLOCKED | ELIGIBLE) + lineage de inputs.
+    - NUNCA toca los registros reales ni el protocolo.
+    """
+
+    def __init__(
+        self,
+        *,
+        start_epoch: int,
+        end_epoch: int,
+        min_span_seconds: int,
+        symbol: str = "BTCUSDT",
+        interval: str = "1h",
+        interval_seconds: int = 3600,
+        raw_dir: str | Path = "data/raw",
+        out_dir: str | Path = "experiments/data/final_oos",
+        opener: Callable[[str, dict[str, Any]], bytes] | None = None,
+    ) -> None:
+        self.start_epoch = int(start_epoch)
+        self.end_epoch = int(end_epoch)
+        self.min_span_seconds = int(min_span_seconds)
+        self.symbol = symbol
+        self.interval = interval
+        self.interval_seconds = int(interval_seconds)
+        self.raw_dir = Path(raw_dir)
+        self.out_dir = Path(out_dir)
+        self._opener = (
+            opener if opener is not None else lambda url, kw: _http_get_bytes(url, **kw)
+        )
+        self._monthly_dir = self.raw_dir / "monthly"
+        self._daily_dir = self.raw_dir / "daily"
+
+    # ------------------------------------------------------------------
+    # Planificacion
+    # ------------------------------------------------------------------
+
+    def _month_url(self, year: int, month: int) -> str:
+        return BINANCE_VISION_KLINE_URL.format(
+            symbol=self.symbol, interval=self.interval, year=year, month=f"{month:02d}"
+        )
+
+    def _day_url(self, year: int, month: int, day: int) -> str:
+        return BINANCE_VISION_DAILY_KLINE_URL.format(
+            symbol=self.symbol,
+            interval=self.interval,
+            date=f"{year:04d}-{month:02d}-{day:02d}",
+        )
+
+    def _months_in_range(self) -> list[tuple[int, int]]:
+        start = datetime.fromtimestamp(self.start_epoch, tz=timezone.utc)
+        end = datetime.fromtimestamp(self.end_epoch - 1, tz=timezone.utc)
+        months: list[tuple[int, int]] = []
+        y, m = start.year, start.month
+        while (y, m) <= (end.year, end.month):
+            months.append((y, m))
+            y, m = (y + 1, 1) if m == 12 else (y, m + 1)
+        return months
+
+    def _days_in_range(self) -> list[tuple[int, int, int]]:
+        start = datetime.fromtimestamp(self.start_epoch, tz=timezone.utc)
+        end = datetime.fromtimestamp(self.end_epoch - 1, tz=timezone.utc)
+        days: list[tuple[int, int, int]] = []
+        cur = start
+        while cur.date() <= end.date():
+            days.append((cur.year, cur.month, cur.day))
+            cur = cur + timedelta(days=1)
+        return days
+
+    def required_files(self) -> dict[str, list[str]]:
+        """URLs ideales del tramo (monthly preferred). Lineage del plan."""
+        return binsance_required_files(
+            self.symbol, self.start_epoch, self.end_epoch, interval=self.interval
+        )
+
+    # ------------------------------------------------------------------
+    # Adquisicion (offline-first)
+    # ------------------------------------------------------------------
+
+    def _local_path(self, kind: str, url: str) -> Path:
+        name = url.rsplit("/", 1)[-1]
+        return (self._monthly_dir if kind == "monthly" else self._daily_dir) / name
+
+    def _obtain(self, kind: str, url: str) -> RawInputRecord | None:
+        """Offline-first: devuelve None si el archivo es 404 (no publicado).
+
+        Si el zip ya esta en la cache (con sha256 correcto) -> se reutiliza sin
+        red. Si no, se descarga, se guarda y se versiona.
+        """
+        local = self._local_path(kind, url)
+        if local.exists() and local.stat().st_size > 0:
+            return RawInputRecord(
+                kind=kind,
+                date_key=self._date_key(kind, url),
+                url=url,
+                local_path=str(local),
+                sha256=sha256_of_file(local),
+            )
+        try:
+            raw = self._opener(url, {"timeout": 90, "retries": 3})
+        except RuntimeError as exc:
+            if "404" in str(exc):
+                return None  # no publicado aun -> fallback/cobertura incompleta
+            raise
+        self._monthly_dir.mkdir(parents=True, exist_ok=True)
+        self._daily_dir.mkdir(parents=True, exist_ok=True)
+        local.write_bytes(raw)
+        return RawInputRecord(
+            kind=kind,
+            date_key=self._date_key(kind, url),
+            url=url,
+            local_path=str(local),
+            sha256=sha256_of_file(local),
+        )
+
+    @staticmethod
+    def _date_key(kind: str, url: str) -> str:
+        name = url.rsplit("/", 1)[-1]  # BTCUSDT-1h-2026-09.zip | ...-2026-09-01.zip
+        body = name.removesuffix(".zip")
+        parts = body.split("-")
+        if kind == "monthly":
+            y, m = parts[-2], parts[-1]
+            return f"{y}-{m}"
+        return "-".join(parts[-3:])
+
+    def _acquire_inputs(self) -> dict[str, Any]:
+        """Planifica y obtiene inputs. Returns las dos listas de zips locales."""
+        monthly: list[RawInputRecord] = []
+        daily: list[RawInputRecord] = []
+        months = self._months_in_range()
+
+        # monthly preferred: el primer mes sin dump mensual corta el monthly
+        monthly_tail_start: tuple[int, int] | None = None
+        for y, m in months:
+            rec = self._obtain("monthly", self._month_url(y, m))
+            if rec is None:
+                monthly_tail_start = (y, m)
+                break
+            monthly.append(rec)
+
+        # daily fallback: los dias de meses SIN monthly (cola no publicada)
+        if monthly_tail_start is not None:
+            for y, m, d in self._days_in_range():
+                if (y, m) < monthly_tail_start:
+                    continue  # ya cubierto por monthly
+                rec = self._obtain("daily", self._day_url(y, m, d))
+                if rec is None:
+                    # dia no publicado: se registra pipe al final del tramo
+                    continue
+                daily.append(rec)
+
+        return {
+            "monthly": monthly,
+            "daily": daily,
+            "monthly_tail_start": monthly_tail_start,
+        }
+
+    # ------------------------------------------------------------------
+    # Build (offline) + estado
+    # ------------------------------------------------------------------
+
+    def _build_dataset(
+        self, monthly: list[RawInputRecord], daily: list[RawInputRecord]
+    ) -> dict[str, Any]:
+        out_files = {
+            "csv": self.out_dir / f"{self.symbol}_final_oos.csv",
+            "manifest": self.out_dir / f"{self.symbol}_final_oos.manifest.json",
+        }
+        self.out_dir.mkdir(parents=True, exist_ok=True)
+
+        builder = FinalOosDatasetBuilder(
+            start_epoch=self.start_epoch,
+            end_epoch=self.end_epoch,
+            interval_seconds=self.interval_seconds,
+            symbol=self.symbol,
+        )
+        if monthly:
+            builder.add_source(
+                "monthly", RawZipSource([r.local_path for r in monthly]), kind="monthly"
+            )
+        if daily:
+            builder.add_source(
+                "daily", RawZipSource([r.local_path for r in daily]), kind="daily"
+            )
+        out = builder.build(out_files["csv"], out_files["manifest"])
+        return out
+
+    # ------------------------------------------------------------------
+    # Ejecucion
+    # ------------------------------------------------------------------
+
+    def acquired_inputs(self) -> list[RawInputRecord]:
+        return self.acquire()["inputs"]
+
+    def acquire(self) -> dict[str, Any]:
+        """Ejecuta la adquisicion completa y devuelve el estado.
+
+        Returns (dict):
+            status            AcquisitionStatus
+            reason            str (detal para BLOCKED)
+            inputs            list[RawInputRecord] (todos los zips usados)
+            manifest_inputs   basename del manifest de inputs escrito
+            dataset_sha256    hash del CSV del dataset (si se pudo construir)
+            dataset_bars      numero de barras
+            coverage          dict del builder (first/last/start/end)
+            eligible          bool: cubre [start, end) y span >= min_span
+            required_files    dict del plan ideal (lineage del tramo)
+        """
+        plan = self.required_files()
+        acquired = self._acquire_inputs()
+        monthly, daily = acquired["monthly"], acquired["daily"]
+        inputs = monthly + daily
+
+        # 1) manifest de inputs (lineage reproducible; sin timestamps volatiles)
+        inputs_manifest = {
+            "symbol": self.symbol,
+            "interval": self.interval,
+            "range": {
+                "start_epoch": self.start_epoch,
+                "end_epoch": self.end_epoch,
+            },
+            "inputs": sorted(
+                (r.to_dict() for r in inputs), key=lambda r: (r["kind"], r["date_key"])
+            ),
+        }
+        self.out_dir.mkdir(parents=True, exist_ok=True)
+        manifest_path = self.out_dir / "inputs.manifest.json"
+        manifest_path.write_text(
+            json.dumps(inputs_manifest, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+
+        # 2) build offline del dataset congelado (inmutable: si ya existe, no
+        #    se reconstruye; se devuelve el mismo artefacto: reproducibilidad)
+        existing = self._existing_dataset()
+        if existing is not None:
+            span_ok = (self.end_epoch - self.start_epoch) >= self.min_span_seconds
+            status = (
+                AcquisitionStatus.ELIGIBLE_PARA_DRY_RUN
+                if span_ok
+                else AcquisitionStatus.BLOCKED_BY_DATA_AVAILABILITY
+            )
+            return {
+                "status": status,
+                "reason": "dataset inmutable ya construido (reproducibilidad: se reutiliza)",
+                "inputs": inputs,
+                "manifest_inputs": manifest_path.name,
+                "dataset_sha256": existing["sha256"],
+                "dataset_bars": existing["bars"],
+                "coverage": existing["coverage"],
+                "eligible": span_ok,
+                "required_files": plan,
+                "build_error": None,
+            }
+
+        try:
+            build = self._build_dataset(monthly, daily)
+        except DatasetBuilderError as exc:
+            return {
+                "status": AcquisitionStatus.BLOCKED_BY_DATA_AVAILABILITY,
+                "reason": f"cobertura incompleta: {exc}",
+                "inputs": inputs,
+                "manifest_inputs": manifest_path.name,
+                "dataset_sha256": None,
+                "dataset_bars": None,
+                "coverage": None,
+                "eligible": False,
+                "required_files": plan,
+                "build_error": str(exc),
+            }
+
+        span_ok = (self.end_epoch - self.start_epoch) >= self.min_span_seconds
+        status = (
+            AcquisitionStatus.ELIGIBLE_PARA_DRY_RUN
+            if span_ok
+            else AcquisitionStatus.BLOCKED_BY_DATA_AVAILABILITY
+        )
+        reason = (
+            ""
+            if span_ok
+            else f"span {self.end_epoch - self.start_epoch}s < min_span {self.min_span_seconds}s"
+        )
+
+        return {
+            "status": status,
+            "reason": reason,
+            "inputs": inputs,
+            "manifest_inputs": manifest_path.name,
+            "dataset_sha256": build["sha256"],
+            "dataset_bars": build["bars"],
+            "coverage": build["coverage"],
+            "eligible": span_ok,
+            "required_files": plan,
+            "build_error": None,
+        }
+
+    def _existing_dataset(self) -> dict[str, Any] | None:
+        """Reutiliza un dataset congelado ya construido (inmutable).
+
+        La reconstruccion es idempotente: mismos inputs + misma config -> el
+        mismo CSV/sha256. Si el CSV ya existe, NO se re-descarga nada ni se
+        reconstruye: se devuelve el artefacto persistido (reproducibilidad).
+        """
+        csv_path = self.out_dir / f"{self.symbol}_final_oos.csv"
+        manifest_path = self.out_dir / f"{self.symbol}_final_oos.manifest.json"
+        if not (csv_path.exists() and manifest_path.exists()):
+            return None
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        return {
+            "sha256": manifest.get("sha256", sha256_of_file(csv_path)),
+            "bars": manifest.get("bars"),
+            "coverage": {
+                "first_ts": int(manifest["first_ts"]),
+                "last_ts": int(manifest["last_ts"]),
+                "start_epoch": self.start_epoch,
+                "end_epoch": self.end_epoch,
+            },
+        }
+
+
+def main(argv: list[str] | None = None) -> int:
+    """CLI de lectura: adquiere (o reusa cache) y reporta el estado.
+
+    NUNCA autoriza ni consume. Requiere el entorno normal de FINAL_OOS: los
+    anclas del tramo salen del preregistro congelado (solo lectura).
+    """
+    import argparse
+
+    ROOT = Path(__file__).resolve().parents[1]
+    plan_path = ROOT / "research" / "decisions" / "FINAL_OOS_PRE_REGISTRATION.json"
+    plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    esquema = plan["esquema"]
+
+    ap = argparse.ArgumentParser(description="E12 adquisicion: dataset FINAL_OOS (offline-first)")
+    ap.add_argument("--raw-dir", default=str(ROOT / "data" / "raw"))
+    ap.add_argument("--out-dir", default=str(ROOT / "experiments" / "data" / "final_oos"))
+    args = ap.parse_args(argv)
+
+    acq = FinalOosAcquisition(
+        start_epoch=int(esquema["start_epoch"]),
+        end_epoch=int(esquema["start_epoch"]) + int(esquema["min_span_seconds"]),
+        min_span_seconds=int(esquema["min_span_seconds"]),
+        interval_seconds=int(esquema["interval_seconds"]),
+        raw_dir=args.raw_dir,
+        out_dir=args.out_dir,
+    )
+    res = acq.acquire()
+
+    print(f"FINAL_OOS acquisition ........ {res['status'].value}")
+    if res["reason"]:
+        print(f"reason ....................... {res['reason']}")
+    print(f"inputs obtenidos ............. {len(res['inputs'])} ({res['manifest_inputs']})")
+    for r in sorted(res["inputs"], key=lambda x: (x.kind, x.date_key)):
+        print(f"  [{r.kind:7s}] {r.date_key}  {r.sha256[:12]}...")
+    if res["dataset_sha256"]:
+        print(f"dataset sha256 ............... {res['dataset_sha256'][:16]}... ({res['dataset_bars']} barras)")
+    print(f"elegible para dry-run ........ {'SI' if res['eligible'] else 'NO'}")
+    print("NOTA: esto NO consume el FINAL_OOS ni autoriza nada (verificar e12 --status)")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
