@@ -58,13 +58,13 @@ Arquitectura, motor de backtest, riesgo, ejecución, diagnóstico por trade,
 controles nulos, lineage de experimentos y datos reales funcionando.
 No hay ejecución real de órdenes todavía (solo `development`/backtest).
 
-* Última sesión: **H004-B ejecutado y cerrado formalmente** (diagnóstico de localización temporal, veredicto pre-registrado **SISTEMÁTICO**), sobre el esquema congelado. La evidencia de **inestabilidad temporal** (`SYSTEMATIC_INSTABILITY`) quedó incorporada al registro EVIDENCE y a las decisiones H004 y H002. Ningún esquema/criterio/config fue modificado por el resultado.
+* Última sesión: **preparada la infraestructura del FINAL_OOS** (esperando el dump mensual 2026-09 de binance.vision, que a fecha de hoy sigue 404): pre-registro congelado (`research/decisions/FINAL_OOS_PRE_REGISTRATION.json`, estado FROZEN, criterios de lectura NULL de falsación), config de ejecución congelada (`config/final_oos/config.yaml`, `config_hash=cb639bbf…`, strategy hash `491ed76d…` idéntico a H004/H004-B), pipeline mecánico (`research/final_oos_pipeline.py`) verificado por tests de integración con dataset sintético (`tests/test_final_oos_pipeline.py`) y validación mecánica del plan (`tests/test_final_oos_preregistration.py`), y runner `experiments/e12_final_oos.py` (modo status/preparación/autorización; el consumo es irreversible). Corregido además `data/quality.py` (`_ts_delta_seconds` ahora UTC-aware: los gaps de 1h ya no dependen del timezone/DST de la máquina).
 * Nuevo (cierre H004-B): `research/evidence.json` registra **H004-B → `RESEARCH_REQUIRED`** con nota `SYSTEMATIC_INSTABILITY` (6/12 folds positivas, mediana +0.3%, media +5.4%, concentración ALTA, 3 vecindades negativas); notas de H004 y H002 ampliadas; `research/decisions/H004_WALK_FORWARD.json` incorpora `h004b_closure` embebiendo `temporal_stability`; `research/decisions/H002_LONG_SHORT_ASYMMETRY.json` añade `temporal_stability_followup` (la inestabilidad refuerza el caveat de beta direccional; no autoriza BOTH/SHORT). Ver `git log -1 fa8b51a`.
 * Nuevo: `experiments/e11_h004b_diagnosis.py`, `experiments/outputs/h004b_diagnosis.json` y
   `research/decisions/H004B_RESULT.json` (con el pre-registro embebido como prueba
   de que el criterio existía antes de ver los números). `research/decisions/H004B_PRE_REGISTRATION.json`
   queda en `estado: COMPLETE` con esquema y criterios intactos.
-* Suite de tests: **232 passed** (`python -m pytest`).
+* Suite de tests: **259 passed** (`python -m pytest`).
 * Nuevo: `research/evidence.py` + `research/evidence.json` (estado de evidencia por
   hipótesis `HYPOTHESIS → RESEARCH_REQUIRED → ROBUSTNESS_SUPPORTED → FINAL_OOS_PENDING
   → FINAL_OOS_PASSED/FAILED → PAPER`, ciclo de vida de `FINAL_OOS`
@@ -175,13 +175,15 @@ python data/market.py kraken  XXBTZUSD 60 2019-01-01
 
 ### Cómo retomar
 
-Punto de partida de la próxima sesión: **H004-B cerrado** (SISTEMÁTICO · inestabilidad temporal).
+Punto de partida de la próxima sesión: **infraestructura FINAL_OOS lista; falta el dato**.
 Verificar que `research/evidence.json` mantiene H001–H005 y H004-B en `RESEARCH_REQUIRED`
 y `final_oos: BLOCKED_BY_DATA_AVAILABILITY` con `minimum_start=1788220800` (2026-09-01T00:00Z).
-No abrir H006 ni ejecutar experimentos nuevos antes de un FINAL_OOS limpio.
+Primer comando: `python experiments/e12_final_oos.py` (status). No abrir H006 ni ejecutar
+experimentos nuevos antes de un FINAL_OOS limpio.
 
 ```powershell
-python -m pytest                                     # 232 tests (baseline de regresión)
+python -m pytest                                     # 259 tests (baseline de regresión)
+python experiments/e12_final_oos.py                  # FINAL_OOS: status (BLOCKED hasta dump 2026-09)
 python experiments/e7_h002_asymmetry.py              # H002 train/test + métricas
 python experiments/e8_h003_breakout_vs_buyhold.py    # H003 A-E: benchmarks/régimen/decisión
 python experiments/e9_h004_walk_forward.py           # H004: walk-forward fijo + DATA_ROLE + decisión
@@ -191,7 +193,7 @@ python experiments/post_mortem.py <report1.json> <report2.json>
 python experiments/e6_real_market.py                 # breakout vs controles (real)
 ```
 
-**Siguiente paso acordado — H004-B cerrado; decisión madre pendiente del FINAL_OOS limpio:**
+**Siguiente paso acordado — infraestructura FINAL_OOS lista; falta el dato (calendario del proveedor):**
 la causa de W2 está documentada (beta direccional adversa del filtro LONG en bears) y la
 inestabilidad temporal, a granularidad trimestral, es **SISTEMÁTICA** (no se localiza en
 2022-2023; 6/12 folds positivas, 3 vecindades negativas: 2021Q2 · 2021Q4→2022Q3 · 2023Q3).
@@ -201,13 +203,26 @@ control neutro superó al breakout). La hipótesis LONG-only **no** presenta ven
 estable → la pregunta correcta ya no es "cómo hacer que LONG funcione mejor", sino
 "¿existe una señal generalizable detrás del rendimiento observado?". H004-B fue diagnóstico:
 **no** justifica modificar la estrategia, no abre H006 ni desbloquea el FINAL_OOS.
-Antes de otro ciclo:
-(1) comprobar si binance.vision ya publicó el dump mensual de 2026-09 (el feed corta en
-    2026-08-31; `research/evidence.json` registra `observed_through=2026-08-31T23:00Z` y
-    `minimum_start=2026-09-01T00:00Z`) y, si existe, declarar y **proteger** un `FINAL_OOS`
-    limpio con los datos nuevos (`estado` hoy: `BLOCKED_BY_DATA_AVAILABILITY`);
-(2) evaluar el FINAL_OOS limpio contra la estrategia **congelada** (sin tocar
-    parámetros) y recién entonces abrir H006 si procede.
+
+El protocolo del FINAL_OOS ya está congelado y verificado (nada dependió de números):
+1. `research/decisions/FINAL_OOS_PRE_REGISTRATION.json` (FROZEN) fija rango
+   `start=1788220800` (2026-09-01T00:00Z), `min_span=365 días`, hashes, 29 métricas,
+   benchmarks (B&H / B&H escalado / exposición temporal neutra) y criterios **NULL**
+   de falsación (net_return>0, PF≥1, expectancy>0, beats-neutral; single-shot).
+2. `research/final_oos_pipeline.py` + `tests/test_final_oos_pipeline.py` ejecutan toda la
+   cadena sobre dataset sintético: calidad → manifest sha256 → guards (OBSERVED, un solo
+   FINAL_OOS, sin doble ejecución, sin recalibración) → evaluación → reporte → consumo
+   irreversible. `tests/test_final_oos_preregistration.py` verifica los hashes del plan.
+3. `experiments/e12_final_oos.py` es el runner: sin dataset imprime status
+   (BLOCKED_BY_DATA_AVAILABILITY); con `--csv/--manifest` hace dry-run sobre copias
+   (nunca muta `evidence.json`/`data_roles.json`); con `--authorize --yes-consume`
+   ejecuta el protocolo real (requiere plan en `AUTHORIZED`) y escribe
+   `experiments/outputs/final_oos_report.json` + `research/decisions/FINAL_OOS_RESULT.json`.
+
+Cuando binance.vision publique el dump 2026-09: ampliar `experiments/data/` (nuevo
+manifest + sha256), ejecutar `python experiments/e12_final_oos.py --status`, revisar
+`--dry-run` y, tras autorización humana explícita (`estado: AUTHORIZED` en el plan),
+`--authorize --yes-consume`.
 **Nunca** reutilizar 2024–2026 como OOS, seleccionar trimestres, filtrar por régimen ni
 optimizar lookback/ATR/stops/SMA.
 

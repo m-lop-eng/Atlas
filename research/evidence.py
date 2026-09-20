@@ -259,6 +259,10 @@ class EvidenceRegistry:
                 f"FINAL_OOS no está bloqueado (estado {self.final_oos_status.value}): "
                 "nada que desbloquear."
             )
+        if end_epoch <= start_epoch:
+            raise EvidenceError(
+                f"Rango FINAL_OOS inválido: end {end_epoch} <= start {start_epoch}."
+            )
         minimum_start = self.dataset.final_oos.minimum_start
         if minimum_start is not None and start_epoch < minimum_start:
             raise EvidenceError(

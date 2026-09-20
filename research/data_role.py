@@ -183,6 +183,11 @@ class RoleRegistry:
                 raise DataRoleError(
                     f"'{label}' solapa el FINAL_OOS '{other.label}': reservado."
                 )
+            if role is DataRole.FINAL_OOS and other.role is DataRole.FINAL_OOS:
+                raise DataRoleError(
+                    f"'{label}' solapa el FINAL_OOS '{other.label}': solo existe "
+                    "UN FINAL_OOS y ya está reservado."
+                )
         rng = DataRange(
             label=label,
             start_epoch=int(start_epoch),
@@ -195,6 +200,12 @@ class RoleRegistry:
         return rng
 
     def declare_final_oos(self, label: str, start_epoch: int, end_epoch: int, *, note: str | None = None) -> DataRange:
+        """Declara el FINAL_OOS (único). Imposible declarar un segundo."""
+        if self.final_oos is not None:
+            raise DataRoleError(
+                f"Ya existe un FINAL_OOS ('{self.final_oos.label}'). Solo se "
+                "define una vez: no se admite un segundo FINAL_OOS."
+            )
         self.register(label, start_epoch, end_epoch, DataRole.FINAL_OOS, note=note)
         self.final_oos = self.chunks[label]
         return self.final_oos

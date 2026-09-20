@@ -1,0 +1,154 @@
+{
+  "id": "FINAL_OOS_PRE_REGISTRATION",
+  "titulo": "Pre-registro: evaluacion unica del FINAL_OOS limpio sobre datos nuevos (>= 2026-09-01)",
+  "pregunta": "La estrategia CONGELADA (breakout LONG, H002-A/H003/H004/H004-B, hash 491ed76d) presenta un edge NETO de costes sobre el tramo de datos NUEVOS, declarado como FINAL_OOS, frente a sus controles de exposicion (B&H, B&H escalado, exposicion temporal neutra)?",
+  "clasificacion": "EVALUACION_FINAL_OOS",
+  "no_reformula_la_pregunta": "Este pre-registro fija ANTES de ver numeros: la configuracion congelada, el rango, las metricas, los benchmarks y los criterios de lectura. Ninguno puede cambiarse tras la ejecucion. No optimiza, no selecciona trimestres, no filtra por regimen, no reanaliza H004/H004-B para 'hacer funcionar' la estrategia.",
+  "estado": "FROZEN",
+  "ciclo_estado": ["FROZEN", "AUTHORIZED", "RUN_IN_PROGRESS", "DECISION_DOCUMENTED", "CLOSED"],
+  "estrategia_congelada": {
+    "fuente": "config/final_oos/config.yaml",
+    "strategy_config_hash": "491ed76d79f1034452e98f72453141a4c69110cc8d487f166a89072df332687f",
+    "config_hash": "cb639bbf55f0b1f25aee21841b7291e0de7d8e360580090e9dd987fba6d9653c",
+    "params": {
+      "lookback": 20,
+      "atr_period": 14,
+      "stop_atr_mult": 2.0,
+      "direction": "long"
+    },
+    "parametros_efectivos": {
+      "lookback": 20,
+      "atr_period": 14,
+      "stop_atr_mult": 2.0,
+      "direction": "long",
+      "trend_filter": null,
+      "invert": false,
+      "risk_per_trade": 0.01,
+      "initial_equity": 100000.0,
+      "max_bars_in_trade": 48,
+      "point_value": 1.0,
+      "interval_seconds": 3600
+    },
+    "costes": {
+      "per_side": 0.15,
+      "slippage_per_side": 0.0005,
+      "commission_per_side": 0.001
+    },
+    "nota": "Identica configuracion que H004 y H004-B (mismo strategy_config_hash). Cualquier cambio de params, risk, costs o engine invalida este plan (guard mecanico imperativo)."
+  },
+  "esquema": {
+    "start_epoch": 1788220800,
+    "iso_start": "2026-09-01T00:00:00Z",
+    "interval_seconds": 3600,
+    "min_span_seconds": 31536000,
+    "min_span_hint": "365 dias",
+    "motivo_min_span": "research/data_roles.json exige 'datos nuevos (>= 1 ano recomendado)' antes de declarar un FINAL_OOS limpio. Un tramo mas corto no es representativo ni cubre un ciclo de regimen completo.",
+    "regla_de_fin": "end_epoch = (last_ts // interval_seconds + 1) * interval_seconds, donde last_ts es la ultima barra del dataset nuevo segun el manifest. Se exige end_epoch - start_epoch >= min_span_seconds; en caso contrario el FINAL_OOS permanece BLOCKED_BY_DATA_AVAILABILITY.",
+    "semantica_de_limite_inclusion": "MITAD_ABIERTA [start, end): una barra con open-time ts pertenece al FINAL_OOS sii start <= ts < end. Identica a _slice() de e9/e10/e11."
+  },
+  "benchmarks": {
+    "per_side": 0.15,
+    "initial_equity": 100000.0,
+    "point_value": 1.0,
+    "neutral_cycle_bars": 48,
+    "neutral_offset": 7,
+    "nota": "Identicos a H003/H004/H004-B: buy_and_hold (100% expuesto), exposure_scaled_buy_and_hold(exposure_frac = exposure_time * capital_exposure_cond), exposure_matched_long(target_exposure = exposure_time)."
+  },
+  "metricas_pre_registradas": [
+    "net_return",
+    "max_drawdown",
+    "profit_factor",
+    "expectancy",
+    "expectancy_e",
+    "win_rate",
+    "num_trades",
+    "avg_win",
+    "avg_loss",
+    "payoff_ratio",
+    "median_trade",
+    "trade_std",
+    "gross_profit",
+    "gross_loss",
+    "avg_mae",
+    "avg_mfe",
+    "mfe_mae_ratio",
+    "max_consecutive_wins",
+    "max_consecutive_losses",
+    "costs_total",
+    "equity_final",
+    "cagr",
+    "annual_volatility",
+    "sharpe",
+    "sortino",
+    "calmar",
+    "return_over_max_dd",
+    "exposure_time",
+    "capital_exposure_cond"
+  ],
+  "secciones_del_reporte": [
+    "hypothesis",
+    "method",
+    "lineage",
+    "dataset_integrity",
+    "metrics",
+    "curve_metrics",
+    "exposure",
+    "benchmarks",
+    "contrasts",
+    "reading",
+    "evidence",
+    "trades_summary"
+  ],
+  "criterios_de_lectura_preregistrados": {
+    "definiciones": {
+      "net_return": "reporting.curve_metrics.net_return sobre la curva de equity del FINAL_OOS (neto de costes).",
+      "profit_factor": "reporting.metrics.calculate_metrics.profit_factor (gross_wins / gross_losses).",
+      "expectancy": "reporting.metrics.calculate_metrics.expectancy (media del P&L neto por trade).",
+      "delta_vs_neutral_ret": "net_return(breakout) - net_return(control de exposicion temporal neutra) sobre el mismo tramo.",
+      "delta_vs_bh_scaled_ret": "net_return(breakout) - net_return(B&H escalado a la exposicion de capital del tratamiento).",
+      "mae_mfe": "reporting.metrics.avg_mae / avg_mfe (medias por trade, $ equivalentes)."
+    },
+    "primarios": {
+      "net_return_gt_zero": "net_return > 0",
+      "profit_factor_ge_one": "profit_factor is None or profit_factor >= 1 (None = sin perdidas)",
+      "expectancy_gt_zero": "expectancy is None or expectancy > 0 (None = involucra costo; se reporta)",
+      "beats_neutral_control": "delta_vs_neutral_ret > 0"
+    },
+    "precedencia": "Lectura single-shot: se genera el reporte COMPLETO y se lee una sola vez al final. Se reporta cada flag primario. Conclusion: NO_FALSADO si los 4 primarios cumplen; FALSADO si alguno no cumple (falsacion estricta: ser peor que no hacer nada en cualquier eje). Tras la lectura, la transicion de evidencia de la hipotesis madre sigue ALLOWED_TRANSITIONS de evidence.py; la ejecucion ya habra consumido (marcado CONSUMED) el FINAL_OOS, irreversible.",
+    "nota_no_sesgo": "Los primarios son criterios NULOS de falsacion (no peor que no hacer nada, con la misma exposicion). NO se definen umbrales de rentabilidad (PF>1.5, retorno minimo, drawdown maximo) que favorecerian un resultado; las cifras se leen del conjunto completo y se documentan sin reinterpretar."
+  },
+  "guard_mecanicos": [
+    "start_epoch >= minimum_start de evidence.json (1788220800)",
+    "end_epoch - start_epoch >= min_span_seconds (365 dias)",
+    "el rango NO puede solapar un tramo OBSERVED (guard_final_oos + register de data_role.py)",
+    "solo existe UN FINAL_OOS: no se puede declarar otro si ya existe uno (consumido o no)",
+    "no se puede ejecutar dos veces el mismo FINAL_OOS (mark_consumed es irreversible)",
+    "config_hash y strategy_config_hash deben coincidir con los congelados; params/risk/costs/engine iguales (sin recalibracion)",
+    "el dataset (sha256 + manifest) debe cubrir [start_epoch, end_epoch): primer bar <= start, ultima bar >= end - interval",
+    "calidad: resumen de data.quality sin issues (schema OHLC completo, high>=max(o,c), low<=min(o,c), sin ts duplicados, sin gaps > 3600s)",
+    "integro: reporte registra dataset (csv sha256 + manifest), hash de config, engine version y commit de codigo usado"
+  ],
+  "validacion_mecanica": {
+    "archivo": "tests/test_final_oos_preregistration.py",
+    "checks": [
+      "strategy_config_hash == make_config_hash(params de config/final_oos/config.yaml) == 491ed76d...",
+      "config_hash == make_config_hash(config completa)",
+      "params == los registrados",
+      "start_epoch == 1788220800 e iso_start coincide",
+      "min_span_seconds e interval_seconds fijados",
+      "todos los guard_mecanicos listados",
+      "metricas_pre_registradas y secciones_del_reporte no vacios"
+    ]
+  },
+  "ejecucion": {
+    "estado": "FROZEN",
+    "autorizacion_requerida": true,
+    "gate": "Se autoriza UNICAMENTE cuando el dataset del manifest cubra [start_epoch, start_epoch + min_span_seconds) y la validacion mecanica pase. Tras el run, los resultados van a una decision separada (se embebe este pre-registro como snapshot) y el FINAL_OOS queda CONSUMED. Este archivo nunca se modifica tras ver numeros.",
+    "referencias": {
+      "runner": "experiments/e12_final_oos.py",
+      "module": "research/final_oos_pipeline.py",
+      "tests_integracion": "tests/test_final_oos_pipeline.py",
+      "tests_preregistro": "tests/test_final_oos_preregistration.py"
+    }
+  }
+}

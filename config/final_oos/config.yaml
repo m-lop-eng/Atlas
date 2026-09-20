@@ -1,0 +1,53 @@
+experiment:
+  name: atlas-btc1h-final-oos
+  environment: BACKTEST
+  type: OOS
+  hypothesis: h004-timing-edge-oos
+  change: frozen (sin recalibracion, sin seleccion, sin optimizacion)
+  parent: null
+
+strategy:
+  strategy_id: atlas-breakout
+  strategy_name: "Atlas Breakout (BTC 1h, FINAL_OOS congelado)"
+  strategy_family: breakout
+  market: crypto
+  instrument: BTCUSDT
+  timeframe: 1h
+  version: 1.0.0
+  parameter_set_version: h2a
+  data_version: v2
+  params:
+    lookback: 20
+    atr_period: 14
+    stop_atr_mult: 2.0
+    direction: long
+
+risk:
+  risk_per_trade: 0.01
+  max_open_positions: 3
+  max_strategy_risk: 0.9
+  max_daily_loss: 0.05
+  max_drawdown: 0.2
+
+costs:
+  spread_ticks: 0
+  tick_size: 0
+  slippage_per_side: 0.05
+  commission_per_unit: 0.1
+  initial_equity: 100000
+
+engine:
+  account_id: BACKTEST-BTC1H-FINALOOS
+  point_value: 1.0
+  min_size: 0.001
+  max_bars_in_trade: 48
+
+# Configuracion CONGELADA para la unica evaluacion FINAL_OOS del tramo de
+# datos nuevos (desde 2026-09-01T00:00Z). Identica en params/coste/ejecucion a
+# H002-A/H003/H004/H004-B (strategy_config_hash 491ed76d...). Cualquier cambio
+# aqui invalida el pre-registro FINAL_OOS_PRE_REGISTRATION.json.
+dataset:
+  path: experiments/data/market_BTCUSDT_60min.csv
+  manifest: experiments/data/market_BTCUSDT_60min.manifest.json
+  interval_seconds: 3600
+  regenerate: true

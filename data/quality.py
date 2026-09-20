@@ -113,17 +113,24 @@ def summarize_quality(
 
 
 def _ts_delta_seconds(a, b) -> float:
-    """Diferencia en segundos entre dos representaciones de timestamp."""
-    from datetime import datetime
+    """Diferencia en segundos entre dos representaciones de timestamp.
+
+    Los epoch timestamps son UTC por definicion: se parsean con tz=UTC para que
+    el calculo NO dependa del timezone/DST de la maquina (de lo contrario un
+    salto de horario local falsifica gaps de +-3600s en barras 1h).
+    """
+    from datetime import datetime, timezone
 
     def parse(value):
         if isinstance(value, (int, float)):
-            return datetime.fromtimestamp(float(value))
+            return datetime.fromtimestamp(float(value), tz=timezone.utc)
         if isinstance(value, datetime):
+            if value.tzinfo is None:
+                return value.replace(tzinfo=timezone.utc)
             return value
         if isinstance(value, str):
             if value.isdigit():
-                return datetime.fromtimestamp(float(value))
+                return datetime.fromtimestamp(float(value), tz=timezone.utc)
             return datetime.fromisoformat(value.replace("Z", "+00:00"))
         raise TypeError(f"timestamp no soportado: {type(value)}")
 
