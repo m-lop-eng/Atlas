@@ -8,6 +8,8 @@ Proveedores (MVP → evolución):
     KrakenSource        : API pública de Kraken (profundidad ~30 días).
     BinanceVisionSource : dumps mensuales de klines 1h en data.binance.vision
                           (sin clave, sin geobloqueo) → histórico profundo.
+    BinanceVisionDaily  : dumps DIARIOS de klines 1h (mismo proveedor); mecanismo
+                          de adquisición alternativo al monthly (misma vela en ambos).
     CsvSource           : CSV local normalizado (datasets versionados/tests).
     ParquetSource       : futuro (requiere pyarrow como dependencia opcional).
 """
@@ -22,7 +24,7 @@ import urllib.request
 import zipfile
 from abc import ABC, abstractmethod
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 
@@ -32,6 +34,28 @@ BINANCE_VISION_KLINE_URL = (
     "https://data.binance.vision/data/spot/monthly/klines/"
     "{symbol}/{interval}/{symbol}-{interval}-{year}-{month}.zip"
 )
+
+BINANCE_VISION_DAILY_KLINE_URL = (
+    "https://data.binance.vision/data/spot/daily/klines/"
+    "{symbol}/{interval}/{symbol}-{interval}-{date}.zip"
+)
+
+
+def _sorted_unique_in_range(
+    bars: list[dict],
+    start_epoch: int,
+    end_epoch: int,
+) -> list[dict]:
+    """Ordena por ts, elimina duplicados exactos y filtra al rango [start, end]."""
+    seen: set[str] = set()
+    unique: list[dict] = []
+    for b in sorted(bars, key=lambda x: int(x["ts"])):
+        if b["ts"] not in seen:
+            seen.add(b["ts"])
+            unique.append(b)
+    return [
+        b for b in unique if start_epoch <= int(b["ts"]) <= end_epoch
+    ]
 
 
 def _http_get_bytes(
@@ -212,6 +236,66 @@ class BinanceVisionSource(DataSource):
         ]
 
 
+class BinanceVisionDailySource(DataSource):
+    """Klines spot 1h desde los dumps DIARIOS (data.binance.vision).
+
+    `https://data.binance.vision/data/spot/daily/klines/{symbol}/{interval}/...`
+    Descarga un zip por dia (YYYY-MM-DD), filtra por rango y normaliza a barras
+    Atlas. Es un mecanismo de adquisicion alternativo al monthly (misma vela
+    puede estar en ambos): el merge/dedupe lo resuelve la capa de dataset
+    (FinalOOSDatasetBuilder), no la fuente.
+    """
+
+    def __init__(
+        self,
+        symbol: str = "BTCUSDT",
+        interval: str = "1h",
+        url_template: str = BINANCE_VISION_DAILY_KLINE_URL,
+        opener: Callable[[str, dict[str, Any]], bytes] | None = None,
+    ) -> None:
+        self.symbol = symbol
+        self.interval = interval
+        self.url_template = url_template
+        self._opener = (
+            opener if opener is not None else lambda url, kw: _http_get_bytes(url, **kw)
+        )
+
+    def _day_url(self, year: int, month: int, day: int) -> str:
+        return self.url_template.format(
+            symbol=self.symbol,
+            interval=self.interval,
+            date=f"{year:04d}-{month:02d}-{day:02d}",
+        )
+
+    def _days(self, start_epoch: int, end_epoch: int):
+        start_dt = datetime.fromtimestamp(start_epoch, tz=timezone.utc)
+        end_dt = datetime.fromtimestamp(end_epoch, tz=timezone.utc)
+        day = start_dt.date()
+        last = end_dt.date()
+        while day <= last:
+            yield day.year, day.month, day.day
+            day = day + timedelta(days=1)
+
+    def fetch(self, start_epoch: int, end_epoch: int) -> list[dict]:
+        """Descarga cada dia en [start_epoch, end_epoch] y concatena.
+
+        Un 404 se interpreta como 'dia aún no publicado' y detiene la iteracion
+        (igual que monthly); el rango efectivo lo valida la calidad del dataset.
+        """
+        out: list[dict] = []
+        for year, month, day in self._days(start_epoch, end_epoch):
+            try:
+                raw = self._opener(
+                    self._day_url(year, month, day), {"timeout": 90, "retries": 3}
+                )
+            except RuntimeError as exc:
+                if "404" in str(exc):
+                    break  # dia en curso: dump aún no publicado
+                raise
+            out.extend(BinanceVisionSource._parse_zip(raw))
+        return _sorted_unique_in_range(out, start_epoch, end_epoch)
+
+
 class CsvSource(DataSource):
     """CSV local normalizado `ts,open,high,low,close,volume`."""
 
@@ -282,6 +366,7 @@ class ParquetSource(DataSource):
 SOURCES = {
     "kraken": KrakenSource,
     "binance": BinanceVisionSource,
+    "binance_daily": BinanceVisionDailySource,
     "csv": CsvSource,
     "parquet": ParquetSource,
 }
