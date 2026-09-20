@@ -58,7 +58,7 @@ Arquitectura, motor de backtest, riesgo, ejecución, diagnóstico por trade,
 controles nulos, lineage de experimentos y datos reales funcionando.
 No hay ejecución real de órdenes todavía (solo `development`/backtest).
 
-* Última sesión: **preparada la infraestructura del FINAL_OOS** (esperando el dump mensual 2026-09 de binance.vision, que a fecha de hoy sigue 404): pre-registro congelado (`research/decisions/FINAL_OOS_PRE_REGISTRATION.json`, estado FROZEN, criterios de lectura NULL de falsación), config de ejecución congelada (`config/final_oos/config.yaml`, `config_hash=cb639bbf…`, strategy hash `491ed76d…` idéntico a H004/H004-B), pipeline mecánico (`research/final_oos_pipeline.py`) verificado por tests de integración con dataset sintético (`tests/test_final_oos_pipeline.py`) y validación mecánica del plan (`tests/test_final_oos_preregistration.py`), y runner `experiments/e12_final_oos.py` (modo status/preparación/autorización; el consumo es irreversible). Corregido además `data/quality.py` (`_ts_delta_seconds` ahora UTC-aware: los gaps de 1h ya no dependen del timezone/DST de la máquina).
+* Última sesión (`git log -1 21ae515`): **preparada la infraestructura del FINAL_OOS** (esperando el dump mensual 2026-09 de binance.vision, que a fecha de hoy sigue 404): pre-registro congelado (`research/decisions/FINAL_OOS_PRE_REGISTRATION.json`, estado FROZEN, criterios de lectura NULL de falsación), config de ejecución congelada (`config/final_oos/config.yaml`, `config_hash=cb639bbf…`, strategy hash `491ed76d…` idéntico a H004/H004-B), pipeline mecánico (`research/final_oos_pipeline.py`) verificado por tests de integración con dataset sintético (`tests/test_final_oos_pipeline.py`) y validación mecánica del plan (`tests/test_final_oos_preregistration.py`), y runner `experiments/e12_final_oos.py` (modo status/preparación/autorización; el consumo es irreversible). Corregido además `data/quality.py` (`_ts_delta_seconds` ahora UTC-aware: los gaps de 1h ya no dependen del timezone/DST de la máquina). **Todo verificado y commiteado: 259 tests verdes, working tree limpio.**
 * Nuevo (cierre H004-B): `research/evidence.json` registra **H004-B → `RESEARCH_REQUIRED`** con nota `SYSTEMATIC_INSTABILITY` (6/12 folds positivas, mediana +0.3%, media +5.4%, concentración ALTA, 3 vecindades negativas); notas de H004 y H002 ampliadas; `research/decisions/H004_WALK_FORWARD.json` incorpora `h004b_closure` embebiendo `temporal_stability`; `research/decisions/H002_LONG_SHORT_ASYMMETRY.json` añade `temporal_stability_followup` (la inestabilidad refuerza el caveat de beta direccional; no autoriza BOTH/SHORT). Ver `git log -1 fa8b51a`.
 * Nuevo: `experiments/e11_h004b_diagnosis.py`, `experiments/outputs/h004b_diagnosis.json` y
   `research/decisions/H004B_RESULT.json` (con el pre-registro embebido como prueba
@@ -175,11 +175,29 @@ python data/market.py kraken  XXBTZUSD 60 2019-01-01
 
 ### Cómo retomar
 
-Punto de partida de la próxima sesión: **infraestructura FINAL_OOS lista; falta el dato**.
-Verificar que `research/evidence.json` mantiene H001–H005 y H004-B en `RESEARCH_REQUIRED`
-y `final_oos: BLOCKED_BY_DATA_AVAILABILITY` con `minimum_start=1788220800` (2026-09-01T00:00Z).
-Primer comando: `python experiments/e12_final_oos.py` (status). No abrir H006 ni ejecutar
-experimentos nuevos antes de un FINAL_OOS limpio.
+Punto de partida de la próxima sesión: **retomar en `21ae515` con la infraestructura del
+FINAL_OOS lista** (nada pendiente de esta tarea; todo commiteado). Verificar que
+`research/evidence.json` mantiene H001–H005 y H004-B en `RESEARCH_REQUIRED` y
+`final_oos: BLOCKED_BY_DATA_AVAILABILITY` con `minimum_start=1788220800` (2026-09-01T00:00Z),
+y que el dump mensual 2026-09 de binance.vision **aún no está publicado**: comprobar la URL
+`https://data.binance.vision/data/spot/monthly/klines/BTCUSDT/1h/BTCUSDT-1h-2026-09.zip`
+(HTTP 404 = sigue bloqueado). NO usar `python data/market.py binance ...` como "prueba":
+si el dump ya existiera reescribiría el CSV completo (y no hay flag dry-run).
+
+Secuencia de retoma (en orden):
+1. `python -m pytest` → deben pasar **259 tests** (baseline de regresión; incluye
+   `test_final_oos_pipeline.py` y `test_final_oos_preregistration.py`).
+2. `python experiments/e12_final_oos.py` → status: verificar
+   `BLOCKED_BY_DATA_AVAILABILITY` y `config congelada ... SI`. Sin dump, aquí termina
+   la sesión (no hay nada más que hacer: **no abrir H006**).
+3. Si el dump 2026-09 ya existe → ampliar el dataset con
+   `python data/market.py binance BTCUSDT 2019-01-01` (reescribe el CSV completo
+   2019 → 2026-09 y genera el nuevo manifest + sha256 en `experiments/data/`) y repetir:
+   `e12_final_oos.py --status` → `--dry-run` (sobre copias, nunca toca los
+   registros reales) → autorización humana explícita (`estado: AUTHORIZED` en
+   `FINAL_OOS_PRE_REGISTRATION.json`) → `e12_final_oos.py --csv <csv> --manifest <m> --authorize --yes-consume`
+   (consumo irreversible; escribe `experiments/outputs/final_oos_report.json` y
+   `research/decisions/FINAL_OOS_RESULT.json`).
 
 ```powershell
 python -m pytest                                     # 259 tests (baseline de regresión)
