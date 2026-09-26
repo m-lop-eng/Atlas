@@ -158,15 +158,18 @@ class MonitoringEngine:
 
 
 def apply_to_kill_switch(coordinator, snapshot: MonitorSnapshot) -> None:
-    """Aplica transiciones de Monitoring sobre un KillSwitchCoordinator (B5).
+    """Representa las condiciones de Monitoring sobre un KillSwitchCoordinator (B5).
 
-    Degradación -> clear; FAILED/UNKNOWN -> set (la precedencia y el latch
-    son del coordinador, no se replican aquí).
+    Agregación por fuente: si varios componentes reportan sobre la MISMA fuente
+    (p.ej. EXECUTION se proxya como SYSTEM), la fuente se representa con la
+    **máxima severidad** entre ellos; un `set` de cualquier componente gana
+    sobre un `clear` de otro componente de la misma fuente. Así un EMERGENCY de
+    SYSTEM no puede ser degradado por un HALT de EXECUTION (colisión de
+    último-escritor previa).
 
-    Agregación por fuente: EXECUTION se proxya como SYSTEM, de modo que un
-    EXECUTION sano NO despeja un EMERGENCY/HALT que SYSTEM haya fijado por su
-    propia cuenta. Un fuente con `set` de cualquier componente gana sobre un
-    `clear` de otro componente en la misma fuente.
+    Monitoring solo REPRESENTA las condiciones; la precedencia efectiva entre
+    fuentes y el latch los decide B5 (`KillSwitchState.most_severe` + recovery
+    explícito). No se replica aquí la política de decisión de B5.
     """
     transitions = tuple(_transition_for(r) for r in snapshot.results)
     sets: dict[KillSource, tuple[KillSwitchState, str]] = {}
@@ -174,10 +177,11 @@ def apply_to_kill_switch(coordinator, snapshot: MonitorSnapshot) -> None:
     for t in transitions:
         if t.state is None:
             clears.add(t.source)
-        else:
+            continue
+        current = sets.get(t.source)
+        if current is None or t.state.severity > current[0].severity:
             sets[t.source] = (t.state, t.reason)
     for source in clears - set(sets):
         coordinator.clear_source(source)
-        continue
     for source, (state, reason) in sets.items():
         coordinator.set_source(source, state, detail=reason)

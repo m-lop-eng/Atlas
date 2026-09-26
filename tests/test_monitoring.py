@@ -514,6 +514,135 @@ class TestAplicacionAlKillSwitch:
         assert coordinator.status().can_trade is True
         assert coordinator.status().state == KillSwitchState.ALLOW
 
+    def test_misma_fuente_emergency_prevalece_sobre_halt(self) -> None:
+        """SYSTEM(EMERGENCY)+EXECUTION(HALT) -> misma fuente SYSTEM: EMERGENCY."""
+        naive = datetime(2026, 5, 4, 12, 0, 0)
+        base = _healthy_observations()
+        obs = Observations(
+            data_feed=base.data_feed,
+            broker=base.broker,
+            reconciliation=base.reconciliation,
+            session=base.session,
+            system=observe_system(naive, heartbeat_at=naive),
+            execution=observe_execution((_FakeOrder("UNKNOWN"),), 0),
+        )
+        coordinator = self._coordinator()
+        apply_to_kill_switch(coordinator, _engine().evaluate(obs))
+        assert coordinator.status().state == KillSwitchState.EMERGENCY
+
+    def test_varias_fuentes_diferente_severidad_gana_la_maxima(self) -> None:
+        now = T0
+        naive = datetime(2026, 5, 4, 12, 0, 0)
+        base = _healthy_observations(now)
+        obs = Observations(
+            data_feed=observe_data_feed(
+                "CONNECTED", "HEALTHY", now - timedelta(seconds=60), 0
+            ),
+            broker=base.broker,
+            reconciliation=observe_reconciliation(
+                "RECONCILIATION_BLOCKED", now - timedelta(seconds=1)
+            ),
+            session=base.session,
+            system=observe_system(naive, heartbeat_at=naive),
+            execution=base.execution,
+        )
+        coordinator = self._coordinator()
+        apply_to_kill_switch(coordinator, _engine().evaluate(obs))
+        assert coordinator.status().state == KillSwitchState.EMERGENCY
+
+    def test_varias_fuentes_misma_severidad(self) -> None:
+        now = T0
+        base = _healthy_observations(now)
+        obs = Observations(
+            data_feed=observe_data_feed(
+                "CONNECTED", "HEALTHY", now - timedelta(seconds=60), 0
+            ),
+            broker=base.broker,
+            reconciliation=base.reconciliation,
+            session=observe_session("HALTED", now),
+            system=base.system,
+            execution=base.execution,
+        )
+        coordinator = self._coordinator()
+        apply_to_kill_switch(coordinator, _engine().evaluate(obs))
+        status = coordinator.status()
+        assert status.state == KillSwitchState.HALT
+        assert {"DATA_FEED", "SESSION"} <= {s.value for s, _ in status.active}
+
+    def test_eliminar_una_fuente_no_elimina_otra_activa(self) -> None:
+        now = T0
+        base = _healthy_observations(now)
+        both = Observations(
+            data_feed=observe_data_feed(
+                "CONNECTED", "HEALTHY", now - timedelta(seconds=60), 0
+            ),
+            broker=base.broker,
+            reconciliation=base.reconciliation,
+            session=observe_session("HALTED", now),
+            system=base.system,
+            execution=base.execution,
+        )
+        coordinator = self._coordinator()
+        apply_to_kill_switch(coordinator, _engine().evaluate(both))
+        assert coordinator.status().state == KillSwitchState.HALT
+
+        recovered_data = Observations(
+            data_feed=base.data_feed,  # DATA_FEED sano -> se despeja
+            broker=base.broker,
+            reconciliation=base.reconciliation,
+            session=observe_session("HALTED", now),  # SESSION sigue activa
+            system=base.system,
+            execution=base.execution,
+        )
+        apply_to_kill_switch(coordinator, _engine().evaluate(recovered_data))
+        status = coordinator.status()
+        assert status.state == KillSwitchState.HALT
+        assert {s.value for s, _ in status.active} == {"SESSION"}
+
+    def test_idempotencia_de_actualizaciones(self) -> None:
+        naive = datetime(2026, 5, 4, 12, 0, 0)
+        base = _healthy_observations()
+        obs = Observations(
+            data_feed=base.data_feed,
+            broker=base.broker,
+            reconciliation=base.reconciliation,
+            session=base.session,
+            system=observe_system(naive, heartbeat_at=naive),
+            execution=observe_execution((_FakeOrder("UNKNOWN"),), 0),
+        )
+        coordinator = self._coordinator()
+        snapshot = _engine().evaluate(obs)
+        apply_to_kill_switch(coordinator, snapshot)
+        state1 = coordinator.status().state
+        audit1 = len(coordinator.audit_log)
+        apply_to_kill_switch(coordinator, snapshot)
+        assert coordinator.status().state == state1
+        assert len(coordinator.audit_log) == audit1
+
+    def test_b5_decide_la_precedencia_efectiva(self) -> None:
+        """La agregación representa condiciones; B5 aplica la precedencia."""
+        now = T0
+        naive = datetime(2026, 5, 4, 12, 0, 0)
+        base = _healthy_observations(now)
+        obs = Observations(
+            data_feed=observe_data_feed(
+                "CONNECTED", "HEALTHY", now - timedelta(seconds=60), 0
+            ),
+            broker=base.broker,
+            reconciliation=observe_reconciliation(
+                "RECONCILIATION_BLOCKED", now - timedelta(seconds=1)
+            ),
+            session=base.session,
+            system=observe_system(naive, heartbeat_at=naive),
+            execution=base.execution,
+        )
+        coordinator = self._coordinator()
+        apply_to_kill_switch(coordinator, _engine().evaluate(obs))
+        status = coordinator.status()
+        assert status.state == KillSwitchState.most_severe(
+            tuple(cond.level for _, cond in status.active)
+        )
+
 
 class TestEjecucion:
     def test_orden_unknown_failed(self) -> None:
