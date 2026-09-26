@@ -65,13 +65,14 @@ data/sessions/broker/reconciliación/kill-switch/monitoring/paper; ver
 «Capa en vivo»).
 No hay ejecución real de órdenes todavía (solo `development`/backtest).
 
-* Última sesión (`git log -1 e6c0c3e`): **forward continuo A4** — `ForwardRunner`
+* Última sesión (`git log -1 72135a4`): **auditoría + hardening operacional (5 hallazgos)** — cierre de la auditoría por capas de A4/forward: latch B5 persistente (`0a528ab`), `reconcile()` B1 endurecido (`ce8ab09`), severidad multi-fuente (`e30286e`), hardening de datos (`589d3c9`) y single-instance lock + input fingerprint (`72135a4`). Ver «Auditoría operacional y hardening». Suite **583 passed**; H002/FINAL_OOS intactos.
+* Sesión previa (`git log -1 e6c0c3e`): **forward continuo A4** — `ForwardRunner`
   (cadena B1–B7 por barra, persistencia idempotente, audit reproducible) + Fases
   A1–A4 sobre datos reales; driver operativo `experiments/e14_forward_continuous.py`
   (ingesta incremental programada, tarea `Atlas-Forward-A4`); fix `OP-DEFECT-A2-001`
   (precio medio FIFO del `PaperBrokerAdapter`, commit `e5c5fc4`). Ver «Forward
   continuo (Fases A1–A4)» y «Cómo retomar». Suite **535 passed**; FINAL_OOS intacto.
-* Última sesión (`git log -1 066a00d`): **construcción del dataset FINAL_OOS con adquisición real + builder** — `research/final_oos_acquisition.py` conecta `FinalOosDatasetBuilder` con binance.vision **monthly preferred / daily fallback** y es **offline-first** (`data/raw/` como caché de inputs inmutables con sha256 → el dataset se reconstruye sin volver a la red). Devuelve `BLOCKED_BY_DATA_AVAILABILITY` o `ELIGIBLE_PARA_DRY_RUN` **sin nunca autorizar ni consumir** (adquisición ≠ autorización; verificado por `tests/test_final_oos_acquisition.py`: monthly completo sin daily innecesario, monthly 404→daily, combinación monthly+daily, gap real→BLOCKED sin rellenado, reproducibilidad idempotente, no consumo, no mutación de registros). Suite **293 tests verdes** (`python -m pytest`); el perímetro congelado del FINAL_OOS sigue intacto.
+* Sesión previa (`git log -1 066a00d`): **construcción del dataset FINAL_OOS con adquisición real + builder** — `research/final_oos_acquisition.py` conecta `FinalOosDatasetBuilder` con binance.vision **monthly preferred / daily fallback** y es **offline-first** (`data/raw/` como caché de inputs inmutables con sha256 → el dataset se reconstruye sin volver a la red). Devuelve `BLOCKED_BY_DATA_AVAILABILITY` o `ELIGIBLE_PARA_DRY_RUN` **sin nunca autorizar ni consumir** (adquisición ≠ autorización; verificado por `tests/test_final_oos_acquisition.py`: monthly completo sin daily innecesario, monthly 404→daily, combinación monthly+daily, gap real→BLOCKED sin rellenado, reproducibilidad idempotente, no consumo, no mutación de registros). Suite **293 tests verdes** (`python -m pytest`); el perímetro congelado del FINAL_OOS sigue intacto.
 * Sesión previa (`git log -1 c23cbd3`): **semántica del desbloqueo del FINAL_OOS** (min_span 365d: un zip mensual NO desbloquea; monthly/daily = solo adquisición) verificada por `tests/test_final_oos_semantics.py`.
 * Sesión previa (`git log -1 21ae515`): **infraestructura del FINAL_OOS** (estado `BLOCKED_BY_DATA_AVAILABILITY`: requiere cobertura completa ≥ 365 días de datos nuevos, fin ≥ 2027-09-01 — ver «Semántica del FINAL_OOS»; el dump mensual 2026-09, aún 404, NO desbloquea el OOS): pre-registro congelado (`research/decisions/FINAL_OOS_PRE_REGISTRATION.json`, estado FROZEN, criterios de lectura NULL de falsación), config de ejecución congelada (`config/final_oos/config.yaml`, `config_hash=cb639bbf…`, strategy hash `491ed76d…` idéntico a H004/H004-B), pipeline mecánico (`research/final_oos_pipeline.py`) verificado por tests de integración con dataset sintético (`tests/test_final_oos_pipeline.py`) y validación mecánica del plan (`tests/test_final_oos_preregistration.py`), y runner `experiments/e12_final_oos.py` (modo status/preparación/autorización; el consumo es irreversible). Corregido además `data/quality.py` (`_ts_delta_seconds` ahora UTC-aware).
 * Nuevo (cierre H004-B): `research/evidence.json` registra **H004-B → `RESEARCH_REQUIRED`** con nota `SYSTEMATIC_INSTABILITY` (6/12 folds positivas, mediana +0.3%, media +5.4%, concentración ALTA, 3 vecindades negativas); notas de H004 y H002 ampliadas; `research/decisions/H004_WALK_FORWARD.json` incorpora `h004b_closure` embebiendo `temporal_stability`; `research/decisions/H002_LONG_SHORT_ASYMMETRY.json` añade `temporal_stability_followup` (la inestabilidad refuerza el caveat de beta direccional; no autoriza BOTH/SHORT). Ver `git log -1 fa8b51a`.
@@ -158,7 +159,7 @@ ver «Forward continuo (Fases A1–A4)»):
   automática por sesión CLOSED (solo stop/time). `ReplayMarketDataAdapter`
   para dry-runs sin red.
 
-Suite actual: **535 tests verdes** (`python -m pytest`). El perímetro
+Suite actual: **583 tests verdes** (`python -m pytest`). El perímetro
 congelado del FINAL_OOS sigue intacto.
 
 ### Forward continuo (Fases A1–A4)
@@ -206,6 +207,24 @@ FIFO sobre el neto abierto (commit `e5c5fc4`) + 2 regresiones
 `test_forward_runner::test_multi_trade_session_keeps_reconciliation_ok`).
 Tras el fix: A2 168/168 OK; A3 288/288 OK (0 UNKNOWN, 0 auto-recovery,
 kill switch siempre `ALLOW`, replay byte-identical).
+
+### Auditoría operacional y hardening (5 hallazgos)
+
+Auditoría por capas (solo lectura) del forward/A4 previa a la fase continua. Cinco
+hallazgos corregidos en **commits aislados**, sin tocar H002/FINAL_OOS ni las
+reglas de trading:
+
+| # | Hallazgo | Fix | Commit |
+| --- | --- | --- | --- |
+| 1 | El latch B5 no sobrevivía al restart del forward (un latch MANUAL/SYSTEM/BROKER se perdía) | estado B5 persistido/restaurado en `snapshot.json`; sin auto-recovery; solo `recover()` explícito | `0a528ab` |
+| 2 | `LiveDataEngine.reconcile()` emitía backfill sin validar (duplicados, out-of-order, vela no cerrada, gap interno) y marcaba HEALTHY | validación símbolo→ts/intervalo→OHLC→cerrada→orden→duplicados→contigüidad; inválido ⇒ `DEGRADED` (nueva `INCOMPLETE_BAR`) | `ce8ab09` |
+| 3 | `apply_to_kill_switch` usaba último-escritor dentro de la misma fuente (EMERGENCY degradado por HALT de EXECUTION) | agregación por **máxima severidad** por fuente; B5 sigue decidiendo | `e30286e` |
+| 4 | Adquisición: `_existing_dataset` no verificaba sha/rango, raw no atómico, filas/volumen sin validar | integridad real (sha+conteo+extremos+intervalo), raw atómico (tmp+fsync+replace), validación de filas/volumen; causas `dataset_integrity`/`corrupt_file`/`coverage_incomplete`/`acquisition_error` | `589d3c9` |
+| 5 | A4 sin lock de instancia ni fingerprint de input | `ForwardInstanceLock` (`.forward.lock`, lock del SO) + `input_fingerprint` en `manifest.json` (prefijo append-only; mismatch ⇒ fail-safe) | `72135a4` |
+
+Aparcado (no bloqueante con adquisición batch): `reconnect()` desde `DEGRADED`.
+Suite tras el cierre: **583 passed**. **A4 demuestra operación forward/paper, no
+valida H002 para capital real** (el gate sigue siendo el FINAL_OOS preregistrado).
 
 ### Infraestructura de datos
 
@@ -343,27 +362,34 @@ La matriz queda verificada mecánicamente por `tests/test_final_oos_semantics.py
 
 ### Cómo retomar
 
-Punto de partida de la próxima sesión: **A4 (forward continuo) EN MARCHA**; todo
-commiteado (último commit `e6c0c3e`) y working tree limpio salvo artefactos
-gitignored. No hay milestone nuevo abierto: el trabajo siguiente solo aparece si
-A4 detecta un incidente real o cuando toque preparar la siguiente etapa de
-evidencia/ejecución.
+Punto de partida de la próxima sesión: **A4 (forward continuo) EN MARCHA** y
+**auditoría de los 5 hallazgos cerrada**; todo commiteado (último commit
+`72135a4`) y working tree limpio salvo artefactos gitignored. No hay milestone
+nuevo abierto: el trabajo siguiente solo aparece si A4 detecta un incidente real
+o cuando toque preparar la siguiente etapa de evidencia/ejecución.
 
 Contexto fijado:
 * B1–B7 + `ForwardRunner` cerrados; Fases A1/A2/A3 aprobadas; **A4 desplegado**
   como ingesta incremental programada (no streaming: el único `MarketDataAdapter`
   concreto es `ReplayMarketDataAdapter`; la fuente real es batch con ~1 día de
   retraso).
+* **Auditoría operacional cerrada** (commits `0a528ab`→`72135a4`): latch B5
+  persistente, `reconcile()` B1 endurecido, severidad multi-fuente, hardening de
+  datos y single-instance lock + input fingerprint (ver «Auditoría operacional y
+  hardening»). `reconnect()` desde `DEGRADED` queda **aparcado**.
 * Estrategia H002 **FROZEN**; FINAL_OOS **🔒 intacto** (`BLOCKED_BY_DATA_AVAILABILITY`;
   ver «Semántica del desbloqueo del FINAL_OOS»).
 * `research/evidence.json`: H001–H005 y H004-B siguen en `RESEARCH_REQUIRED`.
 
 Secuencia de retoma (en orden):
-1. `python -m pytest` → baseline de regresión (hoy **535 passed**).
+1. `python -m pytest` → baseline de regresión (hoy **583 passed**).
 2. `python experiments/e14_forward_continuous.py --status` → informe operativo
    actual de A4 (**solo lectura**: no modifica artefactos).
 3. Revisar `experiments/forward/outputs/FORWARD-PAPER-A4/`: `report_a4.json`,
    `ops_log.ndjson`, `incidents.ndjson`.
+   * El primer ciclo nuevo materializa la transición **manifest legacy →
+     `input_fingerprint`** (y crea `.forward.lock`); a partir de ahí, un cambio
+     inesperado de `bars.jsonl` da `INPUT_FINGERPRINT_MISMATCH` (fail-safe).
    * Si `incidents.ndjson` tiene entradas → tratarlas como **incidente
      operacional** (investigar → fix aislado → test determinista → commit), no
      como motivo para cambiar la estrategia.
@@ -467,7 +493,10 @@ muestra) →
 El foco inmediato ya **no** es construir más infraestructura: es **dejar A4
 operando** (ingesta incremental diaria sobre `experiments/forward/outputs/`) y
 traer incidentes o el primer informe operativo periódico significativo. La
-distinción se mantiene estricta: `operational evidence ≠ strategy evidence`.
+distinción se mantiene estricta: `operational evidence ≠ strategy evidence`. Los
+5 hallazgos de la auditoría quedan cerrados (`0a528ab`→`72135a4`); `reconnect()`
+desde `DEGRADED` sigue aparcado (no es requisito con adquisición batch).
+Tampoco se abre infraestructura nueva de reconexión/WebSocket mientras A4 observa.
 
 En paralelo, el dataset congelado de datos nuevos con cobertura ≥ 365 días
 (`[2026-09-01, 2027-09-01)`, última barra ≥ `2027-08-31T23:00 UTC`) sigue
