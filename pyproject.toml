@@ -36,6 +36,7 @@ include = [
     "live*",
     "sessions*",
     "reconciliation*",
+    "killswitches*",
     "monitoring*",
     "database*",
     "reporting*",
