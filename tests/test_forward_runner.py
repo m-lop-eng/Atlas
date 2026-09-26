@@ -18,6 +18,7 @@ Batería (repResenta los criterios de aceptación de la fase forward):
 
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -25,9 +26,12 @@ from pathlib import Path
 import pytest
 import yaml
 
+from killswitches.models import KillSource, KillSwitchState
 from live.engine import LiveDataEngine
 from live.events import ClosedBarEvent, MarketDataEvent
 from papertrading.forward_runner import (
+    FROZEN_CONFIG_HASH,
+    FROZEN_MAX_STRATEGY_RISK,
     ForwardConfigError,
     ForwardRunner,
     build_forward_runner,
@@ -116,6 +120,49 @@ class TestForwardFullFlow:
         }
         assert runner.strategy_hash == FROZEN_STRATEGY_HASH
         assert strat.metadata.status == "FROZEN"
+
+    def test_manifest_registers_frozen_hashes(self, tmp_path):
+        runner = _make(tmp_path)
+        manifest = json.loads((tmp_path / "TEST-FWD" / "manifest.json").read_text("utf-8"))
+        assert manifest["strategy_hash"] == FROZEN_STRATEGY_HASH
+        assert manifest["config_hash"] == FROZEN_CONFIG_HASH
+        assert manifest["broker"] == "PaperBrokerAdapter"
+        assert manifest["risk_operational"]["risk_per_trade"] == pytest.approx(0.0025)
+        assert manifest["risk_operational"]["max_strategy_risk"] == FROZEN_MAX_STRATEGY_RISK
+        assert manifest["source_configs"]["frozen"].replace("\\", "/").endswith(
+            "config/final_oos/config.yaml"
+        )
+
+    def test_kill_switch_blocked_never_reaches_broker(self, tmp_path):
+        """B5/HALT -> can_trade False y NINGUNA orden llega al PaperBrokerAdapter.
+
+        Verifica el gate E2E a través del ForwardRunner y la proyección
+        ENTRY_SKIPPED_KILL_SWITCH -> 'SKIPPED(KILL_SWITCH)'.
+        """
+        runner = _make(tmp_path)
+        runner.engine.kill_switch.set_source(
+            KillSource.MANUAL, KillSwitchState.HALT, detail="A2 gate test"
+        )
+        assert not runner.engine.kill_switch.status().can_trade
+        _drive(runner, _scenario())
+
+        r20 = runner.records[20]
+        assert r20.signal == "LONG"
+        assert r20.kill_switch == "HALT"
+        assert r20.can_trade is False
+        assert r20.order_intent and r20.order_intent.startswith("ENTRY:")
+        assert r20.submission_status is None  # staged en t; el gate opera en t+1
+
+        r21 = runner.records[21]
+        assert r21.submission_status == "SKIPPED(KILL_SWITCH)"
+        assert r21.position == 0.0
+        assert any(
+            e.event == PaperEvent.ENTRY_SKIPPED_KILL_SWITCH.value
+            for e in runner.engine.audit_log
+        )
+        assert all(e.event != PaperEvent.ENTRY_FILLED.value for e in runner.engine.audit_log)
+        assert len(runner.engine.broker._orders) == 0  # jamás llega al broker
+        assert runner.engine.position is None
 
     def test_full_cycle_and_per_bar_audit_trail(self, tmp_path):
         runner = _make(tmp_path)
@@ -270,6 +317,39 @@ class TestIdempotencyAndReproducibility:
         curve1 = [list(p) for p in r1.engine.equity_curve]
         curve2 = [list(p) for p in r2.engine.equity_curve]
         assert curve1 == curve2
+
+    def test_partial_restart_matches_full_run(self, tmp_path):
+        """Replay parcial + restart -> mismo resultado que la ejecución completa.
+
+        Escenario real de una sesión 24h: el proceso muere a mitad del flujo y
+        al relanzarlo reproduce bars.jsonl y continúa; el resultado debe ser
+        byte a byte el de un run completo desde cero.
+        """
+        run_id = "PARTIAL"
+        bars = _scenario()
+        midpoint = 20  # antes de la barra de señal
+
+        full = _make(tmp_path / "full", run_id=run_id)
+        _drive(full, bars)
+
+        partial = _make(tmp_path / "partial", run_id=run_id)
+        _drive(partial, bars[:midpoint])
+        assert len(partial.records) == midpoint
+
+        resumed = _make(tmp_path / "partial", run_id=run_id)
+        _drive(resumed, bars[midpoint:])
+
+        assert len(resumed.records) == len(bars)
+        assert [r.to_dict() for r in resumed.records] == [
+            r.to_dict() for r in full.records
+        ]
+        assert _file(resumed._records_path) == _file(full._records_path)
+        assert _file(resumed._audit_path) == _file(full._audit_path)
+        assert _file(resumed._snapshot_path) == _file(full._snapshot_path)
+        assert [list(p) for p in resumed.engine.equity_curve] == [
+            list(p) for p in full.engine.equity_curve
+        ]
+        assert len(resumed.engine.trades) == 1  # la exposición no se duplica
 
 
 class TestFrozenGuards:
