@@ -65,6 +65,12 @@ data/sessions/broker/reconciliación/kill-switch/monitoring/paper; ver
 «Capa en vivo»).
 No hay ejecución real de órdenes todavía (solo `development`/backtest).
 
+* Última sesión (`git log -1 e6c0c3e`): **forward continuo A4** — `ForwardRunner`
+  (cadena B1–B7 por barra, persistencia idempotente, audit reproducible) + Fases
+  A1–A4 sobre datos reales; driver operativo `experiments/e14_forward_continuous.py`
+  (ingesta incremental programada, tarea `Atlas-Forward-A4`); fix `OP-DEFECT-A2-001`
+  (precio medio FIFO del `PaperBrokerAdapter`, commit `e5c5fc4`). Ver «Forward
+  continuo (Fases A1–A4)» y «Cómo retomar». Suite **535 passed**; FINAL_OOS intacto.
 * Última sesión (`git log -1 066a00d`): **construcción del dataset FINAL_OOS con adquisición real + builder** — `research/final_oos_acquisition.py` conecta `FinalOosDatasetBuilder` con binance.vision **monthly preferred / daily fallback** y es **offline-first** (`data/raw/` como caché de inputs inmutables con sha256 → el dataset se reconstruye sin volver a la red). Devuelve `BLOCKED_BY_DATA_AVAILABILITY` o `ELIGIBLE_PARA_DRY_RUN` **sin nunca autorizar ni consumir** (adquisición ≠ autorización; verificado por `tests/test_final_oos_acquisition.py`: monthly completo sin daily innecesario, monthly 404→daily, combinación monthly+daily, gap real→BLOCKED sin rellenado, reproducibilidad idempotente, no consumo, no mutación de registros). Suite **293 tests verdes** (`python -m pytest`); el perímetro congelado del FINAL_OOS sigue intacto.
 * Sesión previa (`git log -1 c23cbd3`): **semántica del desbloqueo del FINAL_OOS** (min_span 365d: un zip mensual NO desbloquea; monthly/daily = solo adquisición) verificada por `tests/test_final_oos_semantics.py`.
 * Sesión previa (`git log -1 21ae515`): **infraestructura del FINAL_OOS** (estado `BLOCKED_BY_DATA_AVAILABILITY`: requiere cobertura completa ≥ 365 días de datos nuevos, fin ≥ 2027-09-01 — ver «Semántica del FINAL_OOS»; el dump mensual 2026-09, aún 404, NO desbloquea el OOS): pre-registro congelado (`research/decisions/FINAL_OOS_PRE_REGISTRATION.json`, estado FROZEN, criterios de lectura NULL de falsación), config de ejecución congelada (`config/final_oos/config.yaml`, `config_hash=cb639bbf…`, strategy hash `491ed76d…` idéntico a H004/H004-B), pipeline mecánico (`research/final_oos_pipeline.py`) verificado por tests de integración con dataset sintético (`tests/test_final_oos_pipeline.py`) y validación mecánica del plan (`tests/test_final_oos_preregistration.py`), y runner `experiments/e12_final_oos.py` (modo status/preparación/autorización; el consumo es irreversible). Corregido además `data/quality.py` (`_ts_delta_seconds` ahora UTC-aware).
@@ -101,8 +107,9 @@ No hay ejecución real de órdenes todavía (solo `development`/backtest).
 
 ### Capa en vivo (B1–B7, sesión actual)
 
-Arquitectura de producción construida en esta sesión (todas las capas sin
-ejecución real todavía; el entorno paper es la siguiente frontera):
+Arquitectura de producción (B1–B7). Sigue sin ejecución real de órdenes ni
+broker/capital real; el entorno **paper/forward ya opera en continuo** (Fase A4,
+ver «Forward continuo (Fases A1–A4)»):
 
 * **B1 — Market Data (`live/`, commit `26842c6`)**: `MarketDataAdapter`
   (contrato), `BackfillProvider` y `LiveDataEngine` con `EngineState` y
@@ -151,8 +158,54 @@ ejecución real todavía; el entorno paper es la siguiente frontera):
   automática por sesión CLOSED (solo stop/time). `ReplayMarketDataAdapter`
   para dry-runs sin red.
 
-Suite actual: **503 tests verdes** (`python -m pytest`). El perímetro
+Suite actual: **535 tests verdes** (`python -m pytest`). El perímetro
 congelado del FINAL_OOS sigue intacto.
+
+### Forward continuo (Fases A1–A4)
+
+Operación Paper/Forward sobre la estrategia **congelada H002** (FINAL_OOS
+intacto; principio rector: `operational evidence ≠ strategy evidence`). Código:
+
+* **`papertrading/forward_runner.py`** (`ForwardRunner` + `build_forward_runner`,
+  commits `956934e`/`e5c5fc4`): runner por barra de la cadena B1–B7 con
+  persistencia idempotente y audit reproducible. `start()` **reproduce
+  `bars.jsonl` desde cero** (reconstruye el engine y deduplica → un restart no
+  duplica barras ni exposición). Guardas congeladas: `strategy_hash=491ed76d…`,
+  `config_hash=cb639bbf…`, riesgo paper ≤ 1%, `PaperBrokerAdapter` obligatorio.
+  Persiste `bars.jsonl` (fuente de verdad log-first), `records.ndjson`,
+  `audit.jsonl`, `snapshot.json` y `manifest.json`; `_atomic_replace()` reintenta
+  ante locks transitorios de OneDrive/AV.
+* **`experiments/e13_forward_paper.py`**: replay OHLC → runner (driver de fase).
+* **`experiments/e14_forward_continuous.py`** (commit `e6c0c3e`): **driver
+  operativo de A4**. Un ciclo reconstruye el runner desde su `bars.jsonl` y
+  enruta solo las velas 1h nuevas del proveedor real por **B1**
+  (`LiveDataEngine` + `ReplayMarketDataAdapter` + `BackfillProvider`) hacia B2–B7;
+  emite `report_a4.json`, `ops_log.ndjson` e `incidents.ndjson`. `--once`
+  (idempotente), `--status` (solo lectura), `--loop`. Tarea programada
+  **`Atlas-Forward-A4`** (diaria 00:30) sobre `experiments/forward/outputs/`
+  (artefactos gitignored).
+
+Reglas vigentes de A4: H002 no se modifica; no se optimizan parámetros ni se
+seleccionan estrategias; no se abre H006; no se toca FINAL_OOS; sin broker ni
+capital real; los resultados forward se **registran**, nunca recalibran H002.
+
+| Fase | Alcance | Resultado |
+| --- | --- | --- |
+| A1 Smoke | replay corto | OK |
+| A2 24 h | 48 barras reales (ventana) | 168/168 `RECONCILIATION_OK`; descubrió `OP-DEFECT-A2-001` |
+| A3 7 d | 168 barras reales (ventana) | 12/12 criterios operativos OK |
+| A4 continuo | ingesta incremental real | **EN CURSO** (tarea diaria) |
+
+**Incidente `OP-DEFECT-A2-001`** (A2, barra `2026-09-21T10:00Z`): `PaperBrokerAdapter._avg_entry`
+promediaba *todos* los fills del lado de la posición, incluidos los de un trade
+ya cerrado → `POSITION` MISMATCH interno (`83760.0`) vs broker (`82411.18`) →
+`RECONCILIATION_BLOCKED` → latch de B5 (sin auto-recovery). El fail-safe B4/B5
+actuó correctamente; el defecto era de representación de estado del broker. Fix
+FIFO sobre el neto abierto (commit `e5c5fc4`) + 2 regresiones
+(`test_broker_adapter::…::test_avg_entry_only_open_quantity_fifo`,
+`test_forward_runner::test_multi_trade_session_keeps_reconciliation_ok`).
+Tras el fix: A2 168/168 OK; A3 288/288 OK (0 UNKNOWN, 0 auto-recovery,
+kill switch siempre `ALLOW`, replay byte-identical).
 
 ### Infraestructura de datos
 
@@ -290,48 +343,55 @@ La matriz queda verificada mecánicamente por `tests/test_final_oos_semantics.py
 
 ### Cómo retomar
 
-Punto de partida de la próxima sesión: **retomar en `21ae515` con la infraestructura del
-FINAL_OOS lista** (nada pendiente de esta tarea; todo commiteado). Verificar que
-`research/evidence.json` mantiene H001–H005 y H004-B en `RESEARCH_REQUIRED` y
-`final_oos: BLOCKED_BY_DATA_AVAILABILITY` con `minimum_start=1788220800` (2026-09-01T00:00Z).
-El desbloqueo NO depende de un zip mensual concreto: depende de cobertura completa de
-datos nuevos ≥ 365 días (última barra ≥ `2027-08-31T23:00 UTC`; ver «Semántica del
-desbloqueo del FINAL_OOS»). Comprobar el estado con `e12 --status` (nunca con
-`python data/market.py binance ...` como "prueba": reescribiría el CSV completo y no hay
-flag dry-run).
+Punto de partida de la próxima sesión: **A4 (forward continuo) EN MARCHA**; todo
+commiteado (último commit `e6c0c3e`) y working tree limpio salvo artefactos
+gitignored. No hay milestone nuevo abierto: el trabajo siguiente solo aparece si
+A4 detecta un incidente real o cuando toque preparar la siguiente etapa de
+evidencia/ejecución.
+
+Contexto fijado:
+* B1–B7 + `ForwardRunner` cerrados; Fases A1/A2/A3 aprobadas; **A4 desplegado**
+  como ingesta incremental programada (no streaming: el único `MarketDataAdapter`
+  concreto es `ReplayMarketDataAdapter`; la fuente real es batch con ~1 día de
+  retraso).
+* Estrategia H002 **FROZEN**; FINAL_OOS **🔒 intacto** (`BLOCKED_BY_DATA_AVAILABILITY`;
+  ver «Semántica del desbloqueo del FINAL_OOS»).
+* `research/evidence.json`: H001–H005 y H004-B siguen en `RESEARCH_REQUIRED`.
 
 Secuencia de retoma (en orden):
-1. `python -m pytest` → deben pasar todos los tests (baseline de regresión; incluye
-   `test_final_oos_pipeline.py`, `test_final_oos_preregistration.py` y
-   `test_final_oos_semantics.py`).
-2. `python experiments/e12_final_oos.py` → status: verificar
-   `BLOCKED_BY_DATA_AVAILABILITY` y `config congelada ... SI`. Sin dataset con cobertura
-   completa ≥ 365 días, aquí termina la sesión (no hay nada más que hacer: **no abrir H006**).
-3. Cuando el dataset nuevo cubra `[2026-09-01, 2027-09-01)` (última barra ≥
-   2027-08-31T23:00 UTC) → el orquestador de adquisición (`research/final_oos_acquisition.py`,
-   offline-first: reutiliza `data/raw/` sin red) construye el dataset congelado
-   (CSV + manifest sha256) y reporta `ELIGIBLE_PARA_DRY_RUN`; entonces
-   `e12_final_oos.py --status` → `--dry-run` (sobre copias, nunca toca los
-   registros reales) → autorización humana explícita (`estado: AUTHORIZED` en
-   `FINAL_OOS_PRE_REGISTRATION.json`) → `e12_final_oos.py --csv <csv> --manifest <m> --authorize --yes-consume`
-   (consumo irreversible; escribe `experiments/outputs/final_oos_report.json` y
-   `research/decisions/FINAL_OOS_RESULT.json`).
+1. `python -m pytest` → baseline de regresión (hoy **535 passed**).
+2. `python experiments/e14_forward_continuous.py --status` → informe operativo
+   actual de A4 (**solo lectura**: no modifica artefactos).
+3. Revisar `experiments/forward/outputs/FORWARD-PAPER-A4/`: `report_a4.json`,
+   `ops_log.ndjson`, `incidents.ndjson`.
+   * Si `incidents.ndjson` tiene entradas → tratarlas como **incidente
+     operacional** (investigar → fix aislado → test determinista → commit), no
+     como motivo para cambiar la estrategia.
+   * Si todo verde → no hay nada que hacer: A4 sigue corriendo por la tarea
+     programada `Atlas-Forward-A4` (diaria 00:30).
+4. FINAL_OOS: sigue bloqueado por calendario; comprobar con
+   `python experiments/e12_final_oos.py` (status). **No** abrir H006 ni
+   reescribir datasets como "prueba".
+
+Reglas que NO cambian durante A4: H002 no se modifica; sin optimización ni
+selección de estrategias; no se abre H006; no se toca FINAL_OOS; sin broker ni
+capital real; forward **no** recalibra la estrategia.
 
 ```powershell
-python -m pytest                                     # suite completa (baseline de regresión)
-python experiments/e12_final_oos.py                  # FINAL_OOS: status (BLOCKED hasta cobertura ≥ 2027-09-01)
-python experiments/e7_h002_asymmetry.py              # H002 train/test + métricas
-python experiments/e8_h003_breakout_vs_buyhold.py    # H003 A-E: benchmarks/régimen/decisión
-python experiments/e9_h004_walk_forward.py           # H004: walk-forward fijo + DATA_ROLE + decisión
-python experiments/e10_h005_w2_diagnosis.py          # H005-W2: causa del fallo 2022 (diagnóstico)
-python experiments/e11_h004b_diagnosis.py            # H004-B: localización temporal (SISTEMÁTICO)
-python experiments/post_mortem.py <report1.json> <report2.json>
-python experiments/e6_real_market.py                 # breakout vs controles (real)
+python -m pytest                                       # suite completa (baseline de regresión)
+python experiments/e14_forward_continuous.py --status  # A4: informe operativo (solo lectura)
+python experiments/e14_forward_continuous.py --once    # A4: forzar un ciclo de ingesta
+python experiments/e12_final_oos.py                    # FINAL_OOS: status (BLOCKED hasta cobertura ≥ 2027-09-01)
+python experiments/e7_h002_asymmetry.py                # H002 train/test + métricas
+python experiments/e9_h004_walk_forward.py             # H004: walk-forward fijo + DATA_ROLE + decisión
+Get-ScheduledTask -TaskName "Atlas-Forward-A4"         # estado de la tarea programada
 ```
 
-**Siguiente paso acordado — infraestructura FINAL_OOS lista; falta la cobertura de datos:
-el desbloqueo depende de ≥ 365 días completos de datos nuevos (hasta `2027-09-01T00:00Z`),
-NO de un zip mensual (ver «Semántica del desbloqueo del FINAL_OOS»).** La causa de W2
+**Siguiente paso acordado — sin milestone nuevo: mantener A4 (forward continuo)
+observando y no tocar nada salvo incidentes reales.** El desbloqueo del FINAL_OOS
+depende de ≥ 365 días completos de datos nuevos (hasta `2027-09-01T00:00Z`), NO de
+un zip mensual (ver «Semántica del desbloqueo del FINAL_OOS»); el perímetro
+congelado no se modifica mientras se espera. La causa de W2
 está documentada (beta direccional adversa del filtro LONG en bears) y la
 inestabilidad temporal, a granularidad trimestral, es **SISTEMÁTICA** (no se localiza en
 2022-2023; 6/12 folds positivas, 3 vecindades negativas: 2021Q2 · 2021Q4→2022Q3 · 2023Q3).
@@ -396,21 +456,26 @@ los tests de integración deben usar configuración explícita (equity,
 ## Próximos hitos
 
 Según `00_MASTER_SPECIFICATION.md`. B1–B7 cerrados (capa en vivo + paper
-probada). Hoja ordenada:
-**FINAL_OOS** (dataset congelado con ventana completa) →
+probada) y **forward continuo A4 en marcha**. Hoja ordenada:
+**A4 forward continuo** (observación operacional; EN CURSO) →
+**FINAL_OOS** (dataset congelado con ventana completa; bloqueado por calendario) →
 **decisión de evidencia** →
-**paper/forward evidence** (sin prisa: B7 prueba infraestructura, no edge
-fuera de muestra) →
-**Live Pilot** (⏸️ no autorizado todavía).
+**paper/forward evidence** (sin prisa: prueba infraestructura, no edge fuera de
+muestra) →
+**Live Pilot** (⏸️ no autorizado todavía; no construir WebSocket aún).
 
-El foco inmediato es únicamente el dataset congelado de datos nuevos con
-cobertura ≥ 365 días (`[2026-09-01, 2027-09-01)`, última barra ≥
-`2027-08-31T23:00 UTC`): bloqueado por calendario del proveedor de datos, no
-por Atlas (ver «Semántica del desbloqueo del FINAL_OOS»). El dump diario
-`data/raw/daily/` hoy cubre solo 2026-09-01→25: la ventana se completará a
-medida que el proveedor publique los días restantes (no antes de ~2027-09-01),
-sin forzar adquisición. No se abre ningún bloque de infraestructura nuevo
-mientras espera la ventana; el sistema se mantiene estable y el FINAL_OOS
-congelado (sin más complejidad estratégica ni optimización). Cuando haya
-cobertura completa se seguirá la disciplina
+El foco inmediato ya **no** es construir más infraestructura: es **dejar A4
+operando** (ingesta incremental diaria sobre `experiments/forward/outputs/`) y
+traer incidentes o el primer informe operativo periódico significativo. La
+distinción se mantiene estricta: `operational evidence ≠ strategy evidence`.
+
+En paralelo, el dataset congelado de datos nuevos con cobertura ≥ 365 días
+(`[2026-09-01, 2027-09-01)`, última barra ≥ `2027-08-31T23:00 UTC`) sigue
+bloqueado por calendario del proveedor, no por Atlas (ver «Semántica del
+desbloqueo del FINAL_OOS»). El dump diario `data/raw/daily/` hoy cubre solo
+2026-09-01→25: la ventana se completará a medida que el proveedor publique los
+días restantes (no antes de ~2027-09-01), sin forzar adquisición. No se abre
+ningún bloque de infraestructura nuevo mientras se espera; el sistema se mantiene
+estable y el FINAL_OOS congelado (sin más complejidad estratégica ni
+optimización). Cuando haya cobertura completa se seguirá la disciplina
 status → dry-run → revisión → autorización → consumo irreversible.
