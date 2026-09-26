@@ -381,13 +381,36 @@ precio); con `point_value=1` los resultados históricos no cambian. Verificado
 que `risk in $ ≡ P&L in $` con `point_value=50` (`tests/test_units.py`),
 requisito para pasar de BTC a EURUSD/NQ/ES.
 
+### Lección operacional (B7)
+
+Durante la construcción de `tests/test_paper_trading.py`, el fixture de
+integración dimensionó **25 qty** en vez de 2.5 (equity 1 M ×
+`risk_per_trade=0.0025` / 100 pts) y el `PaperBrokerAdapter` lo rechazó por
+caja insuficiente, dejando la posición sin abrir y enmascarando el resto de la
+cadena. Se corrigió en el sitio correcto: configuración explícita del fixture
+(`risk_per_trade=0.00025`), no el broker. Regla para producción: **los defaults
+no deben determinar silenciosamente el comportamiento de fixtures críticos** —
+los tests de integración deben usar configuración explícita (equity,
+`risk_per_trade`, `point_value`, stop y restricciones de cantidad).
+
 ## Próximos hitos
 
-Según `00_MASTER_SPECIFICATION.md`; el foco inmediato es construir el dataset congelado
-de datos nuevos con cobertura ≥ 365 días (`[2026-09-01, 2027-09-01)`) para un
-`FINAL_OOS` limpio (bloqueado por calendario del proveedor de datos, no por Atlas; ver
-«Semántica del desbloqueo del FINAL_OOS») y decidir, tras el FINAL_OOS, si existe una
-señal generalizable (H006) con el
-diagnóstico H004-B (inestabilidad temporal SISTEMÁTICA) y la causa de W2
-(beta direccional adversa del filtro LONG) documentados. No más complejidad
-estratégica ni optimización.
+Según `00_MASTER_SPECIFICATION.md`. B1–B7 cerrados (capa en vivo + paper
+probada). Hoja ordenada:
+**FINAL_OOS** (dataset congelado con ventana completa) →
+**decisión de evidencia** →
+**paper/forward evidence** (sin prisa: B7 prueba infraestructura, no edge
+fuera de muestra) →
+**Live Pilot** (⏸️ no autorizado todavía).
+
+El foco inmediato es únicamente el dataset congelado de datos nuevos con
+cobertura ≥ 365 días (`[2026-09-01, 2027-09-01)`, última barra ≥
+`2027-08-31T23:00 UTC`): bloqueado por calendario del proveedor de datos, no
+por Atlas (ver «Semántica del desbloqueo del FINAL_OOS»). El dump diario
+`data/raw/daily/` hoy cubre solo 2026-09-01→25: la ventana se completará a
+medida que el proveedor publique los días restantes (no antes de ~2027-09-01),
+sin forzar adquisición. No se abre ningún bloque de infraestructura nuevo
+mientras espera la ventana; el sistema se mantiene estable y el FINAL_OOS
+congelado (sin más complejidad estratégica ni optimización). Cuando haya
+cobertura completa se seguirá la disciplina
+status → dry-run → revisión → autorización → consumo irreversible.
