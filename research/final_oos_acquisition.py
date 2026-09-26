@@ -50,7 +50,9 @@ Este modulo no depende de la estrategia, no calibra parametros y no abre H006.
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -58,6 +60,13 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Callable
 
+from data.loader import read_ohlc_csv
+from data.quality import (
+    check_ohlc_integrity,
+    check_price_volume_integrity,
+    check_sorted_unique,
+    check_timestamp_alignment,
+)
 from data.sources import (
     BINANCE_VISION_DAILY_KLINE_URL,
     BINANCE_VISION_KLINE_URL,
@@ -86,6 +95,14 @@ PROBE_RETRIES = 2
 
 class CorruptDownloadError(DataFetchError):
     """Un zip ya adquirido no se puede parsear (descarga corrupta/incompleta)."""
+
+
+class ExistingDatasetIntegrityError(RuntimeError):
+    """El dataset congelado ya presente no supera las verificaciones de integridad.
+
+    Se distingue de "no existe": el artefacto ESTA pero es corrupto, truncado o
+    no corresponde a su manifest. NUNCA se reconstruye en silencio sobre el.
+    """
 
 
 class AcquisitionStatus(str, Enum):
@@ -239,20 +256,68 @@ class FinalOosAcquisition:
         name = url.rsplit("/", 1)[-1]
         return (self._monthly_dir if kind == "monthly" else self._daily_dir) / name
 
+    @staticmethod
+    def _atomic_write_bytes(dest: Path, raw: bytes) -> None:
+        """Escritura atomica: tmp en el mismo dir -> fsync -> os.replace.
+
+        Una descarga/comprobacion interrumpida NUNCA deja el archivo final a
+        medias: o no existe, o esta completo (y validado antes de escribir).
+        """
+        tmp = dest.with_suffix(dest.suffix + ".tmp")
+        try:
+            with tmp.open("wb") as fh:
+                fh.write(raw)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, dest)
+        finally:
+            if tmp.exists():
+                try:
+                    tmp.unlink()
+                except OSError:
+                    pass
+
+    def _validate_raw_bars(self, bars: list[dict], *, where: str) -> None:
+        """Valida filas de un zip crudo: ts unicos/ordenados/alineados, OHLC y volumen."""
+        issues = []
+        issues.extend(check_sorted_unique(bars))
+        issues.extend(check_timestamp_alignment(bars, self.interval_seconds))
+        issues.extend(check_ohlc_integrity(bars))
+        issues.extend(check_price_volume_integrity(bars))
+        if issues:
+            sample = "; ".join(f"fila {i.row}: {i.issue}" for i in issues[:5])
+            raise CorruptDownloadError(
+                f"zip corrupto: {where}: contenido invalido "
+                f"({len(issues)} issues) -> {sample}"
+            )
+
+    def _parse_and_validate_zip(self, raw: bytes, *, where: str) -> list[dict]:
+        """Parsea el zip y valida sus filas ANTES de aceptarlo/cachearlo."""
+        try:
+            bars = BinanceVisionSource._parse_zip(raw)
+        except Exception as exc:  # noqa: BLE001 - zip corrupto/truncado/no-zip
+            raise CorruptDownloadError(f"zip corrupto: {where}: {exc}") from exc
+        self._validate_raw_bars(bars, where=where)
+        return bars
+
     def _obtain(self, kind: str, url: str) -> RawInputRecord | None:
         """Offline-first: devuelve None si el archivo es 404 (no publicado).
 
-        Si el zip ya esta en la cache (con sha256 correcto) -> se reutiliza sin
-        red. Si no, se descarga, se guarda y se versiona.
+        Cache: si el zip ya esta en `data/raw/` se reutiliza SIN red, pero se
+        revalida (un raw corrupto jamas se presenta como valido). Descarga:
+        se valida el contenido y se escribe de forma atomica (tmp + replace),
+        de modo que una descarga interrumpida no deja archivo final.
         """
         local = self._local_path(kind, url)
         if local.exists() and local.stat().st_size > 0:
+            raw = local.read_bytes()
+            self._parse_and_validate_zip(raw, where=str(local))
             return RawInputRecord(
                 kind=kind,
                 date_key=self._date_key(kind, url),
                 url=url,
                 local_path=str(local),
-                sha256=sha256_of_file(local),
+                sha256=hashlib.sha256(raw).hexdigest(),
             )
         try:
             raw = self._opener(url, {"timeout": PROBE_TIMEOUT_S, "retries": PROBE_RETRIES})
@@ -260,9 +325,9 @@ class FinalOosAcquisition:
             return None  # no publicado aun -> fallback/cobertura incompleta
         # DataTimeoutError/DataConnectionError/DataFetchError: propagan; acquire()
         # termina en ACQUISITION_ERROR determinista (no cuelga ni itera el resto).
-        self._monthly_dir.mkdir(parents=True, exist_ok=True)
-        self._daily_dir.mkdir(parents=True, exist_ok=True)
-        local.write_bytes(raw)
+        self._parse_and_validate_zip(raw, where=url)
+        local.parent.mkdir(parents=True, exist_ok=True)
+        self._atomic_write_bytes(local, raw)
         return RawInputRecord(
             kind=kind,
             date_key=self._date_key(kind, url),
@@ -403,6 +468,8 @@ class FinalOosAcquisition:
         plan = self.required_files()
         try:
             acquired = self._acquire_inputs()
+        except CorruptDownloadError as exc:
+            return self._acquisition_error(cause="corrupt_file", detail=str(exc), plan=plan)
         except DataTimeoutError as exc:
             return self._acquisition_error(cause="timeout", detail=str(exc), plan=plan)
         except DataConnectionError as exc:
@@ -435,8 +502,37 @@ class FinalOosAcquisition:
 
         # 2) build offline del dataset congelado (inmutable: si ya existe, no
         #    se reconstruye; se devuelve el mismo artefacto: reproducibilidad)
-        existing = self._existing_dataset()
+        try:
+            existing = self._existing_dataset()
+        except ExistingDatasetIntegrityError as exc:
+            return self._acquisition_error(
+                cause="dataset_integrity",
+                detail=str(exc),
+                plan=plan,
+                inputs=inputs,
+                manifest_name=manifest_path.name,
+                build_error=str(exc),
+            )
         if existing is not None:
+            if not existing["covers_requested"]:
+                return {
+                    "status": AcquisitionStatus.BLOCKED_BY_DATA_AVAILABILITY,
+                    "cause": "coverage_incomplete",
+                    "reason": (
+                        "dataset existente no cubre [start, end): "
+                        f"first={existing['coverage']['first_ts']}, "
+                        f"last={existing['coverage']['last_ts']}, "
+                        f"start={self.start_epoch}, end={self.end_epoch}"
+                    ),
+                    "inputs": inputs,
+                    "manifest_inputs": manifest_path.name,
+                    "dataset_sha256": existing["sha256"],
+                    "dataset_bars": existing["bars"],
+                    "coverage": existing["coverage"],
+                    "eligible": False,
+                    "required_files": plan,
+                    "build_error": None,
+                }
             span_ok = (self.end_epoch - self.start_epoch) >= self.min_span_seconds
             status = (
                 AcquisitionStatus.ELIGIBLE_PARA_DRY_RUN
@@ -471,7 +567,7 @@ class FinalOosAcquisition:
         except DatasetBuilderError as exc:
             return {
                 "status": AcquisitionStatus.BLOCKED_BY_DATA_AVAILABILITY,
-                "cause": "coverage",
+                "cause": "coverage_incomplete",
                 "reason": f"cobertura incompleta: {exc}",
                 "inputs": inputs,
                 "manifest_inputs": manifest_path.name,
@@ -510,29 +606,71 @@ class FinalOosAcquisition:
         }
 
     def _existing_dataset(self) -> dict[str, Any] | None:
-        """Reutiliza un dataset congelado ya construido (inmutable).
+        """Reutiliza un dataset congelado ya presente SOLO si es integro.
 
-        La reconstruccion es idempotente: mismos inputs + misma config -> el
-        mismo CSV/sha256. Si el CSV ya existe, NO se re-descarga nada ni se
-        reconstruye: se devuelve el artefacto persistido (reproducibilidad).
+        Devuelve None si no hay artefacto (hay que construir). Si el artefacto
+        existe pero es corrupto, truncado o no corresponde a su manifest, lanza
+        `ExistingDatasetIntegrityError`: NUNCA se reconstruye en silencio sobre
+        el.
         """
         csv_path = self.out_dir / f"{self.symbol}_final_oos.csv"
         manifest_path = self.out_dir / f"{self.symbol}_final_oos.manifest.json"
-        if not (csv_path.exists() and manifest_path.exists()):
+        csv_exists = csv_path.exists()
+        man_exists = manifest_path.exists()
+        if not csv_exists and not man_exists:
             return None
+        if csv_exists != man_exists:
+            raise ExistingDatasetIntegrityError(
+                "dataset parcial: CSV y manifest no coexisten "
+                f"(csv={csv_exists}, manifest={man_exists})"
+            )
         try:
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            return None
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ExistingDatasetIntegrityError(f"manifest ilegible: {exc}") from exc
+        required = ("sha256", "bars", "first_ts", "last_ts", "interval_seconds")
+        missing = [k for k in required if k not in manifest]
+        if missing:
+            raise ExistingDatasetIntegrityError(
+                f"manifest incompleto: faltan {missing}"
+            )
+        if int(manifest["interval_seconds"]) != self.interval_seconds:
+            raise ExistingDatasetIntegrityError(
+                f"intervalo del manifest {manifest['interval_seconds']} != "
+                f"{self.interval_seconds}"
+            )
+        real_sha = sha256_of_file(csv_path)
+        if real_sha != manifest["sha256"]:
+            raise ExistingDatasetIntegrityError(
+                "sha256 del CSV no coincide con el manifest "
+                "(corrupto/alterado/truncado)"
+            )
+        bars = read_ohlc_csv(csv_path)
+        if len(bars) != int(manifest["bars"]):
+            raise ExistingDatasetIntegrityError(
+                f"conteo de barras {len(bars)} != manifest {manifest['bars']} (truncado)"
+            )
+        first = int(bars[0]["ts"])
+        last = int(bars[-1]["ts"])
+        if first != int(manifest["first_ts"]) or last != int(manifest["last_ts"]):
+            raise ExistingDatasetIntegrityError(
+                "extremos del CSV no corresponden al manifest "
+                f"(first={first}/{manifest['first_ts']}, "
+                f"last={last}/{manifest['last_ts']})"
+            )
+        covers = first <= self.start_epoch and (
+            last + self.interval_seconds >= self.end_epoch
+        )
         return {
-            "sha256": manifest.get("sha256", sha256_of_file(csv_path)),
-            "bars": manifest.get("bars"),
+            "sha256": real_sha,
+            "bars": len(bars),
             "coverage": {
-                "first_ts": int(manifest["first_ts"]),
-                "last_ts": int(manifest["last_ts"]),
+                "first_ts": first,
+                "last_ts": last,
                 "start_epoch": self.start_epoch,
                 "end_epoch": self.end_epoch,
             },
+            "covers_requested": covers,
         }
 
 

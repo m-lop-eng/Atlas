@@ -6,6 +6,7 @@ modificación de datos: cualquier hallazgo se registra y se documenta.
 
 from __future__ import annotations
 
+import math
 from collections import Counter
 from dataclasses import dataclass, field
 
@@ -66,6 +67,75 @@ def detect_duplicates(bars: list[dict]) -> list[QualityIssue]:
         for i, bar in enumerate(bars)
         if seen[bar.get("ts")] > 1
     ]
+
+
+def check_sorted_unique(bars: list[dict]) -> list[QualityIssue]:
+    """Timestamps estrictamente crecientes (únicos y ordenados)."""
+    issues: list[QualityIssue] = []
+    prev: int | None = None
+    for i, bar in enumerate(bars):
+        try:
+            ts = int(bar["ts"])
+        except (KeyError, TypeError, ValueError) as exc:
+            issues.append(QualityIssue("ts_invalido", i, str(exc)))
+            continue
+        if prev is not None and ts <= prev:
+            issues.append(
+                QualityIssue("ts_no_creciente", i, f"ts={ts} <= prev {prev}")
+            )
+        prev = ts
+    return issues
+
+
+def check_timestamp_alignment(
+    bars: list[dict], interval_seconds: int
+) -> list[QualityIssue]:
+    """Cada ts alineado al grid del intervalo y positivo."""
+    issues: list[QualityIssue] = []
+    interval = int(interval_seconds)
+    for i, bar in enumerate(bars):
+        try:
+            ts = int(bar["ts"])
+        except (KeyError, TypeError, ValueError) as exc:
+            issues.append(QualityIssue("ts_invalido", i, str(exc)))
+            continue
+        if ts <= 0 or ts % interval != 0:
+            issues.append(
+                QualityIssue("ts_desalineado", i, f"ts={ts} no múltiplo de {interval}")
+            )
+    return issues
+
+
+def check_price_volume_integrity(bars: list[dict]) -> list[QualityIssue]:
+    """OHLC finito y positivo; volumen finito y no negativo (klines Binance).
+
+    Complementa `check_ohlc_integrity` (que no detecta NaN/Inf ni volumen):
+    toda comparación con NaN es False, así que un NaN pasaría desapercibido.
+    """
+    issues: list[QualityIssue] = []
+    for i, bar in enumerate(bars):
+        try:
+            o = float(bar["open"])
+            h = float(bar["high"])
+            l = float(bar["low"])
+            c = float(bar["close"])
+            v = float(bar.get("volume", 0.0))
+        except (KeyError, TypeError, ValueError) as exc:
+            issues.append(QualityIssue("campos_malformados", i, str(exc)))
+            continue
+        if not all(math.isfinite(x) for x in (o, h, l, c)):
+            issues.append(
+                QualityIssue("precio_no_finito", i, f"o={o} h={h} l={l} c={c}")
+            )
+            continue
+        if o <= 0 or c <= 0 or l <= 0:
+            issues.append(
+                QualityIssue("precio_no_positivo", i, f"o={o} l={l} c={c}")
+            )
+            continue
+        if not math.isfinite(v) or v < 0:
+            issues.append(QualityIssue("volumen_invalido", i, f"volume={v}"))
+    return issues
 
 
 def detect_timestamp_gaps(

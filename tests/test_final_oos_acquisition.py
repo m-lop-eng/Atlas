@@ -376,7 +376,7 @@ def test_404_es_cobertura_no_error(tmp_path):
     res = acq.acquire()
 
     assert res["status"] is AcquisitionStatus.BLOCKED_BY_DATA_AVAILABILITY
-    assert res["cause"] == "coverage"
+    assert res["cause"] == "coverage_incomplete"
     assert res["dataset_sha256"] is None
 
 
@@ -425,7 +425,7 @@ def test_scan_diario_acotado_a_primer_dia_faltante(tmp_path):
     assert daily_calls[-1].endswith("2026-09-26.zip")
     assert not any("/daily/2026-10" in u for u in fake.calls)
     assert res["status"] is AcquisitionStatus.BLOCKED_BY_DATA_AVAILABILITY
-    assert res["cause"] == "coverage"
+    assert res["cause"] == "coverage_incomplete"
 
 
 def test_error_de_red_no_muta_registros(tmp_path):
@@ -449,3 +449,199 @@ def test_error_de_red_no_muta_registros(tmp_path):
         "plan": _bytes(PLAN),
     }
     assert after == before, "un fallo de adquisicion NO debe mutar los registros congelados"
+
+
+# ---------------------------------------------------------------------------
+# 9. Data hardening — integridad del dataset existente (Bloque 1)
+# ---------------------------------------------------------------------------
+
+
+def _build_valid(tmp_path, fake: FakeVision | None = None):
+    fake = fake or FakeVision(monthly={"2026-09", "2026-10"}, daily=set())
+    acq = make_acquire(fake, tmp_path, end=START + 33 * DAY)
+    res = acq.acquire()
+    assert res["status"] is AcquisitionStatus.ELIGIBLE_PARA_DRY_RUN
+    out = tmp_path / "out"
+    return (
+        res,
+        out / "BTCUSDT_final_oos.csv",
+        out / "BTCUSDT_final_oos.manifest.json",
+    )
+
+
+def test_dataset_valido_se_reutiliza_sin_red(tmp_path):
+    res1, _csv, _man = _build_valid(tmp_path)
+
+    def no_network(url, kw):
+        raise AssertionError("offline-first roto: se llamo a la red")
+
+    acq2 = make_acquire(FakeVision(set(), set()), tmp_path, end=START + 33 * DAY)
+    acq2._opener = no_network
+    res2 = acq2.acquire()
+
+    assert res2["status"] is AcquisitionStatus.ELIGIBLE_PARA_DRY_RUN
+    assert res2["cause"] is None
+    assert res2["dataset_sha256"] == res1["dataset_sha256"]
+    assert "inmutable" in res2["reason"]
+
+
+def test_dataset_sha_incorrecto_rechaza(tmp_path):
+    res1, csv, _man = _build_valid(tmp_path)
+    data = csv.read_bytes()
+    csv.write_bytes(data.replace(b"50000.0", b"50001.0", 1))
+
+    acq2 = make_acquire(FakeVision(set(), set()), tmp_path, end=START + 33 * DAY)
+    res2 = acq2.acquire()
+    assert res2["status"] is AcquisitionStatus.ACQUISITION_ERROR
+    assert res2["cause"] == "dataset_integrity"
+    assert res2["dataset_sha256"] is None
+
+
+def test_manifest_ausente_dataset_parcial(tmp_path):
+    _res1, _csv, man = _build_valid(tmp_path)
+    man.unlink()
+
+    acq2 = make_acquire(FakeVision(set(), set()), tmp_path, end=START + 33 * DAY)
+    res2 = acq2.acquire()
+    assert res2["cause"] == "dataset_integrity"
+
+
+def test_manifest_incompleto_rechaza(tmp_path):
+    import json as _json
+
+    _res1, _csv, man = _build_valid(tmp_path)
+    payload = _json.loads(man.read_text(encoding="utf-8"))
+    payload.pop("interval_seconds", None)
+    man.write_text(_json.dumps(payload), encoding="utf-8")
+
+    acq2 = make_acquire(FakeVision(set(), set()), tmp_path, end=START + 33 * DAY)
+    assert acq2.acquire()["cause"] == "dataset_integrity"
+
+
+def test_dataset_truncado_rechaza(tmp_path):
+    _res1, csv, _man = _build_valid(tmp_path)
+    data = csv.read_bytes()
+    csv.write_bytes(data[: len(data) // 2])
+
+    acq2 = make_acquire(FakeVision(set(), set()), tmp_path, end=START + 33 * DAY)
+    res2 = acq2.acquire()
+    assert res2["status"] is AcquisitionStatus.ACQUISITION_ERROR
+    assert res2["cause"] == "dataset_integrity"
+
+
+def test_dataset_fuera_de_rango_bloquea(tmp_path):
+    _build_valid(tmp_path)  # cubre [START, START+33d)
+    acq2 = make_acquire(
+        FakeVision(monthly={"2026-09", "2026-10"}, daily=set()),
+        tmp_path,
+        end=START + 40 * DAY,  # pide mas de lo que cubre el dataset existente
+    )
+    res2 = acq2.acquire()
+    assert res2["status"] is AcquisitionStatus.BLOCKED_BY_DATA_AVAILABILITY
+    assert res2["cause"] == "coverage_incomplete"
+    assert not res2["eligible"]
+
+
+def test_gap_interno_es_coverage_incomplete(tmp_path):
+    fake = FakeVision(monthly=set(), daily={"2026-09-01", "2026-09-02", "2026-09-04"})
+    acq = make_acquire(fake, tmp_path, end=START + 4 * DAY)
+    res = acq.acquire()
+    assert res["status"] is AcquisitionStatus.BLOCKED_BY_DATA_AVAILABILITY
+    assert res["cause"] == "coverage_incomplete"
+
+
+# ---------------------------------------------------------------------------
+# 10. Data hardening — validacion de filas/volumen (Bloque 3)
+# ---------------------------------------------------------------------------
+
+
+def _acq_with_rows(tmp_path, rows):
+    acq = make_acquire(FakeVision(set(), set()), tmp_path, end=START + DAY)
+    acq._opener = lambda url, kw: _zip_bytes(rows)
+    return acq
+
+
+def test_timestamp_duplicado_es_corrupt_file(tmp_path):
+    rows = _rows(START, 1) + _rows(START, 1)  # mismo ts dos veces
+    res = _acq_with_rows(tmp_path, rows).acquire()
+    assert res["status"] is AcquisitionStatus.ACQUISITION_ERROR
+    assert res["cause"] == "corrupt_file"
+
+
+def test_timestamp_desalineado_es_corrupt_file(tmp_path):
+    rows = [f"{START + 1800},50000.0,50001.0,49999.0,50000.0,1000"]
+    res = _acq_with_rows(tmp_path, rows).acquire()
+    assert res["status"] is AcquisitionStatus.ACQUISITION_ERROR
+    assert res["cause"] == "corrupt_file"
+
+
+def test_ohlc_invalido_es_corrupt_file(tmp_path):
+    # high 49000 < max(open, close) = 50000
+    rows = [f"{START},50000.0,49000.0,48000.0,50000.0,1000"]
+    res = _acq_with_rows(tmp_path, rows).acquire()
+    assert res["status"] is AcquisitionStatus.ACQUISITION_ERROR
+    assert res["cause"] == "corrupt_file"
+
+
+def test_volumen_invalido_es_corrupt_file(tmp_path):
+    rows = [f"{START},50000.0,50001.0,49999.0,50000.0,-1"]
+    res = _acq_with_rows(tmp_path, rows).acquire()
+    assert res["status"] is AcquisitionStatus.ACQUISITION_ERROR
+    assert res["cause"] == "corrupt_file"
+
+
+# ---------------------------------------------------------------------------
+# 11. Data hardening — raw atomico (Bloque 2)
+# ---------------------------------------------------------------------------
+
+
+def test_zip_parcial_no_deja_archivo_final(tmp_path):
+    valid = month_zip(2026, 9)
+    acq = make_acquire(FakeVision(set(), set()), tmp_path, end=START + DAY)
+    acq._opener = lambda url, kw: valid[: len(valid) // 2]  # zip truncado
+    res = acq.acquire()
+
+    assert res["status"] is AcquisitionStatus.ACQUISITION_ERROR
+    assert res["cause"] == "corrupt_file"
+    raw = tmp_path / "raw"
+    leftovers = list(raw.rglob("*")) if raw.exists() else []
+    assert leftovers == [], f"no debe quedar raw final ni .tmp: {leftovers}"
+
+
+def test_fallo_de_descarga_no_deja_archivo(tmp_path):
+    acq = make_acquire(FakeVision(set(), set()), tmp_path, end=START + DAY)
+    acq._opener = _connection_opener
+    res = acq.acquire()
+
+    assert res["status"] is AcquisitionStatus.ACQUISITION_ERROR
+    raw = tmp_path / "raw"
+    leftovers = list(raw.rglob("*")) if raw.exists() else []
+    assert leftovers == []
+
+
+# ---------------------------------------------------------------------------
+# 12. Data hardening — no mutacion ante un fallo de integridad
+# ---------------------------------------------------------------------------
+
+
+def test_dataset_integrity_no_muta_registros(tmp_path):
+    before = {
+        "evidence": _bytes(EVIDENCE),
+        "roles": _bytes(ROLES),
+        "config": _bytes(CONFIG),
+        "plan": _bytes(PLAN),
+    }
+    assert before["evidence"] and before["roles"], "prerequisito: registros reales"
+
+    _res1, csv, _man = _build_valid(tmp_path)
+    csv.write_bytes(csv.read_bytes() + b"\ncorrupto")
+    acq2 = make_acquire(FakeVision(set(), set()), tmp_path, end=START + 33 * DAY)
+    assert acq2.acquire()["cause"] == "dataset_integrity"
+
+    after = {
+        "evidence": _bytes(EVIDENCE),
+        "roles": _bytes(ROLES),
+        "config": _bytes(CONFIG),
+        "plan": _bytes(PLAN),
+    }
+    assert after == before
