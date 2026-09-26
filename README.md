@@ -36,8 +36,12 @@ validation/    OOS, walk-forward, Monte Carlo, stress
 portfolio/     Exposición agregada, correlación, asignación
 risk/          Position sizing, límites y Risk Engine
 execution/     Modelo de órdenes y Order Manager
-brokers/       Adaptadores de broker (MT5, futuros, IBKR, crypto)
-monitoring/    Observable del sistema
+brokers/       Adaptadores de broker (contrato B3): PaperBroker de sandbox
+live/          Motor de datos en vivo: MarketDataAdapter + LiveDataEngine
+sessions/      Gestión de sesiones de mercado (PRE_OPEN…UNKNOWN)
+reconciliation/ Motor de reconciliación interno vs broker (B4)
+killswitches/  Coordinador de kill switches globales (B5)
+monitoring/    MonitoringEngine: salud por componente (B6)
 database/      PostgreSQL (modelos y sesión)
 reporting/     Métricas y reportes
 tests/         Unit / integration / regression
@@ -56,6 +60,9 @@ docs/          Documentación técnica del repositorio
 **Milestone 1 — Pipeline de investigación reproducible (en curso).**
 Arquitectura, motor de backtest, riesgo, ejecución, diagnóstico por trade,
 controles nulos, lineage de experimentos y datos reales funcionando.
+Además, en esta sesión se construyó la **capa en vivo** (B1–B6:
+data/sessions/broker/reconciliación/kill-switch/monitoring; ver
+«Capa en vivo»).
 No hay ejecución real de órdenes todavía (solo `development`/backtest).
 
 * Última sesión (`git log -1 066a00d`): **construcción del dataset FINAL_OOS con adquisición real + builder** — `research/final_oos_acquisition.py` conecta `FinalOosDatasetBuilder` con binance.vision **monthly preferred / daily fallback** y es **offline-first** (`data/raw/` como caché de inputs inmutables con sha256 → el dataset se reconstruye sin volver a la red). Devuelve `BLOCKED_BY_DATA_AVAILABILITY` o `ELIGIBLE_PARA_DRY_RUN` **sin nunca autorizar ni consumir** (adquisición ≠ autorización; verificado por `tests/test_final_oos_acquisition.py`: monthly completo sin daily innecesario, monthly 404→daily, combinación monthly+daily, gap real→BLOCKED sin rellenado, reproducibilidad idempotente, no consumo, no mutación de registros). Suite **293 tests verdes** (`python -m pytest`); el perímetro congelado del FINAL_OOS sigue intacto.
@@ -91,6 +98,47 @@ No hay ejecución real de órdenes todavía (solo `development`/backtest).
 * Motor: `ENGINE_VERSION = 2` (reset diario de `max_daily_loss` + monetización
   por `point_value`; invariante para `point_value=1`, por eso el grafo H001
   conserva sus `experiment_id`).
+
+### Capa en vivo (B1–B6, sesión actual)
+
+Arquitectura de producción construida en esta sesión (todas las capas sin
+ejecución real todavía; el entorno paper es la siguiente frontera):
+
+* **B1 — Market Data (`live/`, commit `26842c6`)**: `MarketDataAdapter`
+  (contrato), `BackfillProvider` y `LiveDataEngine` con `EngineState` y
+  `DataQuality`. Consumo determinista de eventos de mercado → emisión de
+  `ClosedBarEvent`s; reloj inyectable para staleness; nunca fabrica cierres
+  falsos.
+* **B2 — Sessions (`sessions/`, commit `18f811b`)**: `MarketSessionManager`
+  con el autómata de sesión (`PRE_OPEN/OPEN/CLOSING/CLOSED/HALTED/UNKNOWN`) y
+  transiciones temporalmente deterministas.
+* **B3 — Broker sandbox (`brokers/`, commit `e158863`)**: contrato
+  `BrokerAdapter` (connect/subscribe/get_order/health/…) + `PaperBroker` de
+  simulación con reloj inyectado; modelos de broker y errores
+  (`BrokerConnectionError`, …).
+* **B4 — Reconciliación (`reconciliation/`, commit `9f820a5`)**: motor que
+  compara el estado interno (órdenes/fills/posiciones/cuenta) contra el
+  broker — fuente de verdad — y emite `RECONCILIATION_OK/BLOCKED/UNKNOWN`
+  (nunca un MATCH falso). `ReconciliationOrchestrator` hace solo lecturas;
+  los fills autoritativos se adoptan vía `get_order` y el resolutor de
+  órdenes UNKNOWN queda auditable. Cualquier discrepancia bloquea nuevas
+  operaciones (06 §59/§67).
+* **B5 — Kill Switches (`killswitches/`, commit `0face53`)**:
+  `KillSwitchCoordinator` con `ALLOW/BLOCK_NEW_ORDERS/HALT/EMERGENCY`,
+  fuentes auditadas y **latch**: una condición despejada NO auto-desbloquea;
+  exige `recover(reason, health_checks_ok=True)` explícito. Sin liquidación
+  automática y sin API de órdenes.
+* **B6 — Monitoring (`monitoring/`)**: `MonitoringEngine` con salud
+  independiente por componente (`DATA_FEED/BROKER/RECONCILIATION/SESSION/
+  SYSTEM/EXECUTION`). Estados `HEALTHY/DEGRADED/FAILED/UNKNOWN` (UNKNOWN
+  nunca es HEALTHY). Freshness real: `last_success` vs `now` vs umbrales
+  **configurables** (nunca constantes enterradas); reloj UTC-aware
+  obligatorio (DST). `apply_to_kill_switch`: **el monitor detecta, B5
+  decide** (la precedencia y el latch siguen en B5, sin duplicarse). El
+  monitor nunca envía/cancela órdenes.
+
+Suite actual: **480 tests verdes** (`python -m pytest`). El perímetro
+congelado del FINAL_OOS sigue intacto.
 
 ### Infraestructura de datos
 
