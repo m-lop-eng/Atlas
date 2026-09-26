@@ -505,3 +505,115 @@ class TestB1Integration:
 
 def record_close(rec) -> int:
     return rec.bar_close_time
+
+
+class TestKillSwitchPersistence:
+    """El latch/condiciones de B5 sobreviven al restart (nunca auto-ALLOW).
+
+    Un bloqueo no desaparece por reiniciar el proceso: el estado del
+    KillSwitchCoordinator se persiste en snapshot.json y se restaura
+    exactamente. Solo `recover(reason, health_checks_ok=True)` explícito
+    rehabilita el trading.
+    """
+
+    @staticmethod
+    def _ks(runner):
+        return runner.engine.kill_switch
+
+    @pytest.mark.parametrize(
+        "level",
+        [
+            KillSwitchState.BLOCK_NEW_ORDERS,
+            KillSwitchState.HALT,
+            KillSwitchState.EMERGENCY,
+        ],
+    )
+    def test_latch_state_survives_restart(self, tmp_path, level) -> None:
+        run_id = f"TEST-FWD-{level.value}"
+        runner = _make(tmp_path, run_id)
+        self._ks(runner).set_source(KillSource.MANUAL, level, detail="audit")
+        runner._write_snapshot()
+        assert self._ks(runner).status().state is level
+
+        restarted = _make(tmp_path, run_id)
+        status = self._ks(restarted).status()
+        assert status.state is level
+        assert status.can_trade is False
+
+    def test_allow_survives_restart(self, tmp_path) -> None:
+        run_id = "TEST-FWD-KS-ALLOW"
+        runner = _make(tmp_path, run_id)
+        _drive(runner, _scenario())
+        assert self._ks(runner).status().state is KillSwitchState.ALLOW
+
+        restarted = _make(tmp_path, run_id)
+        status = self._ks(restarted).status()
+        assert status.state is KillSwitchState.ALLOW
+        assert status.can_trade is True
+
+    def test_cleared_condition_stays_latched_after_restart(self, tmp_path) -> None:
+        run_id = "TEST-FWD-KS-LATCH"
+        runner = _make(tmp_path, run_id)
+        ks = self._ks(runner)
+        ks.set_source(
+            KillSource.MANUAL, KillSwitchState.BLOCK_NEW_ORDERS, detail="audit"
+        )
+        ks.clear_source(KillSource.MANUAL, detail="condicion despejada")
+        assert ks.status().state is KillSwitchState.BLOCK_NEW_ORDERS
+        assert ks.status().active == ()
+        runner._write_snapshot()
+
+        restarted = _make(tmp_path, run_id)
+        status = self._ks(restarted).status()
+        assert status.state is KillSwitchState.BLOCK_NEW_ORDERS
+        assert status.can_trade is False
+        assert status.active == ()
+
+    def test_only_explicit_recover_rehabilitates(self, tmp_path) -> None:
+        run_id = "TEST-FWD-KS-RECOVER"
+        runner = _make(tmp_path, run_id)
+        self._ks(runner).set_source(
+            KillSource.MANUAL, KillSwitchState.HALT, detail="audit"
+        )
+        runner._write_snapshot()
+
+        restarted = _make(tmp_path, run_id)
+        ks = self._ks(restarted)
+        assert ks.status().state is KillSwitchState.HALT
+
+        rejected = ks.recover(reason="revisado", health_checks_ok=True)
+        assert rejected.accepted is False
+        assert ks.status().state is KillSwitchState.HALT
+        assert ks.status().can_trade is False
+
+        ks.clear_source(KillSource.MANUAL, detail="condicion despejada")
+        assert ks.status().state is KillSwitchState.BLOCK_NEW_ORDERS
+        accepted = ks.recover(reason="revisado", health_checks_ok=True)
+        assert accepted.accepted is True
+        assert ks.status().state is KillSwitchState.ALLOW
+        restarted._write_snapshot()
+
+        final = _make(tmp_path, run_id)
+        assert self._ks(final).status().state is KillSwitchState.ALLOW
+
+    def test_legacy_snapshot_without_block_starts_allow(self, tmp_path) -> None:
+        run_id = "TEST-FWD-KS-LEGACY"
+        runner = _make(tmp_path, run_id)
+        _drive(runner, [_closed(0, FLAT)])
+        snap = json.loads(runner._snapshot_path.read_text(encoding="utf-8"))
+        snap.pop("kill_switch", None)
+        runner._snapshot_path.write_text(json.dumps(snap), encoding="utf-8")
+
+        restarted = _make(tmp_path, run_id)
+        assert self._ks(restarted).status().state is KillSwitchState.ALLOW
+
+    def test_malformed_block_fails_loud(self, tmp_path) -> None:
+        run_id = "TEST-FWD-KS-BAD"
+        runner = _make(tmp_path, run_id)
+        _drive(runner, [_closed(0, FLAT)])
+        snap = json.loads(runner._snapshot_path.read_text(encoding="utf-8"))
+        snap["kill_switch"] = {"sources": []}  # falta recovery_required
+        runner._snapshot_path.write_text(json.dumps(snap), encoding="utf-8")
+
+        with pytest.raises(ForwardConfigError):
+            _make(tmp_path, run_id)

@@ -274,9 +274,17 @@ class ForwardRunner:
         La reproduccion regenera records.ndjson / audit.jsonl / snapshot.json
         sobre el engine recien construido, garantizando que un restart no
         duplica exposicion ni reprocesa barras viejas.
+
+        El estado del Kill Switch (B5) se persiste en snapshot.json y se
+        restaura EXACTAMENTE al arrancar: el latch y las condiciones activas
+        sobreviven al restart y NUNCA se degradan a ALLOW por el reinicio
+        (solo un `recover(reason, health_checks_ok=True)` explicito rehabilita
+        el trading). Un snapshot legacy sin bloque `kill_switch` arranca sin
+        latch (ese formato no persistia B5).
         """
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self._write_manifest()
+        kill_switch_snapshot = self._load_kill_switch_snapshot()
         persisted = self._load_bars()
         if persisted:
             self._reset_derived()
@@ -285,6 +293,9 @@ class ForwardRunner:
                 self._last_open_time = closed.open_time
                 self._clock.set(_closed_close_dt(closed))
                 self._process(closed, str(row.get("quality", "HEALTHY")))
+        if kill_switch_snapshot is not None:
+            self.engine.kill_switch.load_snapshot(kill_switch_snapshot)
+            self._write_snapshot()
         self._started = True
         return self
 
@@ -340,6 +351,31 @@ class ForwardRunner:
                 if line:
                     rows.append(json.loads(line))
         return rows
+
+    def _load_kill_switch_snapshot(self) -> dict | None:
+        """Estado B5 persistido (latch) del snapshot previo, o None.
+
+        Compatibilidad: snapshot ausente o sin bloque `kill_switch` (formato
+        legacy) equivalen a un arranque sin latch. Un bloque presente pero
+        malformado falla en voz alta: NUNCA se degrada a ALLOW por un snapshot
+        ilegible.
+        """
+        if not self._snapshot_path.exists():
+            return None
+        try:
+            snap = json.loads(self._snapshot_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ForwardConfigError(
+                f"snapshot ilegible en {self._snapshot_path}: {exc}"
+            ) from exc
+        block = snap.get("kill_switch")
+        if block is None:
+            return None
+        if not isinstance(block, dict) or "recovery_required" not in block:
+            raise ForwardConfigError(
+                "bloque kill_switch invalido en snapshot (falta recovery_required)."
+            )
+        return block
 
     @staticmethod
     def _closed_from_row(row: dict) -> ClosedBarEvent:
@@ -416,7 +452,11 @@ class ForwardRunner:
             "records": len(self._records),
             "last_open_time": self._last_open_time,
         }
-        snap = {"engine": self.engine.snapshot(), "forward": forward}
+        snap = {
+            "engine": self.engine.snapshot(),
+            "forward": forward,
+            "kill_switch": self.engine.kill_switch.snapshot(),
+        }
         tmp = self._snapshot_path.with_suffix(".tmp")
         tmp.write_text(
             json.dumps(snap, indent=2, default=str), encoding="utf-8"
