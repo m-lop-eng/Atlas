@@ -13,6 +13,21 @@ from itertools import count
 _order_seq = count(1)
 
 
+def reset_order_sequence() -> None:
+    """Reinicia el secuenciador global de `order_id`.
+
+    El `order_id` de Order se acuña contra un contador de MÓDULO (histórico de
+    B7). Al estar compartido entre instancias del proceso, dos reposiciones del
+    mismo input dentro de un mismo proceso producirían IDs distintos en el audit
+    trail del ForwardRunner. Único uso previsto: build_forward_runner lo llama
+    antes de construir su engine para que el replay dtype por barra sea
+    byte-a-byte reproducible. `order_id` solo debe ser único DENTRO de cada
+    OrderManager; reiniciar el contador no genera colisiones entre instancias.
+    """
+    global _order_seq
+    _order_seq = count(1)
+
+
 class OrderSide(str, Enum):
     BUY = "BUY"
     SELL = "SELL"
