@@ -43,6 +43,7 @@ class DataQuality(str, Enum):
     INVALID_TIMESTAMP = "INVALID_TIMESTAMP"
     OUT_OF_ORDER = "OUT_OF_ORDER"
     INVALID_OHLC = "INVALID_OHLC"
+    INCOMPLETE_BAR = "INCOMPLETE_BAR"
 
 
 class LiveDataEngine:
@@ -265,10 +266,18 @@ class LiveDataEngine:
         return None
 
     def reconcile(self) -> list[ClosedBarEvent]:
-        """Recupera velas perdidas desde el BackfillProvider.
+        """Recupera velas perdidas desde el BackfillProvider (contrato B1).
 
-        Devuelve las velas cerradas re-emitidas. Requiere estar DEGRADED o
-        RECONNECTING. Tras reconciliar vuelve a CONNECTED.
+        El backfill es una frontera de confianza igual que el stream: se
+        normaliza/valida antes de emitir. Orden: simbolo -> timestamp/intervalo
+        -> OHLC -> vela cerrada -> orden temporal -> duplicados -> contigüidad.
+        Se emiten SOLO las velas validas contiguas desde `_next_open_time()`.
+
+        Ante cualquier dato invalido NO se marca HEALTHY: se registra el issue,
+        el motor permanece DEGRADED (con la calidad de la violacion) y se
+        devuelve el prefijo valido ya emitido. Sin velas recuperadas tampoco hay
+        evidencia de cierre del gap -> sigue DEGRADED. Solo una secuencia
+        valida que cierra el gap devuelve el motor a CONNECTED/HEALTHY.
         """
         if self.backfill_provider is None:
             raise RuntimeError("no hay BackfillProvider configurado")
@@ -281,15 +290,64 @@ class LiveDataEngine:
             self.symbol, self.interval_seconds, start_from
         )
         replayed: list[ClosedBarEvent] = []
+        expected = start_from
+        violation: DataQuality | None = None
+        detail = ""
         for event in bars:
             if event.symbol != self.symbol:
-                continue
-            if not (self._is_valid_ohlc(event) and self._is_valid_timestamp(event.open_time)):
-                continue
+                violation = DataQuality.INVALID_TIMESTAMP
+                detail = f"backfill: simbolo inesperado {event.symbol}"
+            elif not self._is_valid_timestamp(event.open_time):
+                violation = DataQuality.INVALID_TIMESTAMP
+                detail = (
+                    f"backfill: open_time {event.open_time} no alineado al "
+                    f"intervalo {self.interval_seconds}"
+                )
+            elif not self._is_valid_ohlc(event):
+                violation = DataQuality.INVALID_OHLC
+                detail = f"backfill: OHLC invalido en open_time {event.open_time}"
+            elif not event.is_closed:
+                violation = DataQuality.INCOMPLETE_BAR
+                detail = f"backfill: vela no cerrada en open_time {event.open_time}"
+            elif event.open_time < expected:
+                violation = (
+                    DataQuality.DUPLICATE
+                    if event.open_time == self._last_emitted_open_time
+                    else DataQuality.OUT_OF_ORDER
+                )
+                detail = (
+                    f"backfill fuera de orden: {event.open_time} < esperado {expected}"
+                )
+            elif event.open_time > expected:
+                violation = DataQuality.GAP_DETECTED
+                detail = (
+                    f"backfill con gap interno: se esperaba {expected}, "
+                    f"llego {event.open_time}"
+                )
+            if violation is not None:
+                break
             closed = self._emit(event)
-            if closed is not None:
-                replayed.append(closed)
+            if closed is None:
+                violation = DataQuality.DUPLICATE
+                detail = f"backfill: cierre duplicado {event.open_time}"
+                break
+            replayed.append(closed)
+            expected += self.interval_seconds
+
         self._in_progress = None
+        if violation is not None:
+            self._record_issue(violation, detail)
+            self.state = EngineState.DEGRADED
+            self.quality = violation
+            return replayed
+        if not replayed:
+            self._record_issue(
+                DataQuality.GAP_DETECTED,
+                f"backfill sin velas desde {start_from}; gap sin evidencia de cierre",
+            )
+            self.state = EngineState.DEGRADED
+            self.quality = DataQuality.GAP_DETECTED
+            return replayed
         self.state = EngineState.CONNECTED
         self.quality = DataQuality.HEALTHY
         return replayed

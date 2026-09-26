@@ -81,14 +81,19 @@ class RememberingAdapter(MarketDataAdapter):
 
 
 class FakeBackfill(BackfillProvider):
-    def __init__(self, bars: list[MarketDataEvent]) -> None:
+    def __init__(
+        self, bars: list[MarketDataEvent], *, filter_start: bool = True
+    ) -> None:
         self.bars = bars
+        self.filter_start = filter_start
         self.calls: list[tuple[str, int, int]] = []
 
     def fetch_closed_bars(
         self, symbol: str, interval_seconds: int, start_open_time: int
     ) -> list[MarketDataEvent]:
         self.calls.append((symbol, interval_seconds, start_open_time))
+        if not self.filter_start:
+            return list(self.bars)
         return [b for b in self.bars if b.open_time >= start_open_time]
 
 
@@ -420,3 +425,101 @@ class TestPolling:
         assert n == 1
         processed = engine.process(_ev(BASE + 2 * HOUR))
         assert processed is not None
+
+
+# ---------------------------------------------------------------------------
+# 13. contrato de reconcile(): el backfill es una frontera de confianza
+# ---------------------------------------------------------------------------
+
+
+class TestReconcileContract:
+    """reconcile() valida el backfill y NUNCA marca HEALTHY con datos invalidos."""
+
+    @staticmethod
+    def _degraded(backfill_bars, *, filter_start: bool = True):
+        provider = FakeBackfill(backfill_bars, filter_start=filter_start)
+        engine = _engine([], backfill=provider)
+        engine.process(_ev(BASE))
+        engine.process(_ev(BASE + HOUR))
+        engine.process(_ev(BASE + 3 * HOUR))  # gap: falta BASE + 2*HOUR
+        assert engine.state == EngineState.DEGRADED
+        return engine, provider
+
+    def test_duplicate_backfill_not_emitted_twice(self) -> None:
+        engine, _ = self._degraded([_ev(BASE + 2 * HOUR), _ev(BASE + 2 * HOUR)])
+        replayed = engine.reconcile()
+        assert [b.open_time for b in replayed] == [BASE + 2 * HOUR]
+        assert engine.state == EngineState.DEGRADED
+        assert engine.quality == DataQuality.DUPLICATE
+        assert [b.open_time for b in engine.closed_bars] == [
+            BASE,
+            BASE + HOUR,
+            BASE + 2 * HOUR,
+        ]
+
+    def test_out_of_order_backfill_rejected(self) -> None:
+        engine, _ = self._degraded(
+            [_ev(BASE + 2 * HOUR), _ev(BASE + HOUR)], filter_start=False
+        )
+        replayed = engine.reconcile()
+        assert [b.open_time for b in replayed] == [BASE + 2 * HOUR]
+        assert engine.state == EngineState.DEGRADED
+        assert engine.quality == DataQuality.OUT_OF_ORDER
+
+    def test_incomplete_bar_rejected(self) -> None:
+        engine, _ = self._degraded([_ev(BASE + 2 * HOUR, is_closed=False)])
+        replayed = engine.reconcile()
+        assert replayed == []
+        assert engine.state == EngineState.DEGRADED
+        assert engine.quality == DataQuality.INCOMPLETE_BAR
+        assert BASE + 2 * HOUR not in [b.open_time for b in engine.closed_bars]
+
+    def test_internal_gap_rejected(self) -> None:
+        engine, _ = self._degraded([_ev(BASE + 2 * HOUR), _ev(BASE + 4 * HOUR)])
+        replayed = engine.reconcile()
+        assert [b.open_time for b in replayed] == [BASE + 2 * HOUR]
+        assert engine.state == EngineState.DEGRADED
+        assert engine.quality == DataQuality.GAP_DETECTED
+
+    def test_wrong_timestamp_alignment_rejected(self) -> None:
+        engine, _ = self._degraded([_ev(BASE + 2 * HOUR + 1_800)])
+        assert engine.reconcile() == []
+        assert engine.state == EngineState.DEGRADED
+        assert engine.quality == DataQuality.INVALID_TIMESTAMP
+
+    def test_invalid_ohlc_rejected(self) -> None:
+        engine, _ = self._degraded(
+            [_ev(BASE + 2 * HOUR, open=100.0, high=99.0, low=98.0, close=100.0)]
+        )
+        assert engine.reconcile() == []
+        assert engine.state == EngineState.DEGRADED
+        assert engine.quality == DataQuality.INVALID_OHLC
+
+    def test_empty_backfill_stays_degraded(self) -> None:
+        engine, _ = self._degraded([])
+        assert engine.reconcile() == []
+        assert engine.state == EngineState.DEGRADED
+        assert engine.quality == DataQuality.GAP_DETECTED
+
+    def test_valid_backfill_recovers(self) -> None:
+        engine, _ = self._degraded([_ev(BASE + 2 * HOUR)])
+        replayed = engine.reconcile()
+        assert [b.open_time for b in replayed] == [BASE + 2 * HOUR]
+        assert engine.state == EngineState.CONNECTED
+        assert engine.quality == DataQuality.HEALTHY
+
+    def test_invalid_then_valid_recovery(self) -> None:
+        engine, provider = self._degraded([_ev(BASE + 2 * HOUR, is_closed=False)])
+        assert engine.reconcile() == []
+        assert engine.state == EngineState.DEGRADED
+
+        provider.bars = [_ev(BASE + 2 * HOUR)]  # backfill corregido
+        replayed = engine.reconcile()
+        assert [b.open_time for b in replayed] == [BASE + 2 * HOUR]
+        assert engine.state == EngineState.CONNECTED
+        assert engine.quality == DataQuality.HEALTHY
+        assert [b.open_time for b in engine.closed_bars] == [
+            BASE,
+            BASE + HOUR,
+            BASE + 2 * HOUR,
+        ]
