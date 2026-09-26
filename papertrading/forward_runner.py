@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -75,6 +76,23 @@ FROZEN_CONFIG_HASH = (
 FROZEN_MAX_STRATEGY_RISK = 0.01
 
 _UTC = timezone.utc
+
+
+def _atomic_replace(tmp: Path, dest: Path, retries: int = 3, wait: float = 0.2) -> None:
+    """Reemplazo atómico con reintento ante locks transitorios (OneDrive/AV).
+
+    `os.replace` puede fallar con PermissionError si el destino está siendo
+    sincronizado (OneDrive) o escaneado por AV justo en ese instante. Se reintenta
+    con espera corta varias veces; si persiste se relanza (fallo real).
+    """
+    for attempt in range(retries):
+        try:
+            os.replace(tmp, dest)
+            return
+        except OSError:
+            if attempt == retries - 1:
+                raise
+            time.sleep(wait)
 
 
 class ForwardConfigError(ValueError):
@@ -403,13 +421,13 @@ class ForwardRunner:
         tmp.write_text(
             json.dumps(snap, indent=2, default=str), encoding="utf-8"
         )
-        os.replace(tmp, self._snapshot_path)
+        _atomic_replace(tmp, self._snapshot_path)
 
     @staticmethod
     def _write_json(path: Path, payload: dict) -> None:
         tmp = path.with_suffix(".tmp")
         tmp.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
-        os.replace(tmp, path)
+        _atomic_replace(tmp, path)
 
     # --------------------------------------------------------------- procesado
 

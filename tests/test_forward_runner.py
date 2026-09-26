@@ -260,6 +260,43 @@ class TestForwardFullFlow:
         for rec in runner.records:
             assert rec.data_quality == "DEGRADED"
 
+    def test_multi_trade_session_keeps_reconciliation_ok(self, tmp_path):
+        """Dos operaciones seguidas (cierre + reapertura) sin falso bloqueo.
+
+        Regresión de un bug real descubierto en Fase A2: el avg del broker se
+        diluía con la cantidad del trade cerrado -> POSITION MISMATCH ->
+        RECONCILIATION_BLOCKED -> kill switch latch en la 2ª operación de una
+        sesión continua. El avg del broker debe reflejar solo el neto abierto.
+        """
+        runner = _make(tmp_path)
+        rows = [FLAT] * 20
+        rows.append((50150, 50200, 50050, 50200))   # 20: señal LONG #1
+        rows.append((50200, 50300, 50150, 50200))   # 21: entrada #1
+        rows.append((50200, 50300, 50100, 50250))   # 22: mantiene
+        rows.append((50150, 50250, 49800, 49850))   # 23: STOP trade #1
+        for i in range(20):
+            rows.append((49700, 49800, 49650, 49750))  # 24..43: flat
+        rows.append((50400, 50500, 50300, 50450))   # 44: señal LONG #2
+        rows.append((50500, 50600, 50300, 50550))   # 45: entrada #2
+        rows.append((50550, 50650, 50200, 50600))   # 46: mantiene
+        rows.append((50400, 50500, 49950, 50100))   # 47: STOP trade #2
+        rows.append((50100, 50200, 49900, 50150))   # 48: NO_TRADE
+        _drive(runner, [_closed(i, r) for i, r in enumerate(rows)])
+
+        assert len(runner.engine.trades) == 2
+        for rec in runner.records:
+            assert rec.reconciliation_status == "RECONCILIATION_OK"
+            assert rec.kill_switch == "ALLOW"
+        assert runner.records[-1].position == 0.0
+        assert runner.engine.position is None
+        assert len(runner.engine.broker.get_positions()) == 0
+        material = {
+            d.classification.value
+            for d in runner.engine.last_report.diffs
+            if d.classification.value != "MATCH"
+        }
+        assert material == set()
+
 
 class TestIdempotencyAndReproducibility:
     def test_duplicates_and_out_of_order_not_processed(self, tmp_path):

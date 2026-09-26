@@ -335,6 +335,34 @@ class TestPositionsAndAccount:
         assert len(positions) == 1
         assert positions[0].quantity == pytest.approx(1.5)
 
+    def test_avg_entry_only_open_quantity_fifo(self) -> None:
+        """El precio medio NO se diluye con la cantidad ya cerrada (multi-trade).
+
+        Trade 1: buy 0.5 @80000, sell 0.5 @90000 (cierra). Reapertura: buy
+        0.2 @90000. La posición abierta es 0.2 @90000; el promedio bruto de
+        todos los buys del lado LONG (0.7) daría ~82857 y haría que la
+        reconciliación bloquee en la 2ª operación de una sesión.
+        """
+        prices = iter([80_000.0, 90_000.0, 90_000.0, 90_000.0])
+        adapter = PaperBrokerAdapter(
+            account_id="PAPER-1",
+            initial_cash=100_000.0,
+            price_source=lambda instrument: next(prices),
+            clock=_now,
+        )
+        adapter.connect()
+        adapter.submit_order(_order("T1-OPEN", quantity=0.5))
+        adapter.submit_order(_order("T1-CLOSE", side=OrderSide.SELL, quantity=0.5))
+        adapter.submit_order(_order("T2-OPEN", quantity=0.2))
+
+        positions = adapter.get_positions()
+        assert len(positions) == 1
+        assert positions[0].quantity == pytest.approx(0.2)
+        assert positions[0].avg_entry_price == pytest.approx(90_000.0)
+        assert adapter.get_account_state().cash == pytest.approx(
+            100_000.0 - 0.5 * 80_000.0 + 0.5 * 90_000.0 - 0.2 * 90_000.0
+        )
+
     def test_account_equity_reflects_unrealized(self) -> None:
         adapter = _paper(cash=100_000.0, price=10_000.0)
         adapter.submit_order(_order("EQ-1", instrument="BTCUSDT", quantity=2.0))

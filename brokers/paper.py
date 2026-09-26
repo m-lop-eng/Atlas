@@ -307,20 +307,46 @@ class PaperBrokerAdapter(BrokerAdapter):
         return float(self.price_source(instrument))
 
     def _avg_entry(self, instrument: str, net_qty: float) -> float:
-        sign = 1.0 if net_qty > 0 else -1.0
-        total_cost = 0.0
-        total_qty = 0.0
-        for o in self._orders.values():
-            if o.instrument != instrument or o.state == BrokerOrderState.CANCELLED:
-                continue
+        """Precio medio de la cantidad REALMENTE abierta (FIFO por lotes).
+
+        El promedio bruto de TODOS los fills del lado de la posición (el código
+        anterior) diluye el precio medio con la cantidad que YA se cerró en un
+        trade previo: tras un cierre y reapertura, el broker divergía del precio
+        medio del engine y la reconciliación bloqueaba por un falso positivo
+        (segunda operación de una sesión multi-trade).
+
+        Método: se reconstruye el coste en lotes FIFO tomando los fills por orden
+        de envío y descontando los del lado contrario; el promedio solo cubre el
+        neto abierto. Sin posición -> precio de referencia (compatibilidad).
+        """
+        lots: list[list[float]] = []  # [cantidad_abierta, precio]
+        pos_sign = 1.0 if net_qty > 0 else -1.0
+        orders = sorted(
+            (
+                o for o in self._orders.values()
+                if o.instrument == instrument
+                and o.state != BrokerOrderState.CANCELLED
+                and o.fills
+            ),
+            key=lambda o: (o.submitted_at, o.broker_order_id),
+        )
+        for o in orders:
             o_sign = 1.0 if o.side.value == "BUY" else -1.0
-            if o_sign != sign:
-                continue
-            total_cost += sum(f.quantity * f.price for f in o.fills)
-            total_qty += sum(f.quantity for f in o.fills)
+            for f in o.fills:
+                if o_sign == pos_sign:
+                    lots.append([f.quantity, f.price])
+                else:
+                    rem = f.quantity
+                    while rem > 1e-12 and lots:
+                        take = min(lots[0][0], rem)
+                        lots[0][0] -= take
+                        rem -= take
+                        if lots[0][0] <= 1e-12:
+                            lots.pop(0)
+        total_qty = sum(l[0] for l in lots)
         if not total_qty:
             return self._price(instrument)
-        return total_cost / total_qty
+        return sum(l[0] * l[1] for l in lots) / total_qty
 
     def _new_order(self, order: Order, broker_order_id: str, now: datetime,
                    state: BrokerOrderState, *, filled_quantity: float = 0.0,
