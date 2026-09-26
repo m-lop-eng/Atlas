@@ -19,7 +19,9 @@ from __future__ import annotations
 import gzip
 import io
 import json
+import socket
 import time
+import urllib.error
 import urllib.request
 import zipfile
 from abc import ABC, abstractmethod
@@ -39,6 +41,22 @@ BINANCE_VISION_DAILY_KLINE_URL = (
     "https://data.binance.vision/data/spot/daily/klines/"
     "{symbol}/{interval}/{symbol}-{interval}-{date}.zip"
 )
+
+
+class DataFetchError(RuntimeError):
+    """Cualquier fallo de red/servidor al descargar un input (operacional)."""
+
+
+class NotFoundError(DataFetchError):
+    """HTTP 404: el recurso (zip) aún no está publicado (benigno)."""
+
+
+class DataTimeoutError(DataFetchError):
+    """La conexión/lectura superó el timeout: nunca esperar indefinidamente."""
+
+
+class DataConnectionError(DataFetchError):
+    """No se pudo conectar al proveedor (DNS/refused/TLS/5xx)."""
 
 
 def _sorted_unique_in_range(
@@ -64,16 +82,37 @@ def _http_get_bytes(
     retries: int = 3,
     wait: float = 1.0,
 ) -> bytes:
+    """Descarga bytes con timeout EXPLÍCITO y errores TIPIFICADOS.
+
+    - HTTP 404 -> `NotFoundError` (recurso no publicado; se lanza al instante,
+      sin reintentar: un 404 no se convierte en éxito con retries).
+    - timeout -> `DataTimeoutError` (la conexión/lectura sobrepasa `timeout`).
+    - resto (DNS, refused, TLS, 5xx, corte) -> `DataConnectionError`.
+    - Nunca deja el proceso esperando indefinidamente: cada intento está
+      acotado por `timeout`, el total por `retries`.
+    """
     last: Exception | None = None
+    timed_out = False
     for attempt in range(retries):
         try:
             with urllib.request.urlopen(url, timeout=timeout) as resp:
                 return resp.read()
-        except Exception as exc:  # noqa: BLE001 - red: reintentar cualquier fallo
+        except Exception as exc:  # noqa: BLE001 - red: clasificar y reintentar
             last = exc
+            if isinstance(exc, urllib.error.HTTPError) and exc.code == 404:
+                raise NotFoundError(
+                    f"No se pudo descargar {url}: HTTP 404 (no publicado)"
+                ) from exc
+            reason = getattr(exc, "reason", exc)
+            if isinstance(reason, (TimeoutError, socket.timeout)):
+                timed_out = True
             if attempt < retries - 1:
                 time.sleep(wait)
-    raise RuntimeError(f"No se pudo descargar {url}: {last}")
+    if timed_out:
+        raise DataTimeoutError(
+            f"No se pudo descargar {url}: timeout tras {timeout}s x {retries}"
+        ) from last
+    raise DataConnectionError(f"No se pudo descargar {url}: {last}") from last
 
 
 @dataclass(frozen=True, slots=True)
@@ -212,10 +251,8 @@ class BinanceVisionSource(DataSource):
         while True:
             try:
                 raw = self._opener(self._month_url(year, month), {"timeout": 90, "retries": 3})
-            except RuntimeError as exc:
-                if "404" in str(exc):
-                    break  # mes en curso: dump aún no publicado
-                raise
+            except NotFoundError:
+                break  # mes en curso: dump aún no publicado
             out.extend(self._parse_zip(raw))
             month += 1
             if month > 12:
@@ -288,10 +325,8 @@ class BinanceVisionDailySource(DataSource):
                 raw = self._opener(
                     self._day_url(year, month, day), {"timeout": 90, "retries": 3}
                 )
-            except RuntimeError as exc:
-                if "404" in str(exc):
-                    break  # dia en curso: dump aún no publicado
-                raise
+            except NotFoundError:
+                break  # dia en curso: dump aún no publicado
             out.extend(BinanceVisionSource._parse_zip(raw))
         return _sorted_unique_in_range(out, start_epoch, end_epoch)
 

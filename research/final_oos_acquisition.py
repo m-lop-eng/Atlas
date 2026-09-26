@@ -22,7 +22,7 @@ Flujo (commit 3, sin tocar el protocolo estadistico ni consumir el FINAL_OOS)::
     quality + coverage + lineage  ->  Frozen dataset (CSV + manifest sha256)
               |
               v
-    estado: BLOCKED_BY_DATA_AVAILABILITY | ELIGIBLE_PARA_DRY_RUN
+    estado: BLOCKED_BY_DATA_AVAILABILITY | ACQUISITION_ERROR | ELIGIBLE_PARA_DRY_RUN
 
 PRINCIPIOS (identicos a tests/test_final_oos_semantics.py):
 
@@ -37,6 +37,13 @@ PRINCIPIOS (identicos a tests/test_final_oos_semantics.py):
     (dentro de un ano se puede reproducir el mismo CSV).
   * No se "rellena" silenciosamente: cualquier hueco (archivo esperado que
     no existe ni 404 produce datos) deja el estado BLOCKED_BY_DATA_AVAILABILITY.
+  * Adquisicion operacional: cada request tiene timeout EXPLICITO
+    (PROBE_TIMEOUT_S) y errores TIPIFICADOS. Un proveedor caido aborta en el
+    PRIMER request con ACQUISITION_ERROR: nunca se espera indefinidamente ni se
+    itera ~340 dias futuros; el scan daily se corta en el primer dia sin
+    publicar (publicacion monotona por dia).
+  * Causas distinguibles: 404 (no publicado, benigno -> cobertura) frente a
+    timeout / sin conexion / zip corrupto (operacional -> ACQUISITION_ERROR con `cause`).
 
 Este modulo no depende de la estrategia, no calibra parametros y no abre H006.
 """
@@ -44,6 +51,7 @@ Este modulo no depende de la estrategia, no calibra parametros y no abre H006.
 from __future__ import annotations
 
 import json
+import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from enum import Enum
@@ -54,7 +62,11 @@ from data.sources import (
     BINANCE_VISION_DAILY_KLINE_URL,
     BINANCE_VISION_KLINE_URL,
     BinanceVisionSource,
+    DataConnectionError,
+    DataFetchError,
     DataSource,
+    DataTimeoutError,
+    NotFoundError,
     _http_get_bytes,
     _sorted_unique_in_range,
 )
@@ -65,17 +77,31 @@ from research.final_oos_dataset import (
     binsance_required_files,
 )
 
+# Timeout EXPLICITO por request de red: nunca esperar indefinidamente. Un
+# request colgado se aborta a los PROBE_TIMEOUT_S; un proveedor caido aborta
+# toda la adquisicion en el PRIMER request (sin iterar meses/dias futuros).
+PROBE_TIMEOUT_S = 20
+PROBE_RETRIES = 2
+
+
+class CorruptDownloadError(DataFetchError):
+    """Un zip ya adquirido no se puede parsear (descarga corrupta/incompleta)."""
+
 
 class AcquisitionStatus(str, Enum):
     """Estado de la adquisicion respecto al tramo objetivo.
 
     - BLOCKED_BY_DATA_AVAILABILITY: la cobertura [start, end) esta incompleta
       (mes/dia sin publicar, hueco real, o span menor que el minimo preregistrado).
+    - ACQUISITION_ERROR: fallo OPERACIONAL de red/adquisicion (timeout, sin
+      conexion, zip corrupto). Estado DETERMINISTA y terminal: no se deja el
+      proceso esperando, no se construye dataset y JAMAS se consume/decide.
     - ELIGIBLE_PARA_DRY_RUN: el dataset congelado cubre [start, end) con calidad
       y puede someterse al protocolo de PREPARACION (e12 --dry-run, sobre copias).
     """
 
     BLOCKED_BY_DATA_AVAILABILITY = "BLOCKED_BY_DATA_AVAILABILITY"
+    ACQUISITION_ERROR = "ACQUISITION_ERROR"
     ELIGIBLE_PARA_DRY_RUN = "ELIGIBLE_PARA_DRY_RUN"
 
 
@@ -115,7 +141,10 @@ class RawZipSource(DataSource):
     def fetch(self, start_epoch: int, end_epoch: int) -> list[dict]:
         rows: list[dict] = []
         for p in sorted(self.paths):
-            rows.extend(BinanceVisionSource._parse_zip(p.read_bytes()))
+            try:
+                rows.extend(BinanceVisionSource._parse_zip(p.read_bytes()))
+            except Exception as exc:  # noqa: BLE001 - zip corrupto/truncado
+                raise CorruptDownloadError(f"zip corrupto: {p}: {exc}") from exc
         return [
             b for b in _sorted_unique_in_range(rows, start_epoch, end_epoch)
         ]
@@ -226,11 +255,11 @@ class FinalOosAcquisition:
                 sha256=sha256_of_file(local),
             )
         try:
-            raw = self._opener(url, {"timeout": 90, "retries": 3})
-        except RuntimeError as exc:
-            if "404" in str(exc):
-                return None  # no publicado aun -> fallback/cobertura incompleta
-            raise
+            raw = self._opener(url, {"timeout": PROBE_TIMEOUT_S, "retries": PROBE_RETRIES})
+        except NotFoundError:
+            return None  # no publicado aun -> fallback/cobertura incompleta
+        # DataTimeoutError/DataConnectionError/DataFetchError: propagan; acquire()
+        # termina en ACQUISITION_ERROR determinista (no cuelga ni itera el resto).
         self._monthly_dir.mkdir(parents=True, exist_ok=True)
         self._daily_dir.mkdir(parents=True, exist_ok=True)
         local.write_bytes(raw)
@@ -274,8 +303,11 @@ class FinalOosAcquisition:
                     continue  # ya cubierto por monthly
                 rec = self._obtain("daily", self._day_url(y, m, d))
                 if rec is None:
-                    # dia no publicado: se registra pipe al final del tramo
-                    continue
+                    # primer dia no publicado: la ventana queda incompleta
+                    # (BLOCKED). Corte AQUI: la publicacion es monotona por dia
+                    # (los dias posteriores serian 404) -> se acota la ejecucion
+                    # a dias realmente publicados + 1, en vez de ~340 request.
+                    break
                 daily.append(rec)
 
         return {
@@ -321,22 +353,64 @@ class FinalOosAcquisition:
     def acquired_inputs(self) -> list[RawInputRecord]:
         return self.acquire()["inputs"]
 
+    def _acquisition_error(
+        self,
+        *,
+        cause: str,
+        detail: str,
+        plan: dict[str, list[str]],
+        inputs: list[RawInputRecord] | None = None,
+        manifest_name: str = "",
+        build_error: str | None = None,
+    ) -> dict[str, Any]:
+        """Estado terminal DETERMINISTA ante un fallo operacional de adquisicion.
+
+        No se construye dataset, no se consuma nada y la causa queda tipificada
+        en `cause` ('timeout' | 'connection_error' | 'corrupt_file' | 'network_error').
+        """
+        return {
+            "status": AcquisitionStatus.ACQUISITION_ERROR,
+            "cause": cause,
+            "reason": detail,
+            "inputs": list(inputs or []),
+            "manifest_inputs": manifest_name,
+            "dataset_sha256": None,
+            "dataset_bars": None,
+            "coverage": None,
+            "eligible": False,
+            "required_files": plan,
+            "build_error": build_error or detail,
+        }
+
     def acquire(self) -> dict[str, Any]:
         """Ejecuta la adquisicion completa y devuelve el estado.
 
         Returns (dict):
-            status            AcquisitionStatus
-            reason            str (detal para BLOCKED)
+            status            AcquisitionStatus (BLOCKED | ACQUISITION_ERROR | ELIGIBLE)
+            cause             str | None: 'coverage' (huecos/span) o codigo
+                              operacional: 'timeout' | 'connection_error' |
+                              'corrupt_file' | 'network_error'
+            reason            str (detal para BLOCKED / ACQUISITION_ERROR)
             inputs            list[RawInputRecord] (todos los zips usados)
-            manifest_inputs   basename del manifest de inputs escrito
+            manifest_inputs   basename del manifest de inputs escrito ('' si fallo antes)
             dataset_sha256    hash del CSV del dataset (si se pudo construir)
             dataset_bars      numero de barras
             coverage          dict del builder (first/last/start/end)
             eligible          bool: cubre [start, end) y span >= min_span
             required_files    dict del plan ideal (lineage del tramo)
+            build_error       str | None
         """
         plan = self.required_files()
-        acquired = self._acquire_inputs()
+        try:
+            acquired = self._acquire_inputs()
+        except DataTimeoutError as exc:
+            return self._acquisition_error(cause="timeout", detail=str(exc), plan=plan)
+        except DataConnectionError as exc:
+            return self._acquisition_error(
+                cause="connection_error", detail=str(exc), plan=plan
+            )
+        except DataFetchError as exc:
+            return self._acquisition_error(cause="network_error", detail=str(exc), plan=plan)
         monthly, daily = acquired["monthly"], acquired["daily"]
         inputs = monthly + daily
 
@@ -371,6 +445,7 @@ class FinalOosAcquisition:
             )
             return {
                 "status": status,
+                "cause": None,
                 "reason": "dataset inmutable ya construido (reproducibilidad: se reutiliza)",
                 "inputs": inputs,
                 "manifest_inputs": manifest_path.name,
@@ -384,9 +459,19 @@ class FinalOosAcquisition:
 
         try:
             build = self._build_dataset(monthly, daily)
+        except CorruptDownloadError as exc:
+            return self._acquisition_error(
+                cause="corrupt_file",
+                detail=str(exc),
+                plan=plan,
+                inputs=inputs,
+                manifest_name=manifest_path.name,
+                build_error=str(exc),
+            )
         except DatasetBuilderError as exc:
             return {
                 "status": AcquisitionStatus.BLOCKED_BY_DATA_AVAILABILITY,
+                "cause": "coverage",
                 "reason": f"cobertura incompleta: {exc}",
                 "inputs": inputs,
                 "manifest_inputs": manifest_path.name,
@@ -412,6 +497,7 @@ class FinalOosAcquisition:
 
         return {
             "status": status,
+            "cause": None,
             "reason": reason,
             "inputs": inputs,
             "manifest_inputs": manifest_path.name,
@@ -479,6 +565,8 @@ def main(argv: list[str] | None = None) -> int:
     res = acq.acquire()
 
     print(f"FINAL_OOS acquisition ........ {res['status'].value}")
+    if res["cause"]:
+        print(f"causa ......................... {res['cause']}")
     if res["reason"]:
         print(f"reason ....................... {res['reason']}")
     print(f"inputs obtenidos ............. {len(res['inputs'])} ({res['manifest_inputs']})")
@@ -487,6 +575,13 @@ def main(argv: list[str] | None = None) -> int:
     if res["dataset_sha256"]:
         print(f"dataset sha256 ............... {res['dataset_sha256'][:16]}... ({res['dataset_bars']} barras)")
     print(f"elegible para dry-run ........ {'SI' if res['eligible'] else 'NO'}")
+    if res["status"] is AcquisitionStatus.ACQUISITION_ERROR:
+        print(
+            "adquisicion ABORTADA: fallo operacional (no se escribio dataset, "
+            "no se autorizo ni consumio nada)",
+            file=sys.stderr,
+        )
+        return 1
     print("NOTA: esto NO consume el FINAL_OOS ni autoriza nada (verificar e12 --status)")
     return 0
 

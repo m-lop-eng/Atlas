@@ -11,6 +11,11 @@ cobertura controlada, y verifica:
   5. reproducibilidad          -> mismos inputs => mismo dataset (offline, sin red)
   6. no consumo                -> tras construir, final_oos_consumed sigue False
   7. no mutacion               -> evidence/data_roles/config/preregistro intactos
+  8. hardening de red          -> timeout / sin conexion / zip corrupto terminan en
+                                 ACQUISITION_ERROR determinista (no cuelgan); el 404
+                                 es cobertura (BLOCKED), nunca error; el scan daily se
+                                 acota al primer dia sin publicar; los registros
+                                 congelados siguen intactos ante un error operacional
 
 Los registros reales se toman SOLO en modo lectura (tests 6 y 7).
 """
@@ -27,6 +32,7 @@ from research.final_oos_acquisition import (
     AcquisitionStatus,
     FinalOosAcquisition,
 )
+from data.sources import DataConnectionError, DataTimeoutError, NotFoundError
 
 ROOT = Path(__file__).resolve().parents[1]
 EVIDENCE = ROOT / "research" / "evidence.json"
@@ -88,26 +94,33 @@ def _url_key(kind: str, url: str) -> str:
 
 
 class FakeVision:
-    """Binance Vision sintetico: `available` con URLs completas o 404."""
+    """Binance Vision sintetico: `available` con URLs completas, 404 o corruptas."""
 
-    def __init__(self, monthly: set[str], daily: set[str]) -> None:
+    def __init__(
+        self, monthly: set[str], daily: set[str], corrupt: set[str] | None = None
+    ) -> None:
         self.monthly = set(monthly)
         self.daily = set(daily)
+        self.corrupt = set(corrupt or ())
         self.calls: list[str] = []
 
     def opener(self, url: str, kw: dict) -> bytes:
         self.calls.append(url)
         if "/monthly/" in url:
             key = _url_key("monthly", url)
+            if key in self.corrupt:
+                return b"contenido corrupto: no es un zip"
             if key in self.monthly:
                 y, m = (int(p) for p in key.split("-"))
                 return month_zip(y, m)
         else:
             key = _url_key("daily", url)
+            if key in self.corrupt:
+                return b"contenido corrupto: no es un zip"
             if key in self.daily:
                 y, m, d = (int(p) for p in key.split("-"))
                 return day_zip(y, m, d)
-        raise RuntimeError(f"No se pudo descargar {url}: HTTP Error 404: Not Found")
+        raise NotFoundError(f"No se pudo descargar {url}: HTTP 404 (no publicado)")
 
 
 def make_acquire(
@@ -321,3 +334,118 @@ def test_required_files_y_inputs_consolean(tmp_path):
     # el plan ideal NO promete daily; los inputs reales reflejan el fallback
     assert {"monthly", "daily"} <= {r.kind for r in res["inputs"]}
     assert res["manifest_inputs"] == "inputs.manifest.json"
+
+
+# ---------------------------------------------------------------------------
+# 8. Hardening de red: estados deterministas, sin colgarse nunca
+# ---------------------------------------------------------------------------
+
+
+def _timeout_opener(url: str, kw: dict) -> bytes:
+    raise DataTimeoutError(f"No se pudo descargar {url}: timeout")
+
+
+def _connection_opener(url: str, kw: dict) -> bytes:
+    raise DataConnectionError(f"No se pudo descargar {url}: [Errno 11001] getaddrinfo failed")
+
+
+def test_timeout_aborta_en_estado_determinista_no_cuelga(tmp_path):
+    acq = make_acquire(FakeVision(set(), set()), tmp_path, end=START + 3 * DAY)
+    acq._opener = _timeout_opener
+    res = acq.acquire()
+
+    assert res["status"] is AcquisitionStatus.ACQUISITION_ERROR
+    assert res["cause"] == "timeout"
+    assert not res["eligible"]
+    assert res["dataset_sha256"] is None
+
+
+def test_error_de_conexion_aborta_en_estado_determinista(tmp_path):
+    acq = make_acquire(FakeVision(set(), set()), tmp_path, end=START + 3 * DAY)
+    acq._opener = _connection_opener
+    res = acq.acquire()
+
+    assert res["status"] is AcquisitionStatus.ACQUISITION_ERROR
+    assert res["cause"] == "connection_error"
+    assert not res["eligible"]
+
+
+def test_404_es_cobertura_no_error(tmp_path):
+    # nada publicado aun: todos los probe 404 -> BLOCKED (cobertura), NUNCA error
+    acq = make_acquire(FakeVision(set(), set()), tmp_path, end=START + 3 * DAY)
+    res = acq.acquire()
+
+    assert res["status"] is AcquisitionStatus.BLOCKED_BY_DATA_AVAILABILITY
+    assert res["cause"] == "coverage"
+    assert res["dataset_sha256"] is None
+
+
+def test_zip_corrupto_clasifica_corrupt_file(tmp_path):
+    fake = FakeVision(monthly={"2026-09"}, daily={"2026-10-01"}, corrupt={"2026-09"})
+    acq = make_acquire(fake, tmp_path, end=START + 33 * DAY)
+    res = acq.acquire()
+
+    assert res["status"] is AcquisitionStatus.ACQUISITION_ERROR
+    assert res["cause"] == "corrupt_file"
+    assert "zip corrupto" in res["reason"]
+    assert res["dataset_sha256"] is None
+    assert not res["eligible"]
+
+
+def test_scan_diario_se_detiene_en_primer_hueco(tmp_path):
+    # hueco en medio de la serie diaria: el scan NO sondea dias posteriores al
+    # primer dia sin publicar (publicacion monotona); ejecucion acotada.
+    fake = FakeVision(monthly=set(), daily={"2026-09-01", "2026-09-02", "2026-09-04"})
+    acq = make_acquire(fake, tmp_path, end=START + 4 * DAY)
+    res = acq.acquire()
+
+    daily_calls = [u for u in fake.calls if "/daily/" in u]
+    assert [_url_key("daily", u) for u in daily_calls] == [
+        "2026-09-01",
+        "2026-09-02",
+        "2026-09-03",
+    ]
+    assert {r.date_key for r in res["inputs"]} == {"2026-09-01", "2026-09-02"}
+    assert res["status"] is AcquisitionStatus.BLOCKED_BY_DATA_AVAILABILITY
+
+
+def test_scan_diario_acotado_a_primer_dia_faltante(tmp_path):
+    # estado real hoy: monthly 404 + daily publicados hasta 09-25. La ventana
+    # completa son ~365 dias; el scan DEBE parar en el primer 404 (09-26) en
+    # lugar de sondear ~340 dias futuros (el bug que colgaba el proceso).
+    fake = FakeVision(
+        monthly=set(),
+        daily={f"2026-09-{d:02d}" for d in range(1, 26)},
+    )
+    acq = make_acquire(fake, tmp_path, end=START + 365 * DAY)
+    res = acq.acquire()
+
+    daily_calls = [u for u in fake.calls if "/daily/" in u]
+    assert len(daily_calls) == 26  # 09-01..09-25 (hit) + 09-26 (primer 404, corte)
+    assert daily_calls[-1].endswith("2026-09-26.zip")
+    assert not any("/daily/2026-10" in u for u in fake.calls)
+    assert res["status"] is AcquisitionStatus.BLOCKED_BY_DATA_AVAILABILITY
+    assert res["cause"] == "coverage"
+
+
+def test_error_de_red_no_muta_registros(tmp_path):
+    before = {
+        "evidence": _bytes(EVIDENCE),
+        "roles": _bytes(ROLES),
+        "config": _bytes(CONFIG),
+        "plan": _bytes(PLAN),
+    }
+    assert before["evidence"] and before["roles"], "prerequisito: registros reales"
+
+    acq = make_acquire(FakeVision(set(), set()), tmp_path, end=START + 3 * DAY)
+    acq._opener = _timeout_opener
+    res = acq.acquire()
+    assert res["status"] is AcquisitionStatus.ACQUISITION_ERROR
+
+    after = {
+        "evidence": _bytes(EVIDENCE),
+        "roles": _bytes(ROLES),
+        "config": _bytes(CONFIG),
+        "plan": _bytes(PLAN),
+    }
+    assert after == before, "un fallo de adquisicion NO debe mutar los registros congelados"

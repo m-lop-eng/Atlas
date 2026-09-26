@@ -17,7 +17,7 @@ import zipfile
 
 import pytest
 
-from data.sources import BinanceVisionDailySource, DataSource
+from data.sources import BinanceVisionDailySource, DataSource, NotFoundError
 from data.synthetic import generate_ohlc_bars
 from research.final_oos_dataset import (
     DatasetBuilderError,
@@ -293,7 +293,7 @@ def test_daily_source_fetch_por_dias():
     def opener(url: str, kw: dict) -> bytes:
         calls.append(url)
         if "2026-09-02" in url:
-            raise RuntimeError(f"No se pudo descargar {url}: HTTP Error 404")
+            raise NotFoundError(f"No se pudo descargar {url}: HTTP 404 (no publicado)")
         base = day0 if "2026-09-01" in url else day0 + 24 * HOUR
         return _zip_of(
             [

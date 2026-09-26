@@ -4,13 +4,20 @@ from __future__ import annotations
 
 import io
 import json
+import urllib.error
 import zipfile
+
+import pytest
 
 from data.market import epoch_of
 from data.sources import (
     BinanceVisionSource,
     CsvSource,
+    DataConnectionError,
     DataManifest,
+    DataTimeoutError,
+    NotFoundError,
+    _http_get_bytes,
     write_dataset,
 )
 from data.synthetic import write_ohlc_csv
@@ -43,7 +50,7 @@ def test_parse_zip_mixed_units() -> None:
 def test_fetch_concatenates_and_filters(monkeypatch) -> None:
     def opener(url: str, kw: dict) -> bytes:
         if "2025-03" in url:
-            raise RuntimeError(f"No se pudo descargar {url}: HTTP Error 404")
+            raise NotFoundError(f"No se pudo descargar {url}: HTTP 404 (no publicado)")
         month = int(url.rsplit("-", 1)[1].split(".")[0])
         base = 1735689600 + (month - 1) * 31 * 24 * 3600
         return _zip_of([
@@ -94,3 +101,55 @@ def test_manifest_roundtrip_and_write(tmp_path) -> None:
     assert loaded == m
     assert loaded.bars == 1
     assert loaded.sha256
+
+
+# ---------------------------------------------------------------------------
+# _http_get_bytes: timeout EXPLICITO y errores TIPIFICADOS (sin red)
+# ---------------------------------------------------------------------------
+
+
+def test_http_get_404_es_notfound_sin_reintentar(monkeypatch) -> None:
+    calls: list[int] = []
+
+    def fake_urlopen(url: str, timeout: int):
+        calls.append(timeout)
+        raise urllib.error.HTTPError(url, 404, "Not Found", None, None)
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    with pytest.raises(NotFoundError):
+        _http_get_bytes("https://x/a.zip", timeout=7, retries=3)
+    assert calls == [7], "un 404 NO se reintenta: no se convierte en exito"
+
+
+def test_http_get_timeout_clasifica_timeout(monkeypatch) -> None:
+    calls: list[int] = []
+
+    def fake_urlopen(url: str, timeout: int):
+        calls.append(timeout)
+        raise TimeoutError("timed out")
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    with pytest.raises(DataTimeoutError, match="timeout"):
+        _http_get_bytes("https://x/a.zip", timeout=5, retries=2, wait=0)
+    assert len(calls) == 2, "timeout es transitorio: se reintenta y luego aborta"
+
+
+def test_http_get_conexion_clasifica_conexion(monkeypatch) -> None:
+    err = urllib.error.URLError(ConnectionRefusedError("refused"))
+
+    def fake_urlopen(url: str, timeout: int):
+        raise err
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    with pytest.raises(DataConnectionError):
+        _http_get_bytes("https://x/a.zip", timeout=5, retries=2, wait=0)
+
+
+def test_http_get_respuesta_valida_devuelve_bytes(monkeypatch) -> None:
+    body = b"klines"
+
+    def fake_urlopen(url: str, timeout: int):
+        return io.BytesIO(body)
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    assert _http_get_bytes("https://x/a.zip", timeout=5, retries=2, wait=0) == body
