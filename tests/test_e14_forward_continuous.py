@@ -17,6 +17,8 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
+import pytest
+
 from experiments import e14_forward_continuous as e14
 
 
@@ -119,3 +121,67 @@ def test_data_fetch_error_is_incident_and_preserves_state(tmp_path, monkeypatch)
     assert e14.build_report(
         _args(tmp_path, run_id="FORWARD-PAPER-A4T"), out_dir, datetime.now(timezone.utc)
     )["ejecucion"]["barras_totales"] == 0
+
+
+def test_instance_lock_prevents_second(tmp_path: Path) -> None:
+    path = tmp_path / "FORWARD-PAPER-A4" / e14.LOCK_NAME
+    lock1 = e14.ForwardInstanceLock(path)
+    lock1.acquire()
+    try:
+        with pytest.raises(e14.AlreadyRunningError):
+            e14.ForwardInstanceLock(path).acquire()
+    finally:
+        lock1.release()
+    # reusable tras liberar
+    lock2 = e14.ForwardInstanceLock(path)
+    lock2.acquire()
+    lock2.release()
+
+
+def test_status_does_not_acquire_lock(tmp_path: Path) -> None:
+    rc = e14.main(
+        ["--status", "--run-id", "FORWARD-PAPER-STATUS", "--out-root", str(tmp_path)]
+    )
+    assert rc == 0
+    assert not (tmp_path / "FORWARD-PAPER-STATUS" / e14.LOCK_NAME).exists()
+
+
+def test_run_cycle_skips_when_locked(tmp_path: Path, monkeypatch) -> None:
+    run_id = "FORWARD-PAPER-A4L"
+    out_dir = tmp_path / run_id
+    lock = e14.ForwardInstanceLock(out_dir / e14.LOCK_NAME)
+    lock.acquire()
+
+    class _NoNetwork:
+        def __init__(self, **_kwargs) -> None:
+            pass
+
+        def fetch(self, *_a, **_k):
+            raise AssertionError("no debe llegar a la red si el lock esta tomado")
+
+    monkeypatch.setattr(e14, "BinanceVisionDailySource", _NoNetwork)
+    try:
+        result = e14.run_cycle(_args(tmp_path, run_id=run_id, now="2026-09-26T14:00:00"))
+    finally:
+        lock.release()
+
+    assert result.get("locked") is True
+    assert result["report"] is None
+
+
+def test_run_cycle_releases_lock(tmp_path: Path, monkeypatch) -> None:
+    class _EmptySource:
+        def __init__(self, **_kwargs) -> None:
+            pass
+
+        def fetch(self, *_a, **_k):
+            return []
+
+    monkeypatch.setattr(e14, "BinanceVisionDailySource", _EmptySource)
+    run_id = "FORWARD-PAPER-A4R"
+    result = e14.run_cycle(_args(tmp_path, run_id=run_id, now="2026-09-26T14:00:00"))
+    assert result.get("locked") is False
+
+    lock = e14.ForwardInstanceLock(tmp_path / run_id / e14.LOCK_NAME)
+    lock.acquire()
+    lock.release()

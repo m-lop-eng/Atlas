@@ -25,6 +25,7 @@ import json
 import os
 import sys
 import time
+import uuid
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
@@ -37,12 +38,98 @@ from data.sources import BinanceVisionDailySource, DataFetchError  # noqa: E402
 from live.adapter import BackfillProvider  # noqa: E402
 from live.engine import EngineState, LiveDataEngine  # noqa: E402
 from live.events import MarketDataEvent  # noqa: E402
-from papertrading.forward_runner import build_forward_runner  # noqa: E402
+from papertrading.forward_runner import (  # noqa: E402
+    ForwardConfigError,
+    build_forward_runner,
+)
 from papertrading.replay import ReplayMarketDataAdapter  # noqa: E402
 
 SYMBOL = "BTCUSDT"
 INTERVAL = 3600
 OUT_ROOT = ROOT / "experiments" / "forward" / "outputs"
+LOCK_NAME = ".forward.lock"
+
+
+class AlreadyRunningError(RuntimeError):
+    """Otra instancia de A4 mantiene el lock de este directorio de estado."""
+
+
+class ForwardInstanceLock:
+    """Lock de instancia unica sobre el directorio de estado de A4.
+
+    Usa un lock de fichero del SO (msvcrt en Windows / fcntl en POSIX): el SO
+    libera el lock al morir el proceso, por lo que un proceso muerto NO deja un
+    lock stale que requiera limpieza manual. NO se elimina el fichero de lock:
+    asi JAMAS se borra un lock perteneciente a otra instancia.
+
+    Se libera con `release()` (o como context manager). `--status` no lo usa.
+    """
+
+    def __init__(self, path: str | Path) -> None:
+        self.path = Path(path)
+        self._fh = None
+
+    @staticmethod
+    def _lock(fh) -> None:
+        if os.name == "nt":
+            import msvcrt
+
+            msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    @staticmethod
+    def _unlock(fh) -> None:
+        if os.name == "nt":
+            import msvcrt
+
+            try:
+                fh.seek(0)
+                msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+            except OSError:
+                pass
+        else:
+            import fcntl
+
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+
+    def acquire(self) -> "ForwardInstanceLock":
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        fh = self.path.open("a+", encoding="utf-8")
+        try:
+            fh.seek(0)
+            self._lock(fh)
+        except OSError as exc:
+            fh.close()
+            raise AlreadyRunningError(
+                f"otra instancia de A4 activa sobre {self.path}"
+            ) from exc
+        try:
+            fh.seek(0)
+            fh.truncate()
+            fh.write(f"pid={os.getpid()} token={uuid.uuid4().hex}\n")
+            fh.flush()
+        except OSError:
+            pass
+        self._fh = fh
+        return self
+
+    def release(self) -> None:
+        if self._fh is None:
+            return
+        try:
+            self._unlock(self._fh)
+        finally:
+            self._fh.close()
+            self._fh = None
+
+    def __enter__(self) -> "ForwardInstanceLock":
+        return self.acquire()
+
+    def __exit__(self, *exc) -> None:
+        self.release()
 
 
 def _iso(epoch: int) -> str:
@@ -131,122 +218,189 @@ def run_cycle(args: argparse.Namespace) -> dict:
     )
     now = int(now_dt.timestamp())
 
-    runner = build_forward_runner(run_id=args.run_id, output_dir=out_root).start()
-    n0 = len(runner.records)
-    persisted = _read_rows(runner._bars_path)
-    last_open = max((int(r["bar"]["open_time"]) for r in persisted), default=None)
-    restarted = bool(persisted)
-
-    if last_open is None:
-        start = now - args.seed_days * 24 * INTERVAL
-    else:
-        start = last_open + INTERVAL
-    source = BinanceVisionDailySource(symbol=SYMBOL, interval="1h")
-
-    new_bars: list[dict] = []
-    fetch_error: str | None = None
+    lock = ForwardInstanceLock(out_dir / LOCK_NAME)
     try:
-        new_bars = [b for b in source.fetch(start, now + INTERVAL) if int(b["ts"]) >= start]
-    except DataFetchError as exc:
-        fetch_error = str(exc)
+        lock.acquire()
+    except AlreadyRunningError as exc:
+        return {
+            "locked": True,
+            "cycle": {"at": now_dt.isoformat(), "locked": True, "reason": str(exc)},
+            "report": None,
+            "incidents": [],
+        }
 
-    events = [_row_to_event(r) for r in persisted] + [_bar_to_event(b) for b in new_bars]
-    adapter = ReplayMarketDataAdapter(events)
-    counters = {"emitted": 0, "delivered": 0, "deduped": 0}
-    new_records: list[dict] = []
-
-    def on_closed(closed) -> None:
-        counters["emitted"] += 1
-        rec = runner.on_closed_bar(
-            closed,
-            data_quality="HEALTHY",
-            at=datetime.fromtimestamp(closed.close_time, tz=timezone.utc),
-        )
-        if rec is None:
-            counters["deduped"] += 1
-        else:
-            counters["delivered"] += 1
-
-    engine = LiveDataEngine(
-        SYMBOL,
-        INTERVAL,
-        adapter,
-        stale_timeout_seconds=86_400.0,
-        backfill_provider=VisionBackfill(source),
-        on_closed_bar=on_closed,
-        clock=time.time,
-    )
-    engine.start()
-    engine.poll(max_events=len(events) + 10)
-    reconcile_rounds = 0
-    while engine.state == EngineState.DEGRADED and reconcile_rounds < 3:
+    try:
+        runner = build_forward_runner(run_id=args.run_id, output_dir=out_root)
         try:
-            engine.reconcile()
-        except (DataFetchError, ConnectionError) as exc:
-            _incident(out_dir, "BACKFILL_FALLO", {"error": str(exc)}, now_dt)
-            break
+            runner.start()
+        except ForwardConfigError as exc:
+            inc = _incident(
+                out_dir, "INPUT_FINGERPRINT_MISMATCH", {"error": str(exc)}, now_dt
+            )
+            report = build_report(args, out_dir, now_dt)
+            (out_dir / "report_a4.json").write_text(
+                json.dumps(report, indent=2, sort_keys=True, default=str),
+                encoding="utf-8",
+            )
+            return {
+                "locked": False,
+                "cycle": {
+                    "at": now_dt.isoformat(),
+                    "fingerprint_mismatch": True,
+                    "reason": str(exc),
+                    "incidentes": 1,
+                },
+                "report": report,
+                "incidents": [inc],
+            }
+
+        n0 = len(runner.records)
+        persisted = _read_rows(runner._bars_path)
+        last_open = max((int(r["bar"]["open_time"]) for r in persisted), default=None)
+        restarted = bool(persisted)
+
+        if last_open is None:
+            start = now - args.seed_days * 24 * INTERVAL
+        else:
+            start = last_open + INTERVAL
+        source = BinanceVisionDailySource(symbol=SYMBOL, interval="1h")
+
+        new_bars: list[dict] = []
+        fetch_error: str | None = None
+        try:
+            new_bars = [
+                b for b in source.fetch(start, now + INTERVAL) if int(b["ts"]) >= start
+            ]
+        except DataFetchError as exc:
+            fetch_error = str(exc)
+
+        events = [_row_to_event(r) for r in persisted] + [
+            _bar_to_event(b) for b in new_bars
+        ]
+        adapter = ReplayMarketDataAdapter(events)
+        counters = {"emitted": 0, "delivered": 0, "deduped": 0}
+
+        def on_closed(closed) -> None:
+            counters["emitted"] += 1
+            rec = runner.on_closed_bar(
+                closed,
+                data_quality="HEALTHY",
+                at=datetime.fromtimestamp(closed.close_time, tz=timezone.utc),
+            )
+            if rec is None:
+                counters["deduped"] += 1
+            else:
+                counters["delivered"] += 1
+
+        engine = LiveDataEngine(
+            SYMBOL,
+            INTERVAL,
+            adapter,
+            stale_timeout_seconds=86_400.0,
+            backfill_provider=VisionBackfill(source),
+            on_closed_bar=on_closed,
+            clock=time.time,
+        )
+        engine.start()
         engine.poll(max_events=len(events) + 10)
-        reconcile_rounds += 1
+        reconcile_rounds = 0
+        while engine.state == EngineState.DEGRADED and reconcile_rounds < 3:
+            try:
+                engine.reconcile()
+            except (DataFetchError, ConnectionError) as exc:
+                _incident(out_dir, "BACKFILL_FALLO", {"error": str(exc)}, now_dt)
+                break
+            engine.poll(max_events=len(events) + 10)
+            reconcile_rounds += 1
 
-    new_records = [r.to_dict() for r in runner.records[n0:]]
+        new_records = [r.to_dict() for r in runner.records[n0:]]
 
-    incidents = []
-    if fetch_error:
-        incidents.append(_incident(out_dir, "PROVIDER_ERROR", {"error": fetch_error}, now_dt))
-    if engine.state == EngineState.DEGRADED:
-        incidents.append(
-            _incident(
-                out_dir,
-                "GAP_NO_RECONCILIADO",
-                {"state": engine.state.value, "quality": engine.quality.value,
-                 "issues": [list(i) for i in engine.issues[-5:]]},
-                now_dt,
+        incidents = []
+        if fetch_error:
+            incidents.append(
+                _incident(out_dir, "PROVIDER_ERROR", {"error": fetch_error}, now_dt)
             )
+        if engine.state == EngineState.DEGRADED:
+            incidents.append(
+                _incident(
+                    out_dir,
+                    "GAP_NO_RECONCILIADO",
+                    {
+                        "state": engine.state.value,
+                        "quality": engine.quality.value,
+                        "issues": [list(i) for i in engine.issues[-5:]],
+                    },
+                    now_dt,
+                )
+            )
+        for rec in new_records:
+            if rec["reconciliation_status"] == "RECONCILIATION_BLOCKED":
+                incidents.append(
+                    _incident(
+                        out_dir,
+                        "RECONCILIATION_BLOCKED",
+                        {"bar": rec["timestamp"], "diffs": rec["reconciliation_diffs"]},
+                        now_dt,
+                    )
+                )
+            if rec["kill_switch"] != "ALLOW":
+                incidents.append(
+                    _incident(
+                        out_dir,
+                        "KILL_SWITCH_ACTIVO",
+                        {
+                            "bar": rec["timestamp"],
+                            "state": rec["kill_switch"],
+                            "can_trade": rec["can_trade"],
+                        },
+                        now_dt,
+                    )
+                )
+            if rec["submission_status"] == "UNKNOWN":
+                incidents.append(
+                    _incident(out_dir, "ORDEN_UNKNOWN", {"bar": rec["timestamp"]}, now_dt)
+                )
+
+        # manifest identifica exactamente el input/estado en reposo de este ciclo
+        runner.checkpoint()
+
+        cycle = {
+            "at": now_dt.isoformat(),
+            "restart": restarted,
+            "last_open_before": last_open,
+            "seed_start": _iso(start),
+            "new_bars": len(new_bars),
+            "engine_state": engine.state.value,
+            "engine_quality": engine.quality.value,
+            "emitidas_b1": counters["emitted"],
+            "procesadas": counters["delivered"],
+            "deduplicadas": counters["deduped"],
+            "reconcile_rounds": reconcile_rounds,
+            "provider_error": fetch_error,
+            "incidentes": len(incidents),
+        }
+        _append_ndjson(out_dir / "ops_log.ndjson", cycle)
+        if new_records:
+            _append_ndjson(
+                out_dir / "new_records.ndjson",
+                {
+                    "at": now_dt.isoformat(),
+                    "count": len(new_records),
+                    "bars": [r["timestamp"] for r in new_records],
+                },
+            )
+        report = build_report(args, out_dir, now_dt)
+        (out_dir / "report_a4.json").write_text(
+            json.dumps(report, indent=2, sort_keys=True, default=str), encoding="utf-8"
         )
-    for rec in new_records:
-        if rec["reconciliation_status"] == "RECONCILIATION_BLOCKED":
-            incidents.append(
-                _incident(out_dir, "RECONCILIATION_BLOCKED",
-                          {"bar": rec["timestamp"], "diffs": rec["reconciliation_diffs"]}, now_dt)
-            )
-        if rec["kill_switch"] != "ALLOW":
-            incidents.append(
-                _incident(out_dir, "KILL_SWITCH_ACTIVO",
-                          {"bar": rec["timestamp"], "state": rec["kill_switch"],
-                           "can_trade": rec["can_trade"]}, now_dt)
-            )
-        if rec["submission_status"] == "UNKNOWN":
-            incidents.append(
-                _incident(out_dir, "ORDEN_UNKNOWN", {"bar": rec["timestamp"]}, now_dt)
-            )
-
-    cycle = {
-        "at": now_dt.isoformat(),
-        "restart": restarted,
-        "last_open_before": last_open,
-        "seed_start": _iso(start),
-        "new_bars": len(new_bars),
-        "engine_state": engine.state.value,
-        "engine_quality": engine.quality.value,
-        "emitidas_b1": counters["emitted"],
-        "procesadas": counters["delivered"],
-        "deduplicadas": counters["deduped"],
-        "reconcile_rounds": reconcile_rounds,
-        "provider_error": fetch_error,
-        "incidentes": len(incidents),
-    }
-    _append_ndjson(out_dir / "ops_log.ndjson", cycle)
-    if new_records:
-        _append_ndjson(
-            out_dir / "new_records.ndjson",
-            {"at": now_dt.isoformat(), "count": len(new_records),
-             "bars": [r["timestamp"] for r in new_records]},
-        )
-    report = build_report(args, out_dir, now_dt)
-    (out_dir / "report_a4.json").write_text(
-        json.dumps(report, indent=2, sort_keys=True, default=str), encoding="utf-8"
-    )
-    return {"cycle": cycle, "report": report, "incidents": incidents}
+        return {
+            "locked": False,
+            "cycle": cycle,
+            "report": report,
+            "incidents": incidents,
+        }
+    finally:
+        lock.release()
 
 
 def build_report(args: argparse.Namespace, out_dir: Path, now_dt: datetime) -> dict:
@@ -383,7 +537,17 @@ def main(argv: list[str] | None = None) -> int:
 
     while True:
         result = run_cycle(args)
+        if result.get("locked"):
+            print(f"[{result['cycle']['at']}] SKIP: {result['cycle']['reason']}")
+            return 0
         c = result["cycle"]
+        if c.get("fingerprint_mismatch"):
+            print(
+                f"[{c['at']}] INPUT FINGERPRINT MISMATCH -> fail-safe (sin procesar): "
+                f"{c['reason']}"
+            )
+            _print_report(result["report"])
+            return 1
         print(
             f"[{c['at']}] restart={c['restart']} nuevas={c['new_bars']} "
             f"b1={c['emitidas_b1']} procesadas={c['procesadas']} dedup={c['deduplicadas']} "

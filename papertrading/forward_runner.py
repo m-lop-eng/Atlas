@@ -38,6 +38,7 @@ el modelo de costes del FINAL_OOS (0.15/lado) es exclusivo de la evaluacion OOS.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import time
@@ -281,8 +282,26 @@ class ForwardRunner:
         (solo un `recover(reason, health_checks_ok=True)` explicito rehabilita
         el trading). Un snapshot legacy sin bloque `kill_switch` arranca sin
         latch (ese formato no persistia B5).
+
+        Input fingerprint: el manifest registra sha256+conteo+extremos de
+        bars.jsonl (`checkpoint()` lo refresca al cerrar cada ciclo). Al
+        arrancar se verifica que bars.jsonl EMPIECE con el prefijo registrado;
+        una extension por append (crash a mitad de ciclo) es valida, pero una
+        alteracion/truncamiento del estado lanza ForwardConfigError (fail-safe,
+        sin reconstruir en silencio).
         """
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        recorded = self._load_manifest_fingerprint()
+        if recorded is not None:
+            current = self._input_fingerprint(limit=int(recorded["bars"]))
+            if current != recorded:
+                raise ForwardConfigError(
+                    "input fingerprint mismatch: bars.jsonl ya no coincide con el "
+                    f"manifest (manifest bars={recorded.get('bars')}, "
+                    f"first_ts={recorded.get('first_ts')}, "
+                    f"last_ts={recorded.get('last_ts')}); estado alterado o input "
+                    "inesperado: no se procesa (fail-safe)."
+                )
         self._write_manifest()
         kill_switch_snapshot = self._load_kill_switch_snapshot()
         persisted = self._load_bars()
@@ -322,15 +341,21 @@ class ForwardRunner:
     # ---------------------------------------------------------------- persist
 
     def _write_manifest(self) -> None:
+        created_at = _now_utc().isoformat()
         if self._manifest_path.exists():
-            return
+            try:
+                existing = json.loads(self._manifest_path.read_text(encoding="utf-8"))
+                created_at = str(existing.get("created_at", created_at))
+            except (OSError, json.JSONDecodeError):
+                pass
         manifest = {
             "run_id": self.run_id,
             "instrument": self.instrument,
             "broker": "PaperBrokerAdapter",
             "strategy_hash": self.strategy_hash,
             "config_hash": FROZEN_CONFIG_HASH,
-            "created_at": _now_utc().isoformat(),
+            "created_at": created_at,
+            "input_fingerprint": self._input_fingerprint(),
             "output_files": {
                 "bars": self._bars_path.name,
                 "records": self._records_path.name,
@@ -340,6 +365,64 @@ class ForwardRunner:
         }
         manifest.update(self._lineage)
         self._write_json(self._manifest_path, manifest)
+
+    def checkpoint(self) -> None:
+        """Refresca el manifest con el fingerprint del input/estado actual.
+
+        Se llama al cerrar cada ciclo forward: el manifest identifica de forma
+        exacta las barras que produjeron el estado en reposo.
+        """
+        self._write_manifest()
+
+    def _input_fingerprint(self, limit: int | None = None) -> dict:
+        """Identidad del input persistido (bars.jsonl), opcionalmente truncado.
+
+        Devuelve sha256 + conteo + extremos. Con `limit`, hashea SOLO las
+        primeras `limit` barras: permite comprobar que el estado arranca con el
+        prefijo ya registrado (extension por append es valida; alteracion no).
+        """
+        data = self._bars_path.read_bytes() if self._bars_path.exists() else b""
+        if limit is not None and limit >= 0:
+            pos = 0
+            count = 0
+            while count < limit:
+                nl = data.find(b"\n", pos)
+                if nl == -1:
+                    break
+                pos = nl + 1
+                count += 1
+            data = data[:pos]
+        bars = 0
+        first_ts: int | None = None
+        last_ts: int | None = None
+        for line in data.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            ts = int(json.loads(line)["bar"]["open_time"])
+            if first_ts is None:
+                first_ts = ts
+            last_ts = ts
+            bars += 1
+        return {
+            "sha256": hashlib.sha256(data).hexdigest(),
+            "bars": bars,
+            "first_ts": first_ts,
+            "last_ts": last_ts,
+        }
+
+    def _load_manifest_fingerprint(self) -> dict | None:
+        """Fingerprint de input registrado en el manifest previo (o None)."""
+        if not self._manifest_path.exists():
+            return None
+        try:
+            manifest = json.loads(self._manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        fp = manifest.get("input_fingerprint")
+        if not isinstance(fp, dict) or "bars" not in fp or "sha256" not in fp:
+            return None  # manifest legacy: sin fingerprint -> sin verificacion
+        return fp
 
     def _load_bars(self) -> list[dict]:
         if not self._bars_path.exists():

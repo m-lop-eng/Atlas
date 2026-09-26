@@ -617,3 +617,99 @@ class TestKillSwitchPersistence:
 
         with pytest.raises(ForwardConfigError):
             _make(tmp_path, run_id)
+
+
+class TestInputFingerprint:
+    """El manifest identifica el input (bars.jsonl); un cambio inesperado es fail-safe."""
+
+    @staticmethod
+    def _manifest(tmp_path, run_id: str) -> dict:
+        return json.loads((tmp_path / run_id / "manifest.json").read_text("utf-8"))
+
+    def test_checkpoint_records_fingerprint(self, tmp_path) -> None:
+        run_id = "TEST-FWD-FP"
+        n = len(_scenario())
+        runner = _make(tmp_path, run_id)
+        _drive(runner, _scenario())
+        runner.checkpoint()
+        fp = self._manifest(tmp_path, run_id)["input_fingerprint"]
+        assert fp["bars"] == n
+        assert fp["first_ts"] == START
+        assert fp["last_ts"] == START + (n - 1) * INTERVAL
+
+    def test_resume_without_change_ok(self, tmp_path) -> None:
+        run_id = "TEST-FWD-FP2"
+        runner = _make(tmp_path, run_id)
+        _drive(runner, _scenario())
+        runner.checkpoint()
+        restarted = _make(tmp_path, run_id)
+        assert len(restarted.records) == len(_scenario())
+
+    def test_resume_with_extension_ok(self, tmp_path) -> None:
+        run_id = "TEST-FWD-FP3"
+        n = len(_scenario())
+        runner = _make(tmp_path, run_id)
+        _drive(runner, _scenario())
+        runner.checkpoint()
+        extra = _closed(n, FLAT)  # barra nueva posterior al prefijo registrado
+        row = {
+            "bar": {
+                "symbol": INSTRUMENT,
+                "open_time": extra.open_time,
+                "open": extra.open,
+                "high": extra.high,
+                "low": extra.low,
+                "close": extra.close,
+                "volume": extra.volume,
+                "interval_seconds": INTERVAL,
+                "emission_sequence": n + 1,
+            },
+            "quality": "HEALTHY",
+        }
+        with (tmp_path / run_id / "bars.jsonl").open(
+            "a", encoding="utf-8", newline="\n"
+        ) as fh:
+            fh.write(json.dumps(row) + "\n")
+        restarted = _make(tmp_path, run_id)
+        assert len(restarted.records) == n + 1
+
+    def test_resume_with_content_change_fails_loud(self, tmp_path) -> None:
+        run_id = "TEST-FWD-FP4"
+        runner = _make(tmp_path, run_id)
+        _drive(runner, _scenario())
+        runner.checkpoint()
+        p = tmp_path / run_id / "bars.jsonl"
+        p.write_text(p.read_text("utf-8").replace("50200", "95000", 1), encoding="utf-8")
+        with pytest.raises(ForwardConfigError):
+            _make(tmp_path, run_id)
+
+    def test_resume_with_truncation_fails_loud(self, tmp_path) -> None:
+        run_id = "TEST-FWD-FP5"
+        runner = _make(tmp_path, run_id)
+        _drive(runner, _scenario())
+        runner.checkpoint()
+        p = tmp_path / run_id / "bars.jsonl"
+        lines = p.read_text("utf-8").splitlines()
+        p.write_text("\n".join(lines[:-3]) + "\n", encoding="utf-8")
+        with pytest.raises(ForwardConfigError):
+            _make(tmp_path, run_id)
+
+    def test_legacy_manifest_without_fingerprint_ok(self, tmp_path) -> None:
+        run_id = "TEST-FWD-FP6"
+        runner = _make(tmp_path, run_id)
+        _drive(runner, _scenario())
+        runner.checkpoint()
+        man = tmp_path / run_id / "manifest.json"
+        payload = json.loads(man.read_text("utf-8"))
+        payload.pop("input_fingerprint", None)
+        man.write_text(json.dumps(payload), encoding="utf-8")
+        restarted = _make(tmp_path, run_id)
+        assert len(restarted.records) == len(_scenario())
+
+    def test_created_at_preserved_across_checkpoint(self, tmp_path) -> None:
+        run_id = "TEST-FWD-FP7"
+        runner = _make(tmp_path, run_id)
+        created = self._manifest(tmp_path, run_id)["created_at"]
+        _drive(runner, _scenario())
+        runner.checkpoint()
+        assert self._manifest(tmp_path, run_id)["created_at"] == created
