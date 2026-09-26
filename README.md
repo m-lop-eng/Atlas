@@ -60,8 +60,8 @@ docs/          Documentación técnica del repositorio
 **Milestone 1 — Pipeline de investigación reproducible (en curso).**
 Arquitectura, motor de backtest, riesgo, ejecución, diagnóstico por trade,
 controles nulos, lineage de experimentos y datos reales funcionando.
-Además, en esta sesión se construyó la **capa en vivo** (B1–B6:
-data/sessions/broker/reconciliación/kill-switch/monitoring; ver
+Además, en esta sesión se construyó la **capa en vivo** (B1–B7:
+data/sessions/broker/reconciliación/kill-switch/monitoring/paper; ver
 «Capa en vivo»).
 No hay ejecución real de órdenes todavía (solo `development`/backtest).
 
@@ -99,7 +99,7 @@ No hay ejecución real de órdenes todavía (solo `development`/backtest).
   por `point_value`; invariante para `point_value=1`, por eso el grafo H001
   conserva sus `experiment_id`).
 
-### Capa en vivo (B1–B6, sesión actual)
+### Capa en vivo (B1–B7, sesión actual)
 
 Arquitectura de producción construida en esta sesión (todas las capas sin
 ejecución real todavía; el entorno paper es la siguiente frontera):
@@ -137,7 +137,21 @@ ejecución real todavía; el entorno paper es la siguiente frontera):
   decide** (la precedencia y el latch siguen en B5, sin duplicarse). El
   monitor nunca envía/cancela órdenes.
 
-Suite actual: **480 tests verdes** (`python -m pytest`). El perímetro
+* **B7 — Paper Trading (`papertrading/`)**: orquestador paper de extremo a
+  extremo. `PaperTradingEngine` consume `ClosedBarEvent` y ejecuta la cadena
+  completa por barra: sesión (guard de entrada) → señal sobre la barra cerrada
+  (misma interfaz que el backtest) → RiskEngine (veto, tamaño por `point_value`)
+  → Kill Switch → `OrderManager` → `PaperBrokerAdapter` → fills/posición/equity
+  → reconciliación → monitoring ↺. Temporalidad anti-lookahead idéntica al
+  backtest (decisión en `t`, orden al OPEN de `t+1`). Exige un broker con
+  `price_source` (`TypeError` en `__init__` si falta): nunca envía a un broker
+  real. Reiniciable sin duplicar exposición (`signed_signals` + `RESTART_SKIP`),
+  audit trail reconstruible por ID (`trail`), fills parciales/VWAP, submission
+  UNKNOWN resuelto sin reenvío y fail-safe de reconciliación. Sin liquidación
+  automática por sesión CLOSED (solo stop/time). `ReplayMarketDataAdapter`
+  para dry-runs sin red.
+
+Suite actual: **503 tests verdes** (`python -m pytest`). El perímetro
 congelado del FINAL_OOS sigue intacto.
 
 ### Infraestructura de datos

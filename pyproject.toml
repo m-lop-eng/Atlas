@@ -38,6 +38,7 @@ include = [
     "reconciliation*",
     "killswitches*",
     "monitoring*",
+    "papertrading*",
     "database*",
     "reporting*",
     "deployment*",
