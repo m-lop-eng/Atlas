@@ -40,6 +40,12 @@ from streaming.events import (
     StreamEventKind,
     StreamHeartbeat,
 )
+from streaming.integrity import (
+    IntegrityCoordinator,
+    IntegrityReconciler,
+    IntegrityReport,
+    IntegrityStatus,
+)
 from streaming.sandbox import ScriptedStreamingAdapter
 from streaming.reconnect import ReconnectManager, ReconnectPolicy, ReconnectState
 from streaming.transport import WebSocketTransport, WebsocketClientTransport
@@ -49,6 +55,10 @@ __all__ = [
     "BINANCE_WS_BASE",
     "BackoffPolicy",
     "BinanceStreamingAdapter",
+    "IntegrityCoordinator",
+    "IntegrityReconciler",
+    "IntegrityReport",
+    "IntegrityStatus",
     "ReconnectManager",
     "ReconnectPolicy",
     "ReconnectState",

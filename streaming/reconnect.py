@@ -148,6 +148,7 @@ class ReconnectManager:
         self._recovering = False
         self._pending: deque[StreamEvent] = deque()
         self._delivered = _DeliveredGuard()
+        self._last_closed_bar: tuple[str, int] | None = None
 
         self.attempts = 0
         self.last_error: str | None = None
@@ -170,6 +171,11 @@ class ReconnectManager:
     def data_integrity_unknown(self) -> bool:
         """True si hubo reconexión sin reconciliación posterior (S4)."""
         return self._data_integrity_unknown
+
+    @property
+    def last_closed_bar(self) -> tuple[str, int] | None:
+        """Última vela cerrada entregada `(symbol, open_time)` o None (S4)."""
+        return self._last_closed_bar
 
     # ---------------------------------------------------------- ciclo de vida
 
@@ -332,6 +338,7 @@ class ReconnectManager:
             if self._delivered.is_duplicate(key):
                 return None
             self._delivered.remember(key)
+            self._last_closed_bar = key
         return event
 
     def _drain_one(self) -> StreamEvent | None:
