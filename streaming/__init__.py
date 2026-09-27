@@ -1,13 +1,13 @@
-"""Streaming (S1–S2): datos en vivo por stream, aislados de B1.
+"""Streaming (S1–S5): datos en vivo por stream, aislados de B1.
 
 Este paquete es un track paralelo a A4 (forward batch) y NO modifica `live/`.
-Define el contrato del adapter (S1), eventos tipados (datos, conexión,
-desconexión, heartbeat), errores tipados, un sandbox determinista y el adaptador
-read-only de Binance WebSocket (S2). En S5 se puenteará a `LiveDataEngine`; la
-estrategia sigue recibiendo solo `ClosedBarEvent`.
+Define el contrato del adapter (S1), eventos tipados, errores tipados, sandbox
+determinista, el adaptador read-only de Binance WebSocket (S2), reconexión
+(S3), reconciliación de integridad con backfill (S4) y el puente a
+`LiveDataEngine` (S5). La estrategia sigue recibiendo solo `ClosedBarEvent`.
 
-Roadmap aislado: S1 contrato (este) -> S2 Binance WebSocket -> S3 reconnect +
-heartbeat -> S4 backfill/reconciliación -> S5 integración con LiveDataEngine ->
+Roadmap aislado: S1 contrato -> S2 Binance WebSocket -> S3 reconnect + heartbeat
+-> S4 backfill/reconciliación -> S5 integración con LiveDataEngine ->
 S6 streaming paper runner.
 """
 
@@ -21,6 +21,11 @@ from streaming.binance import (
     BinanceStreamingAdapter,
     interval_to_binance,
     parse_binance_message,
+)
+from streaming.bridge import (
+    B1StreamingAdapter,
+    IntegrityBackfillProvider,
+    StreamingPipeline,
 )
 from streaming.clock import ensure_utc, utc_now
 from streaming.errors import (
@@ -51,10 +56,12 @@ from streaming.reconnect import ReconnectManager, ReconnectPolicy, ReconnectStat
 from streaming.transport import WebSocketTransport, WebsocketClientTransport
 
 __all__ = [
+    "B1StreamingAdapter",
     "BINANCE_INTERVALS",
     "BINANCE_WS_BASE",
     "BackoffPolicy",
     "BinanceStreamingAdapter",
+    "IntegrityBackfillProvider",
     "IntegrityCoordinator",
     "IntegrityReconciler",
     "IntegrityReport",
@@ -74,6 +81,7 @@ __all__ = [
     "StreamingError",
     "StreamingHeartbeatError",
     "StreamingMarketDataAdapter",
+    "StreamingPipeline",
     "StreamingProtocolError",
     "StreamingReconnectError",
     "StreamingSubscribeError",

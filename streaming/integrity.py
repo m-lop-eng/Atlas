@@ -209,6 +209,83 @@ class IntegrityReconciler:
             reason="secuencia contigua verificada",
         )
 
+    def reconcile_open_ended(self, *, start_open_time: int) -> IntegrityReport:
+        """Reconcilia desde `start_open_time` sin cota superior (modo B1).
+
+        Usado por `LiveDataEngine.reconcile()` (S5): recupera el prefijo
+        contiguo desde `start_open_time`. No exige un extremo superior porque
+        B1 valida la frontera viva con la siguiente vela. Si el proveedor no
+        aporta ninguna vela o faltan las iniciales, no hay recuperación.
+        """
+
+        def report(status: IntegrityStatus, **kwargs) -> IntegrityReport:
+            base = dict(
+                status=status,
+                symbol=self._symbol,
+                interval_seconds=self._interval,
+                expected_start=start_open_time,
+                resume_open_time=None,
+            )
+            base.update(kwargs)
+            return IntegrityReport(**base)
+
+        try:
+            bars = self._provider.fetch_closed_bars(
+                self._symbol, self._interval, start_open_time
+            )
+        except ConnectionError as exc:
+            return report(
+                IntegrityStatus.BLOCKED,
+                reason=f"backfill no disponible: {exc}",
+            )
+
+        by_time: dict[int, MarketDataEvent] = {}
+        duplicates: list[int] = []
+        conflicts: list[int] = []
+        for event in bars:
+            if event.open_time < start_open_time:
+                continue
+            if not self._valid(event):
+                return report(
+                    IntegrityStatus.BLOCKED,
+                    reason=f"dato de backfill inválido en open_time {event.open_time}",
+                )
+            existing = by_time.get(event.open_time)
+            if existing is None:
+                by_time[event.open_time] = event
+            elif self._same(existing, event):
+                duplicates.append(event.open_time)
+            else:
+                conflicts.append(event.open_time)
+
+        if conflicts:
+            return report(
+                IntegrityStatus.BLOCKED,
+                duplicates=tuple(sorted(set(duplicates))),
+                conflicts=tuple(sorted(set(conflicts))),
+                reason="conflicto: mismo open_time con OHLC distinto",
+            )
+
+        recovered: list[MarketDataEvent] = []
+        stamp = start_open_time
+        while stamp in by_time:
+            recovered.append(by_time[stamp])
+            stamp += self._interval
+
+        if not recovered:
+            return report(
+                IntegrityStatus.UNRECOVERABLE,
+                duplicates=tuple(sorted(set(duplicates))),
+                reason="sin velas recuperables desde el inicio esperado",
+            )
+
+        return report(
+            IntegrityStatus.HEALTHY,
+            recovered=tuple(recovered),
+            duplicates=tuple(sorted(set(duplicates))),
+            reason="secuencia contigua verificada (extremo abierto)",
+        )
+
     # ----------------------------------------------------------------- helpers
 
     def _valid(self, event: MarketDataEvent) -> bool:
