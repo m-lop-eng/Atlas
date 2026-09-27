@@ -14,6 +14,7 @@ S6 streaming paper runner.
 from __future__ import annotations
 
 from streaming.adapter import StreamConnectionState, StreamingMarketDataAdapter
+from streaming.backoff import BackoffPolicy
 from streaming.binance import (
     BINANCE_INTERVALS,
     BINANCE_WS_BASE,
@@ -40,12 +41,17 @@ from streaming.events import (
     StreamHeartbeat,
 )
 from streaming.sandbox import ScriptedStreamingAdapter
+from streaming.reconnect import ReconnectManager, ReconnectPolicy, ReconnectState
 from streaming.transport import WebSocketTransport, WebsocketClientTransport
 
 __all__ = [
     "BINANCE_INTERVALS",
     "BINANCE_WS_BASE",
+    "BackoffPolicy",
     "BinanceStreamingAdapter",
+    "ReconnectManager",
+    "ReconnectPolicy",
+    "ReconnectState",
     "ScriptedStreamingAdapter",
     "StreamConnected",
     "StreamConnectionState",

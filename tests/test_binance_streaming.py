@@ -35,6 +35,7 @@ from streaming import (
     BinanceStreamingAdapter,
     StreamConnectionState,
     StreamData,
+    StreamHeartbeat,
     StreamingConnectionError,
     StreamingProtocolError,
     StreamingSubscribeError,
@@ -174,7 +175,8 @@ def test_parse_stream_combinado() -> None:
 
 def test_parse_frames_de_control_ignorados() -> None:
     assert _parse(json.dumps({"result": None, "id": 1})) is None
-    assert _parse(json.dumps({"pong": 1788220800000})) is None
+    pong = _parse(json.dumps({"pong": 1788220800000}))
+    assert isinstance(pong, StreamHeartbeat)  # latido (S3)
     assert _parse(json.dumps({"e": "depthUpdate", "s": "BTCUSDT"})) is None
 
 
@@ -252,6 +254,16 @@ def test_receive_perdida_de_conexion() -> None:
         adapter.receive()
     assert adapter.state is StreamConnectionState.DISCONNECTED
     assert adapter.last_error is not None
+
+
+def test_heartbeat_envia_ping_y_pong_emite_heartbeat() -> None:
+    transport = FakeWebSocketTransport([json.dumps({"pong": 1})])
+    adapter = _adapter(transport)
+    adapter.connect()
+    adapter.subscribe("BTCUSDT", HOUR)
+    adapter.heartbeat()
+    assert json.loads(transport.sent[-1]) == {"ping": 1}
+    assert isinstance(adapter.receive(), StreamHeartbeat)
 
 
 def test_subscribe_sin_conexion() -> None:

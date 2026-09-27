@@ -35,7 +35,7 @@ from streaming.errors import (
     StreamingProtocolError,
     StreamingSubscribeError,
 )
-from streaming.events import StreamData
+from streaming.events import StreamData, StreamHeartbeat
 from streaming.transport import WebSocketTransport, WebsocketClientTransport
 
 # Endpoint público de market data (sin autenticación).
@@ -81,13 +81,13 @@ def parse_binance_message(
     symbol: str,
     interval_seconds: int,
     received_at: datetime,
-) -> StreamData | None:
-    """Normaliza un frame de Binance a `StreamData` (o None si es de control).
+) -> StreamData | StreamHeartbeat | None:
+    """Normaliza un frame de Binance a `StreamData`/`StreamHeartbeat` (o None).
 
     Acepta tanto el stream crudo (`{"e": "kline", ...}`) como el combinado
-    (`{"stream": ..., "data": {...}}`). Los frames de control (ack de
-    suscripción, pong) se ignoran devolviendo None; los frames de error o
-    malformados lanzan `StreamingProtocolError`.
+    (`{"stream": ..., "data": {...}}`). El ack de suscripción se ignora
+    (None); el pong se emite como `StreamHeartbeat` (liveness, S3). Los frames
+    de error o malformados lanzan `StreamingProtocolError`.
 
     `open_time` se deriva de `k.t` (ms) a epoch UTC en segundos y debe estar
     alineado al intervalo. `is_closed` refleja `k.x` (vela cerrada vs intrabar).
@@ -111,7 +111,7 @@ def parse_binance_message(
     if "result" in message and "id" in message:
         return None  # ack de suscripción
     if "pong" in message:
-        return None  # heartbeat (S3)
+        return StreamHeartbeat(received_at=received_at)  # latido (S3)
 
     if message.get("e") != "kline":
         return None  # evento no soportado en S2 (se ignora explícitamente)
@@ -192,6 +192,7 @@ class BinanceStreamingAdapter(StreamingMarketDataAdapter):
         self._state = StreamConnectionState.DISCONNECTED
         self._subscription: tuple[str, int] | None = None
         self._request_id = 0
+        self._ping_id = 0
         self.last_error: str | None = None
 
     # ---------------------------------------------------------- propiedades
@@ -278,6 +279,19 @@ class BinanceStreamingAdapter(StreamingMarketDataAdapter):
         finally:
             self._state = StreamConnectionState.CLOSED
             self._subscription = None
+
+    def heartbeat(self) -> None:
+        if self._state is not StreamConnectionState.CONNECTED:
+            raise StreamingConnectionError(
+                f"heartbeat() sin conexión activa (estado {self._state.value})"
+            )
+        self._ping_id += 1
+        try:
+            self._transport.send(json.dumps({"ping": self._ping_id}))
+        except StreamingConnectionError as exc:
+            self._state = StreamConnectionState.DISCONNECTED
+            self.last_error = str(exc)
+            raise
 
 
 __all__ = [

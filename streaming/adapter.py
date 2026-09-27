@@ -87,5 +87,18 @@ class StreamingMarketDataAdapter(ABC):
             StreamingProtocolError: si llegó un mensaje malformado.
         """
 
+    def heartbeat(self) -> None:
+        """Solicita un latido de aplicación al proveedor (S3).
+
+        Proveedores que soportan ping/pong (p. ej. Binance) lo sobrescriben y
+        responden emitiendo un `StreamHeartbeat`. Por defecto es un no-op:
+        el `ReconnectManager` mide la liveness por actividad reciente y, si no
+        hay soporte de latido, recurre a la propia actividad del stream.
+
+        Raises:
+            StreamingConnectionError: si no se puede enviar el latido.
+        """
+        return None
+
 
 __all__ = ["StreamConnectionState", "StreamingMarketDataAdapter"]
