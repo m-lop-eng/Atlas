@@ -25,7 +25,7 @@ stream -> recuperación -> B1 es coherente. Sin estrategia, órdenes ni broker.
 from __future__ import annotations
 
 import time
-from typing import Callable
+from typing import Callable, Protocol
 
 from live.adapter import BackfillProvider, MarketDataAdapter
 from live.engine import EngineState, LiveDataEngine
@@ -56,6 +56,19 @@ class _StreamingSource:
         ...
 
 
+class StreamingPipelineObserver(Protocol):
+    """Observador opcional del pipeline (S6). Solo lectura; no decide nada."""
+
+    def on_stream_event(self, event: StreamEvent) -> None:
+        ...  # pragma: no cover - estructural
+
+    def on_stream_error(self, error: StreamingError) -> None:
+        ...  # pragma: no cover - estructural
+
+    def on_integrity_report(self, report: IntegrityReport) -> None:
+        ...  # pragma: no cover - estructural
+
+
 class B1StreamingAdapter(MarketDataAdapter):
     """Adapta una fuente streaming al contrato `MarketDataAdapter` de B1.
 
@@ -65,8 +78,14 @@ class B1StreamingAdapter(MarketDataAdapter):
     entre en RECONNECTING y deje de emitir.
     """
 
-    def __init__(self, source: _StreamingSource) -> None:
+    def __init__(
+        self,
+        source: _StreamingSource,
+        *,
+        observer: StreamingPipelineObserver | None = None,
+    ) -> None:
         self._source = source
+        self._observer = observer
 
     def connect(self) -> None:
         try:
@@ -91,9 +110,13 @@ class B1StreamingAdapter(MarketDataAdapter):
             try:
                 event = self._source.receive()  # type: ignore[attr-defined]
             except StreamingError as exc:
+                if self._observer is not None:
+                    self._observer.on_stream_error(exc)
                 raise ConnectionError(str(exc)) from exc
             if event is None:
                 return None
+            if self._observer is not None:
+                self._observer.on_stream_event(event)
             if isinstance(event, StreamData):
                 return event.event
             # heartbeat / conexión: no es market data, seguir drenando
@@ -137,6 +160,7 @@ class StreamingPipeline:
         manager: `ReconnectManager` (S3) ya envuelto sobre el adapter S2.
         provider: `BackfillProvider` histórico para S4/B1.
         on_closed_bar: callback invocado por B1 por cada `ClosedBarEvent`.
+        observer: observador opcional (S6) de eventos/errores/reportes.
         stale_timeout_seconds / clock: se pasan a B1.
     """
 
@@ -148,15 +172,18 @@ class StreamingPipeline:
         manager: ReconnectManager,
         provider: BackfillProvider,
         on_closed_bar: Callable[[ClosedBarEvent], None] | None = None,
+        observer: StreamingPipelineObserver | None = None,
         stale_timeout_seconds: float = 60.0,
         clock: Callable[[], float] = time.time,
     ) -> None:
         self.symbol = symbol
         self.interval_seconds = interval_seconds
         self.manager = manager
+        self._observer = observer
+        self._last_notified_report: IntegrityReport | None = None
         self.reconciler = IntegrityReconciler(provider, symbol, interval_seconds)
         self.backfill = IntegrityBackfillProvider(provider, self.reconciler, manager)
-        self.adapter = B1StreamingAdapter(manager)
+        self.adapter = B1StreamingAdapter(manager, observer=observer)
         self.engine = LiveDataEngine(
             symbol,
             interval_seconds,
@@ -190,11 +217,17 @@ class StreamingPipeline:
             try:
                 self.engine.reconcile()
             except RuntimeError:
-                pass
+                return
+            report = self.backfill.last_report
+            if report is not None and report is not self._last_notified_report:
+                self._last_notified_report = report
+                if self._observer is not None:
+                    self._observer.on_integrity_report(report)
 
 
 __all__ = [
     "B1StreamingAdapter",
     "IntegrityBackfillProvider",
     "StreamingPipeline",
+    "StreamingPipelineObserver",
 ]

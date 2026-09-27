@@ -26,6 +26,7 @@ from streaming.bridge import (
     B1StreamingAdapter,
     IntegrityBackfillProvider,
     StreamingPipeline,
+    StreamingPipelineObserver,
 )
 from streaming.clock import ensure_utc, utc_now
 from streaming.errors import (
@@ -51,6 +52,12 @@ from streaming.integrity import (
     IntegrityReport,
     IntegrityStatus,
 )
+from streaming.health import (
+    HeartbeatStatus,
+    StreamingHealthLevel,
+    StreamingHealthMonitor,
+    StreamingHealthSnapshot,
+)
 from streaming.sandbox import ScriptedStreamingAdapter
 from streaming.reconnect import ReconnectManager, ReconnectPolicy, ReconnectState
 from streaming.transport import WebSocketTransport, WebsocketClientTransport
@@ -61,6 +68,7 @@ __all__ = [
     "BINANCE_WS_BASE",
     "BackoffPolicy",
     "BinanceStreamingAdapter",
+    "HeartbeatStatus",
     "IntegrityBackfillProvider",
     "IntegrityCoordinator",
     "IntegrityReconciler",
@@ -79,9 +87,13 @@ __all__ = [
     "StreamHeartbeat",
     "StreamingConnectionError",
     "StreamingError",
+    "StreamingHealthLevel",
+    "StreamingHealthMonitor",
+    "StreamingHealthSnapshot",
     "StreamingHeartbeatError",
     "StreamingMarketDataAdapter",
     "StreamingPipeline",
+    "StreamingPipelineObserver",
     "StreamingProtocolError",
     "StreamingReconnectError",
     "StreamingSubscribeError",
