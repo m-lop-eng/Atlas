@@ -38,6 +38,7 @@ risk/          Position sizing, límites y Risk Engine
 execution/     Modelo de órdenes y Order Manager
 brokers/       Adaptadores de broker (contrato B3): PaperBroker de sandbox
 live/          Motor de datos en vivo: MarketDataAdapter + LiveDataEngine
+streaming/     Track paralelo (S1–S6): WebSocket read-only + reconnect + integridad + puente a B1
 sessions/      Gestión de sesiones de mercado (PRE_OPEN…UNKNOWN)
 reconciliation/ Motor de reconciliación interno vs broker (B4)
 killswitches/  Coordinador de kill switches globales (B5)
@@ -62,10 +63,14 @@ Arquitectura, motor de backtest, riesgo, ejecución, diagnóstico por trade,
 controles nulos, lineage de experimentos y datos reales funcionando.
 Además, en esta sesión se construyó la **capa en vivo** (B1–B7:
 data/sessions/broker/reconciliación/kill-switch/monitoring/paper; ver
-«Capa en vivo»).
+«Capa en vivo») y, en paralelo a A4, el **track de streaming** (S1–S6,
+read-only; ver «Streaming (S1–S6)»).
 No hay ejecución real de órdenes todavía (solo `development`/backtest).
 
-* Última sesión (`git log -1 72135a4`): **auditoría + hardening operacional (5 hallazgos)** — cierre de la auditoría por capas de A4/forward: latch B5 persistente (`0a528ab`), `reconcile()` B1 endurecido (`ce8ab09`), severidad multi-fuente (`e30286e`), hardening de datos (`589d3c9`) y single-instance lock + input fingerprint (`72135a4`). Ver «Auditoría operacional y hardening». Suite **583 passed**; H002/FINAL_OOS intactos.
+* Última sesión (retoma operacional): **A4 ejecutándose solo** — la tarea `Atlas-Forward-A4` completó su primer ciclo programado (`LastRunTime=28/09 0:44:13`, `LastTaskResult=0`, `NumberOfMissedRuns=0`, próxima 29/09 00:30). Estado real de A4: **5 ciclos / 273 barras** (`2026-09-14`→`2026-09-26`), 273 `RECONCILIATION_OK`, kill switch `ALLOW`, monitoring `HEALTHY`, 0 UNKNOWN. Ese ciclo automático registró **1 `PROVIDER_ERROR`** (`incidents.ndjson`): `getaddrinfo failed` al descargar `BTCUSDT-1h-2026-09-27.zip` (caída de red/DNS, **no** defecto de Atlas); el fail-safe no añadió barras ni duplicó exposición. Retoma de solo lectura (sin cambios de código). Suite **682 passed**; H002/FINAL_OOS intactos.
+* Sesión previa (`git log -1 1547593`): **track de streaming S1–S6 (aislado de A4)** — contrato (S1), adaptador Binance WebSocket read-only (S2), reconnect + heartbeat (S3), backfill/reconciliación de integridad sin atajo `reconnect→confirm` (S4), puente a `LiveDataEngine` con B1 como autoridad (S5) y salud operacional que solo observa (S6). Ver «Streaming (S1–S6)». Suite **682 passed**; H002/FINAL_OOS intactos.
+* Sesión previa (`git log -1 f130015`): **endurecimiento del scheduler de A4 (Change 6)** — `deployment/schedule_a4.py`: `StartWhenAvailable=True`, `WakeToRun=False`, batería bloqueada, diaria 00:30, `IgnoreNew`, instalación idempotente (`-Force`), sin catch-up propio; principal `S4U` objetivo (cae a `Interactive` sin admin). Ver «Scheduler de A4 (Change 6)». Suite **595 passed**; H002/FINAL_OOS intactos.
+* Sesión previa (`git log -1 72135a4`): **auditoría + hardening operacional (5 hallazgos)** — cierre de la auditoría por capas de A4/forward: latch B5 persistente (`0a528ab`), `reconcile()` B1 endurecido (`ce8ab09`), severidad multi-fuente (`e30286e`), hardening de datos (`589d3c9`) y single-instance lock + input fingerprint (`72135a4`). Ver «Auditoría operacional y hardening». Suite **583 passed**; H002/FINAL_OOS intactos.
 * Sesión previa (`git log -1 e6c0c3e`): **forward continuo A4** — `ForwardRunner`
   (cadena B1–B7 por barra, persistencia idempotente, audit reproducible) + Fases
   A1–A4 sobre datos reales; driver operativo `experiments/e14_forward_continuous.py`
@@ -159,7 +164,7 @@ ver «Forward continuo (Fases A1–A4)»):
   automática por sesión CLOSED (solo stop/time). `ReplayMarketDataAdapter`
   para dry-runs sin red.
 
-Suite actual: **583 tests verdes** (`python -m pytest`). El perímetro
+Suite actual: **682 tests verdes** (`python -m pytest`). El perímetro
 congelado del FINAL_OOS sigue intacto.
 
 ### Forward continuo (Fases A1–A4)
@@ -225,6 +230,92 @@ reglas de trading:
 Aparcado (no bloqueante con adquisición batch): `reconnect()` desde `DEGRADED`.
 Suite tras el cierre: **583 passed**. **A4 demuestra operación forward/paper, no
 valida H002 para capital real** (el gate sigue siendo el FINAL_OOS preregistrado).
+
+### Scheduler de A4 (Change 6)
+
+`deployment/schedule_a4.py` instala/actualiza la tarea Windows
+**`Atlas-Forward-A4`** que ejecuta `e14_forward_continuous.py --once`. Cambio
+aislado (commit `f130015`): no toca e14/ForwardRunner/H002/FINAL_OOS.
+
+| Parámetro | Objetivo |
+| --- | --- |
+| `StartWhenAvailable` | True (Windows reejecuta la tarea perdida cuando el equipo vuelve) |
+| `WakeToRun` | False |
+| batería | bloqueada (`DisallowStartIfOnBatteries`/`StopIfGoingOnBatteries` = True) |
+| frecuencia | diaria 00:30, un único trigger |
+| `MultipleInstances` | `IgnoreNew` |
+| reinstalación | idempotente (mismo nombre + `Register-ScheduledTask -Force`, no duplica) |
+| principal | objetivo `S4U` (sin sesión interactiva); **en este equipo queda `Interactive`** porque S4U requiere elevación |
+
+**No hay catch-up propio**: A4 no implementa recuperación de ciclos perdidos;
+Windows recupera la ejecución y A4 procesa exactamente un ciclo (sin duplicar
+barras: el runner deduplica por `open_time`). Con `Interactive`, un ciclo perdido
+se recupera al volver el equipo **con sesión iniciada**; para ejecutar sin sesión
+hay que reinstalar como admin (`python -m deployment.schedule_a4 install`).
+
+Las **273 barras** actuales se reparten en **5 ciclos**: 3 smoke manuales el
+26/09 14:05 y, desde el despliegue, ciclos lanzados por la tarea (el último,
+automático, el 28/09 00:32 UTC). Son validación operativa inicial, no evidencia
+acumulada; esta empieza con ciclos reales separados en el tiempo (que añadan
+barras, que no las añadan, que reinicien, y que recuperen alguno). El ciclo
+automático ya demostró dos cosas: A4 corre sin intervención y su fail-safe
+tolera una caída de red del proveedor (`PROVIDER_ERROR` → 0 barras nuevas, sin
+duplicar exposición).
+
+### Streaming (S1–S6, track paralelo a A4)
+
+Track de datos en vivo por **WebSocket, completamente aislado de A4**: no
+modifica `live/` (B1), no cambia H002 y no toca FINAL_OOS. Objetivo: construir y
+probar, sin arriesgar A4, el camino que permitirá a Atlas trabajar con datos
+actuales. Principio rector: **`S6 observa; no autoriza trading`**. Pasos en
+commits aislados:
+
+| Paso | Alcance | Commit |
+| --- | --- | --- |
+| **S1** | Contrato `StreamingMarketDataAdapter` + eventos (`StreamData`/`Heartbeat`/`Connected`/`Disconnected`) + errores tipados + reloj UTC-aware + sandbox determinista | `1abb4c9` |
+| **S2** | Adaptador **Binance WebSocket read-only** (`BinanceStreamingAdapter`): protocolo público de klines, normalización a `MarketDataEvent`, `is_closed`, transporte desacoplado por `Protocol` | `30a96a6` |
+| **S3** | `ReconnectManager`: backoff determinista, heartbeat ping/pong, límite de intentos, resubscribe, sin conexiones duplicadas, dedup de cierres y **`data_integrity_unknown`** | `8c61dfe` |
+| **S4** | Backfill + reconciliación de integridad (`IntegrityReconciler`/`IntegrityCoordinator`): rango perdido, validación/orden/dedup/conflictos/continuidad, **sin atajo `reconnect→confirm`** | `2b4128a` |
+| **S5** | Integración con B1 (`B1StreamingAdapter`, `IntegrityBackfillProvider`, `StreamingPipeline`): todos los datos pasan por `LiveDataEngine` | `92add33` |
+| **S6** | Salud operacional (`StreamingHealthMonitor`/`StreamingHealthSnapshot`): diagnóstico estructurado, **solo observa** | `1547593` |
+
+Pipeline:
+
+```text
+Binance WebSocket → S2 adapter → S3 ReconnectManager → S4 integridad
+    → B1StreamingAdapter → LiveDataEngine (AUTORIDAD) → ClosedBarEvent
+```
+
+Tras una interrupción:
+
+```text
+gap → B1 DEGRADED → integridad UNKNOWN → backfill (S4)
+      ├── no HEALTHY → [] → B1 sigue DEGRADED (no emite)
+      └── HEALTHY → B1.reconcile() → velas contiguas → ClosedBarEvent
+```
+
+Reglas preservadas (verificadas por tests):
+
+* **B1 sigue siendo la autoridad**: ningún dato llega a estrategia sin pasar por
+  `LiveDataEngine`; no hay un segundo camino paralelo que lo sortee.
+* **Transporte ≠ integridad**: reconectar no autoriza; `data_integrity_unknown`
+  solo lo limpia un reporte S4 HEALTHY. **No existe** el atajo
+  `reconnect() → confirm_data_integrity()`. Si el backfill falla, B1 permanece
+  `DEGRADED` y no emite barras recuperadas como si fueran normales.
+* **Read-only por diseño**: sin claves API ni ninguna vía de órdenes/escritura
+  (verificado por test de fuentes).
+* **S6 observa, no decide**: `StreamingHealthSnapshot.level` es informativo; no
+  hay campos de autorización (`can_trade`/`authorized`) ni un segundo kill
+  switch. La autorización seguirá en B1/B5/monitoring/risk.
+
+Código: `streaming/` (`adapter.py`, `events.py`, `errors.py`, `clock.py`,
+`sandbox.py`, `transport.py`, `binance.py`, `backoff.py`, `reconnect.py`,
+`integrity.py`, `bridge.py`, `health.py`); drivers smoke read-only
+`experiments/e15_binance_ws_smoke.py` (S2),
+`experiments/e16_binance_reconnect_smoke.py` (S3) y
+`experiments/e17_streaming_pipeline_smoke.py` (S5). **87 tests deterministas**
+del track (S1–S6). Fuera de scope por ahora: `ForwardRunner`/`PaperBroker`
+streaming (milestone separado, no autorizado todavía).
 
 ### Infraestructura de datos
 
@@ -362,27 +453,38 @@ La matriz queda verificada mecánicamente por `tests/test_final_oos_semantics.py
 
 ### Cómo retomar
 
-Punto de partida de la próxima sesión: **A4 (forward continuo) EN MARCHA** y
-**auditoría de los 5 hallazgos cerrada**; todo commiteado (último commit
-`72135a4`) y working tree limpio salvo artefactos gitignored. No hay milestone
-nuevo abierto: el trabajo siguiente solo aparece si A4 detecta un incidente real
-o cuando toque preparar la siguiente etapa de evidencia/ejecución.
+Punto de partida de la próxima sesión: **A4 (forward continuo) EN MARCHA y ya
+ejecutándose solo** (primer ciclo automático confirmado el 28/09), **auditoría de
+los 5 hallazgos cerrada**, **scheduler endurecido (Change 6)** y **track de
+streaming S1–S6 cerrado** (aislado); todo commiteado (último commit
+`1547593` + retoma documental) y working tree limpio salvo artefactos gitignored.
+No hay milestone nuevo abierto: el trabajo siguiente solo aparece si A4 detecta
+un incidente real o cuando toque evaluar (milestone separado) la integración
+streaming → `ForwardRunner`/`PaperBroker`.
 
 Contexto fijado:
-* B1–B7 + `ForwardRunner` cerrados; Fases A1/A2/A3 aprobadas; **A4 desplegado**
-  como ingesta incremental programada (no streaming: el único `MarketDataAdapter`
-  concreto es `ReplayMarketDataAdapter`; la fuente real es batch con ~1 día de
-  retraso).
+* B1–B7 + `ForwardRunner` cerrados; Fases A1/A2/A3 aprobadas; **A4 desplegado y
+  confirmado en automático** (tarea `Atlas-Forward-A4`, ciclo del 28/09 00:32 UTC)
+  como ingesta incremental programada (batch: el `MarketDataAdapter` de A4 es
+  `ReplayMarketDataAdapter`; la fuente real es batch con ~1 día de retraso).
+* **Streaming S1–S6 cerrado** (commits `1abb4c9`→`1547593`): pipeline
+  `WebSocket → LiveDataEngine (B1) → ClosedBarEvent`, read-only, con reconnect,
+  integridad (S4) y salud operacional (S6). **No** está conectado a
+  A4/`ForwardRunner` todavía (milestone separado). Ver «Streaming (S1–S6)».
 * **Auditoría operacional cerrada** (commits `0a528ab`→`72135a4`): latch B5
   persistente, `reconcile()` B1 endurecido, severidad multi-fuente, hardening de
   datos y single-instance lock + input fingerprint (ver «Auditoría operacional y
   hardening»). `reconnect()` desde `DEGRADED` queda **aparcado**.
+* **Scheduler endurecido** (commit `f130015`): `StartWhenAvailable=True`, sin
+  `WakeToRun`, batería bloqueada, diaria, idempotente; principal `S4U` objetivo
+  (en este equipo `Interactive` hasta reinstalar como admin). Ver «Scheduler de
+  A4 (Change 6)».
 * Estrategia H002 **FROZEN**; FINAL_OOS **🔒 intacto** (`BLOCKED_BY_DATA_AVAILABILITY`;
   ver «Semántica del desbloqueo del FINAL_OOS»).
 * `research/evidence.json`: H001–H005 y H004-B siguen en `RESEARCH_REQUIRED`.
 
 Secuencia de retoma (en orden):
-1. `python -m pytest` → baseline de regresión (hoy **583 passed**).
+1. `python -m pytest` → baseline de regresión (hoy **682 passed**).
 2. `python experiments/e14_forward_continuous.py --status` → informe operativo
    actual de A4 (**solo lectura**: no modifica artefactos).
 3. Revisar `experiments/forward/outputs/FORWARD-PAPER-A4/`: `report_a4.json`,
@@ -392,16 +494,22 @@ Secuencia de retoma (en orden):
      inesperado de `bars.jsonl` da `INPUT_FINGERPRINT_MISMATCH` (fail-safe).
    * Si `incidents.ndjson` tiene entradas → tratarlas como **incidente
      operacional** (investigar → fix aislado → test determinista → commit), no
-     como motivo para cambiar la estrategia.
+     como motivo para cambiar la estrategia. (El `PROVIDER_ERROR` del 28/09 ya se
+     clasificó como caída de red/DNS del proveedor, **sin** fix pendiente.)
    * Si todo verde → no hay nada que hacer: A4 sigue corriendo por la tarea
-     programada `Atlas-Forward-A4` (diaria 00:30).
+     programada `Atlas-Forward-A4` (diaria 00:30; `StartWhenAvailable` recupera
+     una ejecución perdida).
 4. FINAL_OOS: sigue bloqueado por calendario; comprobar con
    `python experiments/e12_final_oos.py` (status). **No** abrir H006 ni
    reescribir datasets como "prueba".
+5. Streaming (opcional, solo lectura): `python -m pytest tests/test_streaming_*.py`
+   o los smokes `experiments/e15_*`/`e16_*`/`e17_*`. Track **cerrado y aislado**:
+   no forma parte de la operación de A4.
 
 Reglas que NO cambian durante A4: H002 no se modifica; sin optimización ni
 selección de estrategias; no se abre H006; no se toca FINAL_OOS; sin broker ni
-capital real; forward **no** recalibra la estrategia.
+capital real; forward **no** recalibra la estrategia. El streaming (S1–S6) no
+toca A4/H002/FINAL_OOS y no autoriza trading.
 
 ```powershell
 python -m pytest                                       # suite completa (baseline de regresión)
@@ -411,7 +519,15 @@ python experiments/e12_final_oos.py                    # FINAL_OOS: status (BLOC
 python experiments/e7_h002_asymmetry.py                # H002 train/test + métricas
 python experiments/e9_h004_walk_forward.py             # H004: walk-forward fijo + DATA_ROLE + decisión
 Get-ScheduledTask -TaskName "Atlas-Forward-A4"         # estado de la tarea programada
+python -m deployment.schedule_a4 status                # scheduler A4: config real (solo lectura)
+python -m deployment.schedule_a4 install               # (re)instalar tarea endurecida (admin para S4U)
+python experiments/e15_binance_ws_smoke.py             # S2: smoke read-only Binance WebSocket
+python experiments/e16_binance_reconnect_smoke.py      # S3: smoke read-only reconexión (fuerza caída)
+python experiments/e17_streaming_pipeline_smoke.py     # S5: smoke read-only stream -> B1
 ```
+
+El streaming requiere la dependencia opcional `websocket-client`
+(`pip install "atlas[streaming]"`).
 
 **Siguiente paso acordado — sin milestone nuevo: mantener A4 (forward continuo)
 observando y no tocar nada salvo incidentes reales.** El desbloqueo del FINAL_OOS
@@ -482,21 +598,31 @@ los tests de integración deben usar configuración explícita (equity,
 ## Próximos hitos
 
 Según `00_MASTER_SPECIFICATION.md`. B1–B7 cerrados (capa en vivo + paper
-probada) y **forward continuo A4 en marcha**. Hoja ordenada:
+probada), **forward continuo A4 en marcha** y **streaming S1–S6 cerrado**
+(track paralelo aislado, solo observabilidad). Hoja ordenada:
 **A4 forward continuo** (observación operacional; EN CURSO) →
 **FINAL_OOS** (dataset congelado con ventana completa; bloqueado por calendario) →
 **decisión de evidencia** →
 **paper/forward evidence** (sin prisa: prueba infraestructura, no edge fuera de
 muestra) →
-**Live Pilot** (⏸️ no autorizado todavía; no construir WebSocket aún).
+**Live Pilot** (⏸️ no autorizado todavía).
 
 El foco inmediato ya **no** es construir más infraestructura: es **dejar A4
 operando** (ingesta incremental diaria sobre `experiments/forward/outputs/`) y
 traer incidentes o el primer informe operativo periódico significativo. La
 distinción se mantiene estricta: `operational evidence ≠ strategy evidence`. Los
-5 hallazgos de la auditoría quedan cerrados (`0a528ab`→`72135a4`); `reconnect()`
-desde `DEGRADED` sigue aparcado (no es requisito con adquisición batch).
-Tampoco se abre infraestructura nueva de reconexión/WebSocket mientras A4 observa.
+5 hallazgos de la auditoría quedan cerrados (`0a528ab`→`72135a4`) y el scheduler
+de A4 endurecido (`f130015`); `reconnect()` desde `DEGRADED` sigue aparcado
+(no es requisito con adquisición batch).
+
+El **track de streaming S1–S6** se construyó en paralelo, aislado de A4 (no toca
+`live/`/H002/FINAL_OOS y no autoriza trading): contrato (S1), Binance WebSocket
+read-only (S2), reconnect + heartbeat (S3), integridad sin atajo (S4), puente a
+`LiveDataEngine` con B1 como autoridad (S5) y salud operacional que solo observa
+(S6). Ver «Streaming (S1–S6)». El siguiente paso del track —**integrar streaming
+con `ForwardRunner`/`PaperBroker`**— queda como **milestone separado y no
+autorizado todavía**; `websocket-client` es dependencia opcional
+(`pip install "atlas[streaming]"`).
 
 En paralelo, el dataset congelado de datos nuevos con cobertura ≥ 365 días
 (`[2026-09-01, 2027-09-01)`, última barra ≥ `2027-08-31T23:00 UTC`) sigue
