@@ -180,7 +180,7 @@ class StreamingPipeline:
         self.interval_seconds = interval_seconds
         self.manager = manager
         self._observer = observer
-        self._last_notified_report: IntegrityReport | None = None
+        self._last_notified_signature: tuple | None = None
         self.reconciler = IntegrityReconciler(provider, symbol, interval_seconds)
         self.backfill = IntegrityBackfillProvider(provider, self.reconciler, manager)
         self.adapter = B1StreamingAdapter(manager, observer=observer)
@@ -219,10 +219,20 @@ class StreamingPipeline:
             except RuntimeError:
                 return
             report = self.backfill.last_report
-            if report is not None and report is not self._last_notified_report:
-                self._last_notified_report = report
-                if self._observer is not None:
-                    self._observer.on_integrity_report(report)
+            if report is not None:
+                signature = (
+                    report.status,
+                    report.expected_start,
+                    report.resume_open_time,
+                    report.recovered,
+                    report.missing,
+                    report.conflicts,
+                    report.duplicates,
+                )
+                if signature != self._last_notified_signature:
+                    self._last_notified_signature = signature
+                    if self._observer is not None:
+                        self._observer.on_integrity_report(report)
 
 
 __all__ = [

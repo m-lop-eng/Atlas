@@ -2,8 +2,9 @@
 
 S6 aporta un diagnóstico estructurado y auditable del pipeline S1-S5:
 estado global, conexión, heartbeat, integridad, último evento, última vela
-cerrada, freshness, contadores (reconexiones, gaps recuperados/no recuperables,
-errores consecutivos) y última causa.
+cerrada (aceptada por B1), freshness, contadores (reconexiones, gaps
+recuperados/no recuperables, errores consecutivos), última causa y la evidencia
+del último `IntegrityReport` (delegada en `evidence()`, sin duplicar S4).
 
 REGLA: S6 observa; NO decide autorización de trading y NO es un kill switch.
 La autorización seguirá perteneciendo a las capas de Atlas (B1/B5/monitoring/
@@ -25,7 +26,6 @@ from streaming.clock import utc_now
 from streaming.errors import StreamingError
 from streaming.events import (
     StreamConnected,
-    StreamData,
     StreamDisconnected,
     StreamEvent,
     StreamHeartbeat,
@@ -66,6 +66,7 @@ class StreamingHealthSnapshot:
     gaps_unrecoverable: int
     consecutive_errors: int
     last_error: str | None
+    last_integrity_evidence: dict | None = None
 
     def as_dict(self) -> dict:
         """Representación audit trail (sin campos de autorización)."""
@@ -84,6 +85,7 @@ class StreamingHealthSnapshot:
             "gaps_unrecoverable": self.gaps_unrecoverable,
             "consecutive_errors": self.consecutive_errors,
             "last_error": self.last_error,
+            "last_integrity_evidence": self.last_integrity_evidence,
         }
 
 
@@ -111,8 +113,8 @@ class StreamingHealthMonitor:
 
         self._last_event_at: datetime | None = None
         self._last_event_monotonic: float | None = None
-        self._last_closed_bar: tuple[str, int] | None = None
         self._last_report_status: str | None = None
+        self._last_report_evidence: dict | None = None
         self._saw_disconnect = False
 
         self._reconnections = 0
@@ -136,9 +138,6 @@ class StreamingHealthMonitor:
             if self._saw_disconnect:
                 self._reconnections += 1
                 self._saw_disconnect = False
-            return
-        if isinstance(event, StreamData) and event.event.is_closed:
-            self._last_closed_bar = (event.event.symbol, event.event.open_time)
 
     def on_stream_error(self, error: StreamingError | str) -> None:
         self._consecutive_errors += 1
@@ -146,6 +145,7 @@ class StreamingHealthMonitor:
 
     def on_integrity_report(self, report: IntegrityReport) -> None:
         self._last_report_status = report.status.value
+        self._last_report_evidence = report.evidence()
         if report.ok:
             self._gaps_recovered += 1
         else:
@@ -186,7 +186,10 @@ class StreamingHealthMonitor:
             heartbeat=heartbeat,
         )
 
-        last_closed = self._last_closed_bar or pipeline.manager.last_closed_bar
+        accepted = pipeline.closed_bars
+        last_closed = (
+            (accepted[-1].symbol, accepted[-1].open_time) if accepted else None
+        )
 
         return StreamingHealthSnapshot(
             level=level,
@@ -203,6 +206,7 @@ class StreamingHealthMonitor:
             gaps_unrecoverable=self._gaps_unrecoverable,
             consecutive_errors=self._consecutive_errors,
             last_error=self._last_error,
+            last_integrity_evidence=self._last_report_evidence,
         )
 
     # ----------------------------------------------------------------- helpers

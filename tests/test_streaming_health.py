@@ -11,6 +11,9 @@ Batería S6:
   7.  freshness vencida -> heartbeat STALE + nivel DEGRADED
   8.  as_dict estructurado SIN campos de autorización
   9.  el monitor NO actúa (no cambia el estado del pipeline)
+  10. polls repetidos del mismo reporte NO inflan los contadores
+  11. last_closed_bar refleja SOLO una vela aceptada por B1
+  12. el snapshot conserva el evidence() del IntegrityReport (sin duplicar S4)
 """
 
 from __future__ import annotations
@@ -228,6 +231,79 @@ def test_gap_no_recuperable_cuenta() -> None:
     assert snap.level is StreamingHealthLevel.UNKNOWN
 
 
+def test_poll_repetido_no_infla_gaps_unrecoverable() -> None:
+    script = [
+        _sdata(BASE),
+        _sdata(BASE + HOUR),
+        StreamingConnectionError("drop"),
+        _sdata(BASE + 3 * HOUR),
+    ]
+    pipeline, monitor, manager, _ = _setup(script, [], mono=None)
+    pipeline.connect()
+    for _ in range(5):
+        pipeline.poll()
+        snap = monitor.snapshot(pipeline)
+        assert snap.gaps_unrecoverable == 1
+        assert snap.gaps_recovered == 0
+        assert manager.data_integrity_unknown is True
+        assert snap.integrity == "UNKNOWN"
+        assert snap.level is StreamingHealthLevel.UNKNOWN
+
+
+def test_last_closed_bar_solo_aceptadas_por_b1() -> None:
+    script = [
+        _sdata(BASE),
+        _sdata(BASE + HOUR),
+        StreamingConnectionError("drop"),
+        _sdata(BASE + 3 * HOUR),
+    ]
+    pipeline, monitor, _, _ = _setup(script, [], mono=None)
+    pipeline.connect()
+    pipeline.poll()
+    accepted = pipeline.closed_bars
+    assert [(b.symbol, b.open_time) for b in accepted] == [
+        (SYMBOL, BASE),
+        (SYMBOL, BASE + HOUR),
+    ]
+    snap = monitor.snapshot(pipeline)
+    assert snap.last_closed_bar == (accepted[-1].symbol, accepted[-1].open_time)
+    assert snap.last_closed_bar != (SYMBOL, BASE + 3 * HOUR)
+
+
+def test_snapshot_incluye_evidence_de_integridad() -> None:
+    unrecoverable_script = [
+        _sdata(BASE),
+        _sdata(BASE + HOUR),
+        StreamingConnectionError("drop"),
+        _sdata(BASE + 3 * HOUR),
+    ]
+    pipeline, monitor, _, _ = _setup(unrecoverable_script, [], mono=None)
+    pipeline.connect()
+    pipeline.poll()
+    snap = monitor.snapshot(pipeline)
+    assert snap.integrity == "UNKNOWN"
+    assert snap.last_integrity_evidence is not None
+    assert snap.last_integrity_evidence["status"] == "UNRECOVERABLE"
+    assert snap.last_integrity_evidence["recovered"] == 0
+    assert snap.last_integrity_evidence["reason"]
+
+    recovered_script = [
+        _sdata(BASE),
+        _sdata(BASE + HOUR),
+        StreamingConnectionError("drop"),
+        _sdata(BASE + 3 * HOUR),
+    ]
+    historical = [_market(BASE + 2 * HOUR), _market(BASE + 3 * HOUR)]
+    ok_pipeline, ok_monitor, _, _ = _setup(recovered_script, historical, mono=None)
+    ok_pipeline.connect()
+    ok_pipeline.poll()
+    ok = ok_monitor.snapshot(ok_pipeline)
+    assert ok.integrity == "HEALTHY"
+    assert ok.last_integrity_evidence is not None
+    assert ok.last_integrity_evidence["status"] == "HEALTHY"
+    assert ok.last_integrity_evidence["recovered"] > 0
+
+
 def test_errores_consecutivos_reset() -> None:
     pipeline, monitor, _, _ = _setup([], [], mono=None)
     monitor.on_stream_error(StreamingConnectionError("e1"))
@@ -274,6 +350,7 @@ def test_as_dict_sin_autorizacion() -> None:
         "gaps_unrecoverable",
         "consecutive_errors",
         "last_error",
+        "last_integrity_evidence",
     ):
         assert key in data
     for forbidden in ("can_trade", "authorized", "authorization", "allow", "permission"):
