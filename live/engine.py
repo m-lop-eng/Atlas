@@ -46,6 +46,10 @@ class DataQuality(str, Enum):
     INCOMPLETE_BAR = "INCOMPLETE_BAR"
 
 
+class WarmStartError(ValueError):
+    """La vela de siembra de `warm_start` es invalida o inconsistente."""
+
+
 class LiveDataEngine:
     """Consume MarketDataEvents del adapter y emite ClosedBarEvents.
 
@@ -123,6 +127,74 @@ class LiveDataEngine:
         # cierre falso para una barra que nunca cerró.
         self._in_progress = None
         self._last_data_at = None
+
+    def warm_start(self, closed: ClosedBarEvent) -> None:
+        """Fija el ancla de reanudacion de B1 SIN emitir ni llamar callbacks.
+
+        Siembra el estado con la ultima vela persistida de una sesion previa
+        para que B1 detecte huecos entre reinicios: la proxima vela real en
+        `open_time + interval` se acepta; un salto mayor dispara GAP_DEGRADED.
+
+        Garantias:
+          * no produce `ClosedBarEvent` ni invoca `on_closed_bar`;
+          * no modifica `closed_bars`, `issues`, `state`, `quality` ni
+            `_last_data_at`;
+          * no ejecuta `reconcile()` ni consulta el `BackfillProvider`;
+          * conserva exactamente `closed.emission_sequence` (continuidad);
+          * valida todo atomicamente antes de tocar estado.
+
+        Args:
+            closed: ultima vela cerrada persistida (con su `emission_sequence`).
+
+        Raises:
+            WarmStartError: dato invalido (tipo/simbolo/intervalo/timestamp/
+                OHLC/emission_sequence).
+            RuntimeError: estado no CONNECTED, vela en curso, o ancla ya fijada
+                en un `open_time` distinto.
+        """
+        if not isinstance(closed, ClosedBarEvent):
+            raise WarmStartError("warm_start exige un ClosedBarEvent")
+        if self.state is not EngineState.CONNECTED:
+            raise RuntimeError(
+                f"warm_start solo desde CONNECTED, estado actual {self.state.value}"
+            )
+        if self._in_progress is not None:
+            raise RuntimeError("warm_start no permitido con una vela en curso")
+        if closed.symbol != self.symbol:
+            raise WarmStartError(
+                f"warm_start: simbolo {closed.symbol!r} != {self.symbol!r}"
+            )
+        if closed.interval_seconds != self.interval_seconds:
+            raise WarmStartError(
+                f"warm_start: intervalo {closed.interval_seconds} != "
+                f"{self.interval_seconds}"
+            )
+        if not self._is_valid_timestamp(closed.open_time):
+            raise WarmStartError(
+                f"warm_start: open_time {closed.open_time} no alineado al "
+                f"intervalo {self.interval_seconds}"
+            )
+        if not self._is_valid_ohlc(closed):
+            raise WarmStartError(
+                f"warm_start: OHLC invalido en open_time {closed.open_time}"
+            )
+        seq = closed.emission_sequence
+        if not isinstance(seq, int) or isinstance(seq, bool) or seq < 0:
+            raise WarmStartError(
+                f"warm_start: emission_sequence invalido {seq!r}"
+            )
+
+        if self._last_emitted_open_time is not None:
+            if closed.open_time == self._last_emitted_open_time:
+                return  # no-op idempotente: mismo ancla
+            raise RuntimeError(
+                f"warm_start: ancla ya fijada en {self._last_emitted_open_time}; "
+                f"no se puede reemplazar por {closed.open_time}"
+            )
+
+        self._last_emitted_open_time = closed.open_time
+        self._emission_seq = seq
+        self._in_progress = None
 
     def poll(self, max_events: int = 100) -> int:
         """Drena hasta `max_events` del adapter procesándolos.

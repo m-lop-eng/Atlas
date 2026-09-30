@@ -21,7 +21,12 @@ from __future__ import annotations
 import pytest
 
 from live.adapter import BackfillProvider, MarketDataAdapter
-from live.engine import DataQuality, EngineState, LiveDataEngine
+from live.engine import (
+    DataQuality,
+    EngineState,
+    LiveDataEngine,
+    WarmStartError,
+)
 from live.events import ClosedBarEvent, MarketDataEvent
 
 HOUR = 3_600
@@ -523,3 +528,178 @@ class TestReconcileContract:
             BASE + HOUR,
             BASE + 2 * HOUR,
         ]
+
+
+# ---------------------------------------------------------------------------
+# 14. warm_start: siembra del ancla SIN emitir/callback/reconcile
+# ---------------------------------------------------------------------------
+
+
+def _closed(
+    open_time: int,
+    *,
+    seq: int = 1,
+    symbol: str = "BTCUSDT",
+    interval_seconds: int = HOUR,
+    open: float = 100.0,
+    high: float | None = None,
+    low: float | None = None,
+    close: float = 100.0,
+    volume: float = 1_000.0,
+) -> ClosedBarEvent:
+    high = high if high is not None else max(open, close)
+    low = low if low is not None else min(open, close)
+    return ClosedBarEvent(
+        symbol=symbol,
+        open_time=open_time,
+        open=open,
+        high=high,
+        low=low,
+        close=close,
+        volume=volume,
+        interval_seconds=interval_seconds,
+        emission_sequence=seq,
+    )
+
+
+class TestWarmStart:
+    def test_cero_emision_ni_callback(self) -> None:
+        received: list[ClosedBarEvent] = []
+        engine = _engine(handler=received.append)
+        engine.warm_start(_closed(BASE, seq=7))
+        assert engine.closed_bars == []
+        assert received == []
+        assert engine.state == EngineState.CONNECTED
+        assert engine.quality == DataQuality.HEALTHY
+
+    def test_continuidad_emission_sequence(self) -> None:
+        engine = _engine()
+        engine.warm_start(_closed(BASE, seq=7))
+        out = engine.process(_ev(BASE + HOUR))
+        assert out is not None
+        assert out.emission_sequence == 8
+
+    def test_continuidad_normal(self) -> None:
+        engine = _engine()
+        engine.warm_start(_closed(BASE))
+        out = engine.process(_ev(BASE + HOUR))
+        assert out is not None
+        assert [b.open_time for b in engine.closed_bars] == [BASE + HOUR]
+
+    def test_gap_degraded(self) -> None:
+        engine = _engine()
+        engine.warm_start(_closed(BASE))
+        out = engine.process(_ev(BASE + 3 * HOUR))
+        assert out is None
+        assert engine.state == EngineState.DEGRADED
+        assert engine.quality == DataQuality.GAP_DETECTED
+        assert engine.closed_bars == []
+
+    def test_duplicate_tras_seed(self) -> None:
+        engine = _engine()
+        engine.warm_start(_closed(BASE))
+        out = engine.process(_ev(BASE))
+        assert out is None
+        assert any(q == DataQuality.DUPLICATE for q, _ in engine.issues)
+        assert engine.state == EngineState.CONNECTED
+        assert engine.closed_bars == []
+
+    def test_out_of_order_antes_del_seed(self) -> None:
+        engine = _engine()
+        engine.warm_start(_closed(BASE))
+        out = engine.process(_ev(BASE - HOUR))
+        assert out is None
+        assert any(q == DataQuality.OUT_OF_ORDER for q, _ in engine.issues)
+        assert engine.state == EngineState.CONNECTED
+        assert engine.closed_bars == []
+
+    def test_idempotencia_mismo_ancla(self) -> None:
+        engine = _engine()
+        engine.warm_start(_closed(BASE, seq=7))
+        engine.warm_start(_closed(BASE, seq=7))
+        out = engine.process(_ev(BASE + HOUR))
+        assert out is not None
+        assert out.emission_sequence == 8
+
+    def test_conflicto_de_ancla(self) -> None:
+        engine = _engine()
+        engine.warm_start(_closed(BASE, seq=7))
+        with pytest.raises(RuntimeError):
+            engine.warm_start(_closed(BASE + HOUR, seq=8))  # posterior
+        with pytest.raises(RuntimeError):
+            engine.warm_start(_closed(BASE - HOUR, seq=8))  # anterior
+        out = engine.process(_ev(BASE + HOUR))
+        assert out is not None
+        assert out.emission_sequence == 8
+
+    def test_tipo_invalido(self) -> None:
+        engine = _engine()
+        with pytest.raises(WarmStartError):
+            engine.warm_start(_ev(BASE))  # type: ignore[arg-type]
+
+    @pytest.mark.parametrize(
+        "bad",
+        [
+            _closed(BASE, symbol="ETHUSDT"),
+            _closed(BASE, interval_seconds=60),
+            _closed(BASE + 1_800),
+            _closed(BASE, open=100.0, high=99.0, low=98.0, close=100.0),
+            _closed(BASE, seq=-1),
+        ],
+    )
+    def test_validaciones_atomicas(self, bad: ClosedBarEvent) -> None:
+        engine = _engine()
+        with pytest.raises(WarmStartError):
+            engine.warm_start(bad)
+        # sin efectos parciales: el engine sigue utilizable como fresco
+        engine.warm_start(_closed(BASE, seq=3))
+        out = engine.process(_ev(BASE + HOUR))
+        assert out is not None
+        assert out.emission_sequence == 4
+
+    def test_estado_no_conectado(self) -> None:
+        adapter = RememberingAdapter([])
+        engine = LiveDataEngine("BTCUSDT", HOUR, adapter)
+        with pytest.raises(RuntimeError):
+            engine.warm_start(_closed(BASE))
+
+    def test_vela_en_curso(self) -> None:
+        engine = _engine()
+        engine.process(_ev(BASE, is_closed=False))
+        with pytest.raises(RuntimeError):
+            engine.warm_start(_closed(BASE))
+        assert engine.closed_bars == []
+
+    def test_estado_degraded(self) -> None:
+        engine = _engine()
+        engine.process(_ev(BASE))
+        engine.process(_ev(BASE + 3 * HOUR))
+        assert engine.state == EngineState.DEGRADED
+        with pytest.raises(RuntimeError):
+            engine.warm_start(_closed(BASE + 2 * HOUR))
+
+    def test_cero_llamadas_al_backfill(self) -> None:
+        backfill = FakeBackfill([_ev(BASE + HOUR)])
+        engine = _engine([], backfill=backfill)
+        engine.warm_start(_closed(BASE))
+        assert backfill.calls == []
+        assert engine.state == EngineState.CONNECTED
+
+    def test_no_modifica_last_data_at(self) -> None:
+        class FakeClock:
+            def __init__(self) -> None:
+                self.now = 1_000.0
+
+            def __call__(self) -> float:
+                return self.now
+
+        clock = FakeClock()
+        adapter = RememberingAdapter([])
+        engine = LiveDataEngine(
+            "BTCUSDT", HOUR, adapter, stale_timeout_seconds=5.0, clock=clock
+        )
+        engine.start()
+        engine.warm_start(_closed(BASE))
+        clock.now = 1_100.0
+        engine.check_stale()
+        assert engine.state == EngineState.CONNECTED

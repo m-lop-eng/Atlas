@@ -30,7 +30,7 @@ import pytest
 
 from live.adapter import BackfillProvider
 from live.engine import EngineState
-from live.events import MarketDataEvent
+from live.events import ClosedBarEvent, MarketDataEvent
 
 from streaming import (
     BackoffPolicy,
@@ -41,6 +41,7 @@ from streaming import (
     ReconnectState,
     StreamData,
     StreamingConnectionError,
+    StreamingHealthMonitor,
     StreamingMarketDataAdapter,
     StreamingPipeline,
 )
@@ -125,7 +126,21 @@ class FakeHistoricalProvider(BackfillProvider):
         return [b for b in self.bars if b.open_time >= start_open_time]
 
 
-def _pipeline(script, historical, *, connect_error_after=False):
+def _closed(open_time: int, *, seq: int = 1, symbol: str = SYMBOL) -> ClosedBarEvent:
+    return ClosedBarEvent(
+        symbol=symbol,
+        open_time=open_time,
+        open=1.0,
+        high=2.0,
+        low=0.5,
+        close=1.5,
+        volume=1.0,
+        interval_seconds=HOUR,
+        emission_sequence=seq,
+    )
+
+
+def _pipeline(script, historical, *, observer=None):
     adapter = FakeStreamingAdapter(script)
     manager = ReconnectManager(
         adapter,
@@ -142,6 +157,7 @@ def _pipeline(script, historical, *, connect_error_after=False):
         interval_seconds=HOUR,
         manager=manager,
         provider=provider,
+        observer=observer,
         clock=lambda: 0.0,
         stale_timeout_seconds=1e9,
     )
@@ -332,3 +348,57 @@ def test_bridge_no_importa_ejecucion() -> None:
     ]
     for pattern in forbidden:
         assert re.search(pattern, source) is None, f"referencia prohibida: {pattern}"
+
+
+# --------------------------------------------------------------- warm_start
+
+
+def test_warm_start_no_observa_s6() -> None:
+    monitor = StreamingHealthMonitor(clock=lambda: FIXED_NOW, monotonic=lambda: 0.0)
+    pipeline, _, provider, manager = _pipeline(
+        [_sdata(BASE), _sdata(BASE + HOUR)], [], observer=monitor
+    )
+    pipeline.connect()
+    pipeline.warm_start(_closed(BASE, seq=5))
+    assert _open_times(pipeline) == []
+    assert provider.calls == []
+    assert manager.data_integrity_unknown is False
+    snap = monitor.snapshot(pipeline)
+    assert snap.last_event_at is None
+    assert snap.last_closed_bar is None
+    assert snap.reconnections == 0
+
+
+def test_warm_start_gap_recuperado() -> None:
+    historical = [
+        _market(BASE + HOUR),
+        _market(BASE + 2 * HOUR),
+        _market(BASE + 3 * HOUR),
+    ]
+    script = [_sdata(BASE + 3 * HOUR)]
+    pipeline, _, provider, manager = _pipeline(script, historical)
+    pipeline.connect()
+    pipeline.warm_start(_closed(BASE, seq=5))
+    pipeline.poll()
+    assert _open_times(pipeline) == [BASE + HOUR, BASE + 2 * HOUR, BASE + 3 * HOUR]
+    assert pipeline.engine.state is EngineState.CONNECTED
+    assert manager.data_integrity_unknown is False
+    assert pipeline.closed_bars[-1].emission_sequence == 8
+
+
+def test_warm_start_sin_backfill_hasta_poll() -> None:
+    pipeline, _, provider, manager = _pipeline([_sdata(BASE + HOUR)], [])
+    pipeline.connect()
+    pipeline.warm_start(_closed(BASE))
+    assert provider.calls == []
+    assert manager.data_integrity_unknown is False
+    assert pipeline.engine.state is EngineState.CONNECTED
+    pipeline.poll()
+    assert _open_times(pipeline) == [BASE + HOUR]
+
+
+def test_warm_start_requiere_connect() -> None:
+    pipeline, _, _, _ = _pipeline([], [])
+    with pytest.raises(RuntimeError):
+        pipeline.warm_start(_closed(BASE))
+    assert _open_times(pipeline) == []

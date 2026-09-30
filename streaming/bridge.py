@@ -204,6 +204,15 @@ class StreamingPipeline:
     def disconnect(self) -> None:
         self.engine.stop()
 
+    def warm_start(self, closed: ClosedBarEvent) -> None:
+        """Siembra el ancla de B1 del pipeline (delegado, sin observar en S6).
+
+        Delega en `LiveDataEngine.warm_start`: no emite `ClosedBarEvent`, no
+        invoca el observer S6 (no pasa por `B1StreamingAdapter.receive`) y no
+        reconcilia. Debe invocarse tras `connect()`.
+        """
+        self.engine.warm_start(closed)
+
     def poll(self, max_events: int = 100) -> int:
         """Drena el stream hacia B1 y reconcilia si B1 quedó DEGRADED."""
         processed = self.engine.poll(max_events)
