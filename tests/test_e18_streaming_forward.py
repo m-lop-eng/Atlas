@@ -23,6 +23,8 @@ from streaming import (
     ReconnectPolicy,
     ScriptedStreamingAdapter,
     StreamData,
+    StreamingConnectionError,
+    StreamingMarketDataAdapter,
 )
 
 BASE = 1_788_220_800
@@ -155,6 +157,45 @@ class _EmptyBackfill:
         return []
 
 
+class _CountingAdapter(StreamingMarketDataAdapter):
+    """Adapter determinista que puede fallar en connect y cuenta disconnect."""
+
+    def __init__(self, *, connect_error: BaseException | None = None) -> None:
+        self._connect_error = connect_error
+        self.disconnect_calls = 0
+        self._state = "DISCONNECTED"
+        self._subscription: tuple[str, int] | None = None
+
+    @property
+    def provider_name(self) -> str:
+        return "counting"
+
+    @property
+    def state(self):  # type: ignore[override]
+        return self._state
+
+    @property
+    def subscription(self):
+        return self._subscription
+
+    def connect(self) -> None:
+        if self._connect_error is not None:
+            raise self._connect_error
+        self._state = "CONNECTED"
+
+    def disconnect(self) -> None:
+        self.disconnect_calls += 1
+        self._state = "CLOSED"
+
+    def subscribe(self, symbol, interval_seconds) -> None:
+        if self._state != "CONNECTED":
+            raise StreamingConnectionError("no conectado")
+        self._subscription = (symbol, interval_seconds)
+
+    def receive(self):
+        return None
+
+
 # --------------------------------------------------------------- status
 
 
@@ -261,3 +302,73 @@ def test_run_cycle_once_bounded(tmp_path: Path, monkeypatch) -> None:
 
     report = e18.build_report(out_dir, datetime.now(timezone.utc))
     assert report["ejecucion"]["barras_totales"] == 2
+
+
+# --------------------------------------------------------------- hardening
+
+
+def test_run_cycle_connect_failure_controlado(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(
+        e18,
+        "build_streaming_adapter",
+        lambda args: _CountingAdapter(
+            connect_error=StreamingConnectionError("boom connect")
+        ),
+    )
+    monkeypatch.setattr(e18, "build_reconnect_manager", _scripted_manager)
+    monkeypatch.setattr(e18, "build_backfill_provider", lambda args: _EmptyBackfill())
+
+    run_id = "FORWARD-STREAM-CONNFAIL"
+    result = e18.run_cycle(_args(tmp_path, run_id=run_id))
+
+    assert result["locked"] is False  # no escapa excepcion; lock liberado
+    assert result["cycle"]["connect_error"] is True
+    assert [i["kind"] for i in result["incidents"]] == ["STREAM_CONNECT_ERROR"]
+
+    out_dir = tmp_path / run_id
+    assert (out_dir / e18.S7_REPORT).exists()
+    assert (out_dir / e18.S7_INCIDENTS).exists()
+
+    lock = e18.StreamingInstanceLock(out_dir / e18.S7_LOCK)
+    lock.acquire()
+    lock.release()
+
+
+def test_run_cycle_startup_failure_controlado(tmp_path: Path, monkeypatch) -> None:
+    _patch_factories(monkeypatch, [])
+
+    def _boom(self):
+        raise RuntimeError("provenance boom")
+
+    monkeypatch.setattr(e18.StreamingForwardRunner, "_write_provenance", _boom)
+
+    run_id = "FORWARD-STREAM-PROVFAIL"
+    result = e18.run_cycle(_args(tmp_path, run_id=run_id))
+
+    assert result["locked"] is False
+    assert result["cycle"]["startup_error"] is True
+    assert [i["kind"] for i in result["incidents"]] == ["STARTUP_ERROR"]
+
+    out_dir = tmp_path / run_id
+    assert (out_dir / e18.S7_REPORT).exists()
+
+    lock = e18.StreamingInstanceLock(out_dir / e18.S7_LOCK)
+    lock.acquire()
+    lock.release()
+
+
+def test_main_connect_failure_devuelve_1(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(
+        e18,
+        "build_streaming_adapter",
+        lambda args: _CountingAdapter(
+            connect_error=StreamingConnectionError("boom connect")
+        ),
+    )
+    monkeypatch.setattr(e18, "build_reconnect_manager", _scripted_manager)
+    monkeypatch.setattr(e18, "build_backfill_provider", lambda args: _EmptyBackfill())
+
+    rc = e18.main(
+        ["--once", "--run-id", "FORWARD-STREAM-MAINFAIL", "--out-root", str(tmp_path)]
+    )
+    assert rc == 1

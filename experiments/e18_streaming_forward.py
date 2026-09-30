@@ -318,6 +318,36 @@ def _print_report(report: dict) -> None:
 # --------------------------------------------------------------- ciclo
 
 
+def _startup_failure(
+    out_dir: Path,
+    now_dt: datetime,
+    *,
+    kind: str,
+    flag: str,
+    exc: BaseException,
+) -> dict:
+    """Fallo de arranque controlado: incidente + informe, sin traceback.
+
+    No oculta el fallo: registra el tipo y el mensaje del error; el driver
+    `main` devuelve codigo != 0. El cleanup (disconnect/checkpoint) ya lo
+    garantiza `StreamingForwardRunner.start()`.
+    """
+    inc = _incident(
+        out_dir,
+        kind,
+        {"error": str(exc), "error_type": type(exc).__name__},
+        now_dt,
+    )
+    report = build_report(out_dir, now_dt)
+    _write_report(out_dir, report)
+    return {
+        "locked": False,
+        "cycle": {"at": now_dt.isoformat(), flag: True, "reason": str(exc)},
+        "report": report,
+        "incidents": [inc],
+    }
+
+
 def run_cycle(args: argparse.Namespace) -> dict:
     """Una sesion acotada de S7 (idempotente y aislada de A4)."""
     out_root = Path(args.out_root)
@@ -352,27 +382,29 @@ def run_cycle(args: argparse.Namespace) -> dict:
         try:
             sfr.start()
         except ForwardConfigError as exc:
-            inc = _incident(
-                out_dir, "INPUT_FINGERPRINT_MISMATCH", {"error": str(exc)}, now_dt
+            return _startup_failure(
+                out_dir,
+                now_dt,
+                kind="INPUT_FINGERPRINT_MISMATCH",
+                flag="fingerprint_mismatch",
+                exc=exc,
             )
-            report = build_report(out_dir, now_dt)
-            _write_report(out_dir, report)
-            return {
-                "locked": False,
-                "cycle": {"at": now_dt.isoformat(), "fingerprint_mismatch": True},
-                "report": report,
-                "incidents": [inc],
-            }
         except SeedError as exc:
-            inc = _incident(out_dir, "SEED_INVALID", {"error": str(exc)}, now_dt)
-            report = build_report(out_dir, now_dt)
-            _write_report(out_dir, report)
-            return {
-                "locked": False,
-                "cycle": {"at": now_dt.isoformat(), "seed_invalid": True},
-                "report": report,
-                "incidents": [inc],
-            }
+            return _startup_failure(
+                out_dir, now_dt, kind="SEED_INVALID", flag="seed_invalid", exc=exc
+            )
+        except ConnectionError as exc:
+            return _startup_failure(
+                out_dir,
+                now_dt,
+                kind="STREAM_CONNECT_ERROR",
+                flag="connect_error",
+                exc=exc,
+            )
+        except Exception as exc:  # noqa: BLE001 - arranque controlado
+            return _startup_failure(
+                out_dir, now_dt, kind="STARTUP_ERROR", flag="startup_error", exc=exc
+            )
 
         try:
             cycle = sfr.run_bounded(
@@ -466,7 +498,12 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[{result['cycle']['at']}] SKIP: {result['cycle']['reason']}")
         return 0
     cycle = result["cycle"]
-    if cycle.get("fingerprint_mismatch") or cycle.get("seed_invalid"):
+    if (
+        cycle.get("fingerprint_mismatch")
+        or cycle.get("seed_invalid")
+        or cycle.get("connect_error")
+        or cycle.get("startup_error")
+    ):
         print(f"[{cycle['at']}] fail-safe (sin procesar): {cycle}")
         _print_report(result["report"])
         return 1

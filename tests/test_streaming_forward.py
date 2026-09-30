@@ -46,7 +46,10 @@ from streaming import (
     ReconnectPolicy,
     ScriptedStreamingAdapter,
     StreamData,
+    StreamingConnectionError,
     StreamingHealthMonitor,
+    StreamingMarketDataAdapter,
+    StreamingPipeline,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -158,6 +161,76 @@ def _sfr(
         clock=lambda: 0.0,
     )
     return sfr, provider
+
+
+class _CountingAdapter(StreamingMarketDataAdapter):
+    """Adapter determinista que cuenta disconnect y puede fallar en connect."""
+
+    def __init__(self, *, connect_error: BaseException | None = None) -> None:
+        self._connect_error = connect_error
+        self.connect_calls = 0
+        self.disconnect_calls = 0
+        self._state = "DISCONNECTED"
+        self._subscription: tuple[str, int] | None = None
+
+    @property
+    def provider_name(self) -> str:
+        return "counting"
+
+    @property
+    def state(self):  # type: ignore[override]
+        return self._state
+
+    @property
+    def subscription(self):
+        return self._subscription
+
+    def connect(self) -> None:
+        self.connect_calls += 1
+        if self._connect_error is not None:
+            raise self._connect_error
+        self._state = "CONNECTED"
+
+    def disconnect(self) -> None:
+        self.disconnect_calls += 1
+        self._state = "CLOSED"
+
+    def subscribe(self, symbol, interval_seconds) -> None:
+        if self._state != "CONNECTED":
+            raise StreamingConnectionError("no conectado")
+        self._subscription = (symbol, interval_seconds)
+
+    def receive(self):
+        return None
+
+
+def _sfr_with_adapter(tmp_path, run_id, adapter, *, runner=None):
+    if runner is None:
+        runner = build_forward_runner(run_id=run_id, output_dir=str(tmp_path))
+    manager = ReconnectManager(
+        adapter,
+        policy=ReconnectPolicy(
+            max_attempts=3, backoff=BackoffPolicy(base_delay_seconds=1.0, factor=2.0)
+        ),
+        clock=lambda: 0.0,
+        wall_clock=lambda: FIXED_NOW,
+        sleep=lambda _s: None,
+    )
+    return StreamingForwardRunner(
+        forward_runner=runner,
+        symbol=SYMBOL,
+        interval_seconds=HOUR,
+        manager=manager,
+        backfill_provider=_ListBackfill([]),
+        clock=lambda: 0.0,
+    )
+
+
+def _spy_checkpoint(runner):
+    calls: list[int] = []
+    orig = runner.checkpoint
+    runner.checkpoint = lambda: (calls.append(1), orig())[1]
+    return calls
 
 
 # --------------------------------------------------------------- casos
@@ -367,3 +440,64 @@ def test_determinismo_de_replay(tmp_path: Path) -> None:
     assert [r.to_dict() for r in a.forward_runner.records] == [
         r.to_dict() for r in b.forward_runner.records
     ]
+
+
+# --------------------------------------------------------------- hardening
+
+
+def test_start_connect_falla_limpia_y_repropaga(tmp_path: Path) -> None:
+    adapter = _CountingAdapter(
+        connect_error=StreamingConnectionError("boom connect")
+    )
+    sfr = _sfr_with_adapter(tmp_path, "S7-CONNFAIL", adapter)
+
+    with pytest.raises(ConnectionError):
+        sfr.start()
+
+    assert adapter.disconnect_calls >= 1  # sin recursos de streaming abiertos
+    assert sfr._started is False
+
+
+def test_start_warm_start_falla_limpia_y_repropaga(
+    tmp_path: Path, monkeypatch
+) -> None:
+    _seed_run(tmp_path, "S7-WSFAIL", [_closed(BASE, 1)])
+    runner = build_forward_runner(run_id="S7-WSFAIL", output_dir=str(tmp_path))
+    checkpoint_calls = _spy_checkpoint(runner)
+
+    def _boom(self, closed):
+        raise RuntimeError("warm_start boom")
+
+    monkeypatch.setattr(StreamingPipeline, "warm_start", _boom)
+
+    adapter = _CountingAdapter()
+    sfr = _sfr_with_adapter(tmp_path, "S7-WSFAIL", adapter, runner=runner)
+
+    with pytest.raises(RuntimeError):
+        sfr.start()
+
+    assert adapter.disconnect_calls >= 1  # pipeline desconectado
+    assert checkpoint_calls  # runner.checkpoint() ejecutado en cleanup
+    assert sfr._started is False
+
+
+def test_start_provenance_falla_limpia_y_repropaga(
+    tmp_path: Path, monkeypatch
+) -> None:
+    runner = build_forward_runner(run_id="S7-PROVFAIL", output_dir=str(tmp_path))
+    checkpoint_calls = _spy_checkpoint(runner)
+
+    def _boom(self):
+        raise RuntimeError("provenance boom")
+
+    monkeypatch.setattr(StreamingForwardRunner, "_write_provenance", _boom)
+
+    adapter = _CountingAdapter()
+    sfr = _sfr_with_adapter(tmp_path, "S7-PROVFAIL", adapter, runner=runner)
+
+    with pytest.raises(RuntimeError):
+        sfr.start()
+
+    assert adapter.disconnect_calls >= 1  # pipeline desconectado
+    assert checkpoint_calls  # runner.checkpoint() ejecutado en cleanup
+    assert sfr._started is False

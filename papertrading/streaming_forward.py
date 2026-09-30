@@ -239,29 +239,44 @@ class StreamingForwardRunner:
     # ------------------------------------------------------------ ciclo de vida
 
     def start(self) -> "StreamingForwardRunner":
-        """runner.start() -> seed -> pipeline.connect() -> warm_start(seed)."""
+        """runner.start() -> seed -> pipeline.connect() -> warm_start(seed).
+
+        Hardening de arranque: si CUALQUIER paso desde la construccion del
+        pipeline en adelante falla (construir pipeline, `connect()`,
+        `warm_start()` o provenance), se garantiza el cleanup
+        (`disconnect()` best-effort + `checkpoint()` aplicable) y el error se
+        re-propaga SIN ocultarse. El lock de instancia lo libera el driver.
+        """
         if self._started:
             return self
         # 1) El runner reproduce bars.jsonl (idempotente) y fija su ancla.
         self._forward.start()
         # 2) Seed DESPUES de start (nunca antes de cualquier callback).
         self._seed = load_seed_bar(self._forward.output_dir / "bars.jsonl")
-        # 3) Pipeline (B1 es la autoridad); unico callback hacia el runner.
-        self.pipeline = StreamingPipeline(
-            symbol=self.symbol,
-            interval_seconds=self.interval_seconds,
-            manager=self._manager,
-            provider=self._backfill,
-            on_closed_bar=self._on_closed_bar,
-            observer=self._monitor,
-            stale_timeout_seconds=self._stale_timeout,
-            clock=self._clock,
-        )
-        self.pipeline.connect()
-        # 4) Warm-start SILENCIOSO (no emite, no observa S6, conserva seq).
-        if self._seed is not None:
-            self.pipeline.warm_start(self._seed)
-        self._write_provenance()
+        try:
+            # 3) Pipeline (B1 es la autoridad); unico callback hacia el runner.
+            self.pipeline = StreamingPipeline(
+                symbol=self.symbol,
+                interval_seconds=self.interval_seconds,
+                manager=self._manager,
+                provider=self._backfill,
+                on_closed_bar=self._on_closed_bar,
+                observer=self._monitor,
+                stale_timeout_seconds=self._stale_timeout,
+                clock=self._clock,
+            )
+            self.pipeline.connect()
+            # 4) Warm-start SILENCIOSO (no emite, no observa S6, conserva seq).
+            if self._seed is not None:
+                self.pipeline.warm_start(self._seed)
+            self._write_provenance()
+        except BaseException:
+            # Cleanup garantizado; nunca enmascara el error original.
+            try:
+                self.close()
+            except Exception:  # noqa: BLE001 - cleanup best-effort
+                pass
+            raise
         self._started = True
         return self
 
