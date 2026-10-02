@@ -22,6 +22,19 @@ Modos:
 
 D3: no se modifica ni refactoriza e18/S7; se reutilizan sus componentes
 publicos (`StreamingInstanceLock`, `AlreadyRunningError`, `build_report`).
+
+Acotacion operacional (S8-C2-POLLDUR-001):
+  * `--cycle-timeout-seconds` es un presupuesto SOFT: se comprueba SOLO entre
+    `poll_once()`; NO interrumpe una lectura de socket en curso. Un unico
+    `poll_once()` puede seguir bloqueando hasta `recv_timeout` (+frames) y una
+    reconciliacion REST su propio timeout HTTP.
+  * Si el presupuesto se agota, el ciclo se cierra de forma controlada y se
+    registra `status="budget_exhausted"` + `completed=false` + incidente
+    `CYCLE_BUDGET_EXHAUSTED`. NUNCA se cuenta como ciclo completado.
+  * No existe un "modo rapido": no se omite replay, warm-start, S4 ni REST.
+  * El incidente de presupuesto lo emite el PROPIO ciclo; una interrupcion
+    externa del proceso (kill/timeout de la herramienta) no genera ese
+    incidente, porque no ejecuta el cierre del ciclo.
 """
 
 from __future__ import annotations
@@ -98,7 +111,10 @@ def build_backfill_provider(args: argparse.Namespace) -> RestStreamingBackfillPr
 
 
 def build_streaming_adapter(args: argparse.Namespace):
-    return BinanceStreamingAdapter()
+    return BinanceStreamingAdapter(
+        recv_timeout_seconds=args.recv_timeout,
+        max_control_frames=args.max_control_frames,
+    )
 
 
 def build_reconnect_manager(args: argparse.Namespace, adapter):
@@ -107,6 +123,9 @@ def build_reconnect_manager(args: argparse.Namespace, adapter):
         policy=ReconnectPolicy(
             max_attempts=3, backoff=BackoffPolicy(base_delay_seconds=1.0, factor=2.0)
         ),
+        heartbeat_timeout_seconds=args.heartbeat_timeout,
+        pong_timeout_seconds=args.pong_timeout,
+        poll_interval_seconds=args.poll_interval,
     )
 
 
@@ -117,6 +136,11 @@ def _now(args: argparse.Namespace) -> datetime:
     if getattr(args, "now", None):
         return datetime.fromisoformat(args.now).replace(tzinfo=_UTC)
     return datetime.now(_UTC)
+
+
+def _monotonic() -> float:
+    """Reloj monotono para medir el presupuesto del ciclo (no de pared)."""
+    return time.monotonic()
 
 
 def _append_ndjson(path: Path, payload: dict) -> None:
@@ -313,15 +337,62 @@ def run_cycle(args: argparse.Namespace) -> dict:
 
         _write_provenance_s8(out_dir, args, manager, sfr.seed)
 
+        # Ciclo acotado por presupuesto SOFT (comprobado entre poll_once()).
+        # NUNCA se omite replay/warm-start/S4/REST: solo se decide si seguir.
+        started_at = _monotonic()
+        budget = args.cycle_timeout_seconds
+        deadline = None if budget is None else started_at + budget
+        processed = 0
+        polls = 0
+        budget_exhausted = False
         try:
-            cycle = sfr.run_bounded(
-                max_events=args.max_events, max_polls=args.max_polls
-            )
+            while polls < args.max_polls and processed < args.max_events:
+                if deadline is not None and _monotonic() >= deadline:
+                    budget_exhausted = True
+                    break
+                processed += sfr.poll_once()
+                polls += 1
+            # Capturar estado ANTES de close(): close() deja B1 en DISCONNECTED.
+            last_report = sfr.pipeline.backfill.last_report
+            engine_state = sfr.pipeline.engine.state.value
+            engine_quality = sfr.pipeline.engine.quality.value
+            closed_bars = len(sfr.pipeline.closed_bars)
         finally:
+            sfr.checkpoint()
             sfr.close()
+        start_seconds = round(_monotonic() - started_at, 3)
+
+        cycle = {
+            "processed": processed,
+            "polls": polls,
+            "emitted": sfr.emitted,
+            "deduped": sfr.deduped,
+            "closed_bars": closed_bars,
+            "engine_state": engine_state,
+            "engine_quality": engine_quality,
+            "backfill_status": last_report.status.value if last_report else None,
+            "restart": sfr.seed is not None,
+            "status": "budget_exhausted" if budget_exhausted else "completed",
+            "completed": not budget_exhausted,
+            "start_seconds": start_seconds,
+        }
 
         incidents: list[dict] = []
-        last_report = sfr.pipeline.backfill.last_report
+        if budget_exhausted:
+            incidents.append(
+                _incident(
+                    out_dir,
+                    "CYCLE_BUDGET_EXHAUSTED",
+                    {
+                        "cycle_timeout_seconds": budget,
+                        "processed": processed,
+                        "polls": polls,
+                        "max_polls": args.max_polls,
+                        "max_events": args.max_events,
+                    },
+                    now_dt,
+                )
+            )
         if last_report is not None and not last_report.ok:
             incidents.append(
                 _incident(
@@ -375,6 +446,18 @@ def _parse(argv: list[str] | None) -> argparse.Namespace:
     ap.add_argument("--loop", action="store_true")
     ap.add_argument("--status", action="store_true")
     ap.add_argument("--now", default=None, help="ISO UTC (tests deterministas)")
+    # Acotacion operacional (S8-C2-POLLDUR-001). Defaults = comportamiento actual.
+    ap.add_argument(
+        "--cycle-timeout-seconds",
+        type=float,
+        default=None,
+        help="Presupuesto SOFT del ciclo (entre poll_once); None = sin limite",
+    )
+    ap.add_argument("--recv-timeout", type=float, default=5.0)
+    ap.add_argument("--max-control-frames", type=int, default=10)
+    ap.add_argument("--heartbeat-timeout", type=float, default=30.0)
+    ap.add_argument("--pong-timeout", type=float, default=10.0)
+    ap.add_argument("--poll-interval", type=float, default=0.5)
     return ap.parse_args(argv)
 
 

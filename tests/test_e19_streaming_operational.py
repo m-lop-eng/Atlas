@@ -126,6 +126,12 @@ def _args(tmp_path: Path, run_id: str, **overrides) -> argparse.Namespace:
         loop=False,
         status=False,
         now="2026-09-01T00:00:00",
+        cycle_timeout_seconds=None,
+        recv_timeout=5.0,
+        max_control_frames=10,
+        heartbeat_timeout=30.0,
+        pong_timeout=10.0,
+        poll_interval=0.5,
     )
     base.update(overrides)
     return argparse.Namespace(**base)
@@ -346,3 +352,114 @@ def test_source_scan_sin_credenciales_ni_ordenes() -> None:
             import re
 
             assert re.search(pattern, src) is None, f"{rel}: {pattern}"
+
+
+# --------------------------------------------------- presupuesto (POLLDUR-001)
+
+
+def test_cycle_completed_flag_y_start_seconds(tmp_path: Path, monkeypatch) -> None:
+    _patch(monkeypatch, [_sdata(BASE)], [])
+    result = e19.run_cycle(_args(tmp_path, "S8-BUDGET-OK"))
+    cycle = result["cycle"]
+    assert cycle["status"] == "completed"
+    assert cycle["completed"] is True
+    assert isinstance(cycle["start_seconds"], float)
+    # Sin presupuesto no se genera incidente de presupuesto.
+    kinds = [i["kind"] for i in result["incidents"]]
+    assert "CYCLE_BUDGET_EXHAUSTED" not in kinds
+
+
+def test_budget_agotado_no_cuenta_como_completado(tmp_path: Path, monkeypatch) -> None:
+    _patch(monkeypatch, [_sdata(BASE)], [])
+    # Deadline ya consumido: el bucle debe salir en la primera comprobacion.
+    ticks = iter([100.0, 200.0, 200.0, 200.0, 200.0, 200.0, 200.0])
+    monkeypatch.setattr(e19, "_monotonic", lambda: next(ticks, 200.0))
+
+    result = e19.run_cycle(
+        _args(tmp_path, "S8-BUDGET-EXH", cycle_timeout_seconds=1.0)
+    )
+    cycle = result["cycle"]
+    assert cycle["status"] == "budget_exhausted"
+    assert cycle["completed"] is False
+    assert cycle["polls"] == 0  # no se completo ningun poll
+    kinds = [i["kind"] for i in result["incidents"]]
+    assert "CYCLE_BUDGET_EXHAUSTED" in kinds
+    # No debe registrarse como ciclo completado en ops_log.
+    ops = _read_ndjson(tmp_path / "S8-BUDGET-EXH" / e19.S7_OPS_LOG)
+    assert ops[-1]["status"] == "budget_exhausted"
+    assert ops[-1]["completed"] is False
+
+
+def test_budget_parcial_con_polls(tmp_path: Path, monkeypatch) -> None:
+    """Presupuesto agotado tras completar al menos un poll: registra el parcial."""
+    _patch(monkeypatch, [_sdata(BASE), _sdata(BASE + HOUR)], [])
+    # Primera comprobacion dentro de plazo; tras el poll, deadline superado.
+    ticks = iter([100.0, 100.0, 101.0, 101.0, 101.0, 101.0, 101.0, 101.0])
+    monkeypatch.setattr(e19, "_monotonic", lambda: next(ticks, 101.0))
+
+    result = e19.run_cycle(
+        _args(tmp_path, "S8-BUDGET-PART", max_polls=5, cycle_timeout_seconds=0.5)
+    )
+    cycle = result["cycle"]
+    assert cycle["status"] == "budget_exhausted"
+    assert cycle["completed"] is False
+    assert cycle["polls"] >= 1
+    # La integridad/emision no se omite: las barras del poll si se persisten.
+    recs = _read_ndjson(tmp_path / "S8-BUDGET-PART" / "records.ndjson")
+    assert [int(r["bar_open_time"]) for r in recs] == [BASE, BASE + HOUR]
+
+
+def test_budget_lock_liberado_y_checkpoint(tmp_path: Path, monkeypatch) -> None:
+    _patch(monkeypatch, [_sdata(BASE)], [])
+    ticks = iter([100.0, 200.0, 200.0, 200.0, 200.0, 200.0, 200.0])
+    monkeypatch.setattr(e19, "_monotonic", lambda: next(ticks, 200.0))
+
+    out_dir = tmp_path / "S8-BUDGET-LOCK"
+    e19.run_cycle(_args(tmp_path, "S8-BUDGET-LOCK", cycle_timeout_seconds=1.0))
+    # Lock liberado -> re-adquirible.
+    lock = e19.StreamingInstanceLock(out_dir / e19.S7_LOCK)
+    lock.acquire()
+    lock.release()
+    # Checkpoint ejecutado -> manifest presente.
+    assert (out_dir / "manifest.json").exists()
+
+
+def test_timeouts_se_propagan_al_adapter_y_manager(monkeypatch) -> None:
+    captured = {}
+
+    def _fake_adapter(**kwargs):
+        captured["adapter"] = kwargs
+        return _CountingAdapter()
+
+    def _fake_manager(adapter, **kwargs):
+        captured["manager"] = kwargs
+        return _scripted_manager(None, adapter)
+
+    monkeypatch.setattr(e19, "BinanceStreamingAdapter", _fake_adapter)
+    monkeypatch.setattr(e19, "ReconnectManager", _fake_manager)
+
+    args = argparse.Namespace(
+        recv_timeout=1.5, max_control_frames=3,
+        heartbeat_timeout=20.0, pong_timeout=7.0, poll_interval=0.25,
+    )
+    adapter = e19.build_streaming_adapter(args)
+    e19.build_reconnect_manager(args, adapter)
+    assert captured["adapter"] == {"recv_timeout_seconds": 1.5, "max_control_frames": 3}
+    assert captured["manager"]["heartbeat_timeout_seconds"] == 20.0
+    assert captured["manager"]["pong_timeout_seconds"] == 7.0
+    assert captured["manager"]["poll_interval_seconds"] == 0.25
+
+
+def test_budget_no_omite_integridad_gap(tmp_path: Path, monkeypatch) -> None:
+    """Presupuesto generoso: el gap recovery S4/REST sigue ocurriendo."""
+    events = [_sdata(BASE), _sdata(BASE + 3 * HOUR)]
+    backfill = [_market(BASE + HOUR), _market(BASE + 2 * HOUR), _market(BASE + 3 * HOUR)]
+    _patch(monkeypatch, events, backfill)
+
+    result = e19.run_cycle(
+        _args(tmp_path, "S8-BUDGET-GAP", cycle_timeout_seconds=600.0)
+    )
+    assert result["cycle"]["status"] == "completed"
+    assert result["cycle"]["completed"] is True
+    assert result["cycle"]["backfill_status"] == "HEALTHY"
+    assert _read_ndjson(tmp_path / "S8-BUDGET-GAP" / e19.S7_INCIDENTS) == []
