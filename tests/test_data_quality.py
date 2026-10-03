@@ -2,13 +2,17 @@
 
 from data.quality import (
     check_ohlc_integrity,
+    check_price_volume_integrity,
+    check_sorted_unique,
+    check_timestamp_alignment,
     detect_duplicates,
     detect_timestamp_gaps,
     summarize_quality,
 )
 
 
-def _clean_bars(n: int = 4, start: int = 1000) -> list[dict]:
+def _clean_bars(n: int = 4, start: int = 6000) -> list[dict]:
+    # `start` debe ser > 0 y múltiplo de 60 (alignación): 6000 = 100*60.
     return [
         {"ts": str(start + i * 60), "open": 100 + i, "high": 102 + i, "low": 99 + i, "close": 101 + i}
         for i in range(n)
@@ -53,20 +57,20 @@ class TestDuplicates:
 
 class TestGaps:
     def test_gap_detected(self) -> None:
-        bars = _clean_bars(start=0)
+        bars = _clean_bars()
         bars[2]["ts"] = "10000"
         issues = detect_timestamp_gaps(bars, expected_seconds=60)
         assert any(i.issue == "gap" for i in issues)
 
     def test_no_gap_within_tolerance(self) -> None:
-        bars = _clean_bars(start=0)
+        bars = _clean_bars()
         issues = detect_timestamp_gaps(bars, expected_seconds=60, tolerance_seconds=30)
         assert issues == []
 
 
 class TestSummary:
     def test_clean_data_ok(self) -> None:
-        summary = summarize_quality(_clean_bars(start=0), expected_interval_seconds=60)
+        summary = summarize_quality(_clean_bars(), expected_interval_seconds=60)
         assert summary.ok
         assert summary.rows == 4
 
@@ -81,3 +85,57 @@ class TestSummary:
         bars = [{"ts": "1", "open": 1, "high": 1, "low": 1}]
         summary = summarize_quality(bars)
         assert any(i.issue == "columnas" for i in summary.issues)
+
+
+class TestSummaryIntegratesAllChecks:
+    """F-09: summarize_quality debe agregar los 3 checks que faltaban."""
+
+    def test_desorden_detectado_en_resumen(self) -> None:
+        bars = _clean_bars()
+        bars[1], bars[2] = bars[2], bars[1]  # desordenar
+        assert any(
+            i.issue == "ts_no_creciente"
+            for i in check_sorted_unique(bars)
+        )
+        summary = summarize_quality(bars, expected_interval_seconds=60)
+        assert any(i.issue == "ts_no_creciente" for i in summary.issues)
+        assert not summary.ok
+
+    def test_desalineacion_detectada_en_resumen(self) -> None:
+        bars = _clean_bars()
+        bars[2]["ts"] = "1001"  # no múltiplo de 60
+        assert any(
+            i.issue == "ts_desalineado"
+            for i in check_timestamp_alignment(bars, 60)
+        )
+        summary = summarize_quality(bars, expected_interval_seconds=60)
+        assert any(i.issue == "ts_desalineado" for i in summary.issues)
+        assert not summary.ok
+
+    def test_precio_no_finito_detectado_en_resumen(self) -> None:
+        bars = _clean_bars()
+        bars[1]["close"] = float("nan")
+        assert any(
+            i.issue == "precio_no_finito"
+            for i in check_price_volume_integrity(bars)
+        )
+        summary = summarize_quality(bars, expected_interval_seconds=60)
+        assert any(i.issue == "precio_no_finito" for i in summary.issues)
+        assert not summary.ok
+
+    def test_volumen_invalido_detectado_en_resumen(self) -> None:
+        bars = _clean_bars()
+        for b in bars:
+            b["volume"] = 1.0
+        bars[0]["volume"] = -5.0
+        summary = summarize_quality(bars, expected_interval_seconds=60)
+        assert any(i.issue == "volumen_invalido" for i in summary.issues)
+
+    def test_dataset_valido_sigue_ok(self) -> None:
+        bars = _clean_bars()
+        for b in bars:
+            b["volume"] = 1.0
+        summary = summarize_quality(bars, expected_interval_seconds=60)
+        assert summary.ok
+        assert summary.issues == []
+        assert summary.rows == 4

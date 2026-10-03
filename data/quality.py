@@ -175,7 +175,16 @@ def summarize_quality(
 
     summary.issues.extend(check_ohlc_integrity(bars))
     summary.issues.extend(detect_duplicates(bars))
+    # Orden/unicidad y valores finitos se comprueban SIEMPRE (04 §7 "Timestamp
+    # order" / "Invalid OHLC" / "Volume anomalies"); antes quedaban definidos
+    # pero fuera del resumen, por lo que un dataset desordenado o con NaN podia
+    # pasar como `ok`.
+    summary.issues.extend(check_sorted_unique(bars))
+    summary.issues.extend(check_price_volume_integrity(bars))
     if expected_interval_seconds is not None:
+        summary.issues.extend(
+            check_timestamp_alignment(bars, expected_interval_seconds)
+        )
         summary.issues.extend(
             detect_timestamp_gaps(bars, expected_interval_seconds, tolerance_seconds)
         )

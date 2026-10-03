@@ -30,10 +30,12 @@ def read_ohlc_csv(
     close_col: str = "close",
     volume_col: str | None = None,
 ) -> list[dict]:
-    """Lee un CSV OHLC y devuelve barras cronológicamente ordenadas.
+    """Lee un CSV OHLC conservando el ORDEN del archivo.
 
     El estándar Atlas es `ts,open,high,low,close[,volume]`: el volumen es
     opcional por defecto. Pasar `volume_col="volume"` lo exige explícitamente.
+    El orden cronológico es OBLIGATORIO en la entrada; el loader NO reordena
+    (la detección de desorden vive en `data.quality.check_sorted_unique`).
 
     Raises:
         DataLoadError: archivo inexistente, columnas faltantes o filas corruptas.
@@ -82,5 +84,9 @@ def read_ohlc_csv(
     except OSError as exc:
         raise DataLoadError(f"No se pudo leer {path}: {exc}") from exc
 
-    bars.sort(key=lambda b: b["ts"])
+    # El ORDEN del archivo se conserva tal cual: el contrato exige que la
+    # entrada este cronologicamente ordenada (docstring; 04 §7 "Timestamp
+    # order"). Reordenar en silencio ocultaba un dataset desordenado y hacia
+    # pasar artificialmente `check_sorted_unique`. La deteccion corresponde a
+    # `data.quality.check_sorted_unique`/`summarize_quality`, no al loader.
     return bars

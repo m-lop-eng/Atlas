@@ -29,10 +29,33 @@ class TestReadOhlcCsv:
         assert bars[0]["open"] == 10.0
         assert bars[1]["close"] == 11.5
 
-    def test_sorts_by_timestamp(self, tmp_path) -> None:
+    def test_preserva_orden_del_archivo(self, tmp_path) -> None:
+        """F-10: el loader NO reordena; conserva el orden de entrada."""
         path = _write_csv(
             tmp_path,
             [HEADER, "2,10.5,12,10,11.5", "1,10,11,9,10.5"],
+        )
+        bars = read_ohlc_csv(path)
+        assert [b["ts"] for b in bars] == ["2", "1"]
+
+    def test_desorden_detectado_por_quality(self, tmp_path) -> None:
+        """F-10: un CSV desordenado queda desordenado y quality lo detecta."""
+        from data.loader import read_ohlc_csv as _read
+        from data.quality import check_sorted_unique, summarize_quality
+
+        path = _write_csv(
+            tmp_path,
+            [HEADER, "2,10.5,12,10,11.5", "1,10,11,9,10.5"],
+        )
+        bars = _read(path)
+        assert [b["ts"] for b in bars] == ["2", "1"]
+        assert any(i.issue == "ts_no_creciente" for i in check_sorted_unique(bars))
+        assert not summarize_quality(bars, expected_interval_seconds=60).ok
+
+    def test_orden_correcto_permanece(self, tmp_path) -> None:
+        path = _write_csv(
+            tmp_path,
+            [HEADER, "1,10,11,9,10.5", "2,10.5,12,10,11.5"],
         )
         bars = read_ohlc_csv(path)
         assert [b["ts"] for b in bars] == ["1", "2"]

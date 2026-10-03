@@ -274,22 +274,55 @@ correcta requeriría un estado no terminal — hallazgo adicional, ver F-15.)
 - test necesario: caso entero (round/step) o documentar que el MVP es fraccional.
 - recomendación: añadir `quantity_step`/`integer_contracts` como configuración.
 
-### F-09 — `summarize_quality()` NO ejecuta todos los checks
+### F-09 — `summarize_quality()` NO ejecuta todos los checks — **RESOLVED — pending commit**
 - ID: F-09
 - severidad: **HIGH**
-- archivo: `data/quality.py:163-182`
+- archivo: `data/quality.py:163-187`
 - función: `summarize_quality`
-- descripción: solo ejecuta `check_required_columns`, `check_ohlc_integrity`,
-  `detect_duplicates` y (si `expected_interval_seconds`) `detect_timestamp_gaps`.
-  **No** ejecuta `check_sorted_unique`, `check_timestamp_alignment` ni
-  `check_price_volume_integrity` (definidos pero fuera del resumen).
-- impacto: un dataset desordenado, desalineado o con NaN en volumen pasa el
-  `summarize_quality` como `ok`. Contradice el propio enunciado del módulo
-  ("ejecuta todas las comprobaciones").
-- evidencia: código; grep de los 3 checks sin uso en `summarize_quality`.
-- test existente: `test_data_quality.py` (llama a las funciones por separado).
-- test necesario: `summarize_quality` debe marcar NaN/desorden/desalineación.
-- recomendación: invocar los 3 checks (el alineamiento requiere `interval`).
+- **estado: RESOLVED — pending commit**
+- **causa raíz**: el resumen solo agregaba `check_required_columns`,
+  `check_ohlc_integrity`, `detect_duplicates` y (si `expected_interval_seconds`)
+  `detect_timestamp_gaps`. `check_sorted_unique`, `check_timestamp_alignment` y
+  `check_price_volume_integrity` estaban definidos pero **fuera** del resumen →
+  un dataset desordenado, desalineado o con NaN/volumen inválido pasaba `ok`.
+- **comportamiento anterior**: `summarize_quality(<bars desordenadas>)` → `ok`.
+- **corrección**: agregar `check_sorted_unique` y
+  `check_price_volume_integrity` **siempre**; `check_timestamp_alignment` dentro
+  del bloque `expected_interval_seconds` (requiere el intervalo). No se
+  modificó la semántica interna de ningún check ni la estructura
+  (`QualitySummary.rows/issues/ok`).
+- **tests añadidos** (`tests/test_data_quality.py::TestSummaryIntegratesAllChecks`):
+  desorden (`ts_no_creciente`), desalineación (`ts_desalineado`), precio no
+  finito (`precio_no_finito`), volumen inválido (`volumen_invalido`), y dataset
+  válido (alineado, con volumen) → `ok` y `issues == []`.
+- **API**: sin cambios; `_clean_bars` pasa a base `6000` (positiva y múltiplo de
+  60) porque `ts=0` no es un timestamp válido.
+- **evidencia**: `pytest tests/test_data_quality.py` → verde; suite → 824.
+- **no cerrado del todo** hasta el commit.
+
+### F-10 — `read_ohlc_csv()` reordena silenciosamente — **RESOLVED — pending commit**
+- ID: F-10
+- severidad: **MEDIUM**
+- archivo: `data/loader.py:?`
+- función: `read_ohlc_csv`
+- **estado: RESOLVED — pending commit**
+- **causa raíz**: `read_ohlc_csv` terminaba con `bars.sort(key=lambda b: b["ts"])`,
+  ocultando un CSV desordenado. El contrato documentado (`04 §7 "Timestamp
+  order"`; docstring de `loader.py` "el orden cronológico es obligatorio")
+  exige que el orden de entrada sea correcto y **auditable**, no auto-corregido.
+- **contrato confirmado**: el orden es responsabilidad de la entrada; la
+  detección pertenece a `data.quality.check_sorted_unique`/`summarize_quality`.
+  No se introduce excepción automática (no era el contrato).
+- **corrección**: eliminar el `sort`; conservar el orden del archivo; docstring
+  actualizado.
+- **tests modificados/añadidos** (`tests/test_loader.py`):
+  `test_preserva_orden_del_archivo` (antes `test_sorts_by_timestamp`: ahora un
+  archivo `2,1` permanece `["2","1"]`), `test_desorden_detectado_por_quality`
+  (desorden + `check_sorted_unique` + `summarize_quality` no `ok`),
+  `test_orden_correcto_permanece`.
+- **evidencia**: el loader ya no oculta el desorden; la etapa de calidad lo
+  detecta.
+- **no cerrado del todo** hasta el commit.
 
 ### F-10 — `read_ohlc_csv()` reordena silenciosamente
 - ID: F-10
