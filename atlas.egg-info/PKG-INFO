@@ -1,0 +1,71 @@
+Metadata-Version: 2.4
+Name: atlas
+Version: 0.1.0
+Summary: Modular multi-market algorithmic trading system
+License: Proprietary
+Requires-Python: >=3.12
+Description-Content-Type: text/markdown
+Requires-Dist: PyYAML>=6.0
+Requires-Dist: SQLAlchemy>=2.0
+Requires-Dist: psycopg[binary]>=3.1
+Provides-Extra: dev
+Requires-Dist: pytest>=8.0; extra == "dev"
+Requires-Dist: pytest-cov>=5.0; extra == "dev"
+
+# Atlas — Modular Algorithmic Trading System
+
+Plataforma de robo-trading algorítmico multi-mercado, modular y escalable.
+
+## Principios
+
+* La estrategia no sabe dónde se ejecutará (Broker Adapter / separación de capas).
+* El Risk Engine tiene veto sobre cualquier señal.
+* Validación por falsación: ningún backtest demuestra rentabilidad futura.
+* Reproducibilidad, trazabilidad y control de riesgo por encima de rentabilidad histórica.
+
+## Documentación de referencia
+
+| Documento | Contenido |
+| --- | --- |
+| `00_MASTER_SPECIFICATION.md` | Visión, arquitectura, roadmap |
+| `01_GENERAL_RULES.md` | Reglas generales obligatorias |
+| `02_QUANT_RESEARCH_METHODOLOGY.md` | Metodología de investigación |
+| `03_RISK_MANAGEMENT.md` | Framework de riesgo |
+| `04_BACKTEST_VALIDATION.md` | Backtest y validación |
+| `05_TRADING_KNOWLEDGE_BASE.md` | Base de conocimiento |
+| `06_EXECUTION_OPERATION.md` | Ejecución y operación |
+| `07_PROP_FIRM_RULES_FRAMEWORK.md` | Reglas de cuentas de fondeo |
+| `08_DEVELOPMENT_WORKFLOW.md` | Estándares de desarrollo |
+| `09_STRATEGY_LIFECYCLE.md` | Ciclo de vida de estrategias |
+
+## Estructura
+
+```text
+config/        Configuración por entorno (development/paper/production)
+data/          Adquisición, limpieza, validación y control de calidad de datos
+research/      Hipótesis, features y experimentos
+strategies/    Implementación de estrategias (base + mercados)
+backtesting/   Motor de backtest (event-driven, costes realistas)
+validation/    OOS, walk-forward, Monte Carlo, stress
+portfolio/     Exposición agregada, correlación, asignación
+risk/          Position sizing, límites y Risk Engine
+execution/     Modelo de órdenes y Order Manager
+brokers/       Adaptadores de broker (MT5, futuros, IBKR, crypto)
+monitoring/    Observable del sistema
+database/      PostgreSQL (modelos y sesión)
+reporting/     Métricas y reportes
+tests/         Unit / integration / regression
+deployment/    Infraestructura y despliegue
+docs/          Documentación técnica del repositorio
+```
+
+## Entornos
+
+* `development` — sin ejecución real posible.
+* `paper` — ejecución simulada con arquitectura de producción.
+* `production` — solo cuando una estrategia supere todo el lifecycle.
+
+## Estado actual
+
+**Milestone 0 — Arquitectura (en curso).** Esqueleto técnico con interfaces y tests iniciales.
+No hay código de ejecución real todavía. Siguientes milestones según `00_MASTER_SPECIFICATION.md`.
