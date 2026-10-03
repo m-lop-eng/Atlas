@@ -376,6 +376,193 @@ class TestPositionsAndAccount:
         assert state.as_of == _now()
 
 
+class TestAccountEquitySign:
+    """F-05: equity mark-to-market correcta para LONG y SHORT (sin doble conteo).
+
+    Invariante: para posicion abierta,
+        unrealized = quantity * (mark_price - avg_entry_price)
+    con `quantity` dirigida. El modelo no aplica fees (BrokerFill.commission=0).
+    """
+
+    def _open(
+        self, side: OrderSide, qty: float, entry: float, mark: float, *,
+        cash: float = 10_000.0,
+    ) -> "PaperBrokerAdapter":
+        prices = iter([entry, mark])
+        adapter = PaperBrokerAdapter(
+            account_id="PAPER-EQ",
+            initial_cash=cash,
+            price_source=lambda instrument: next(prices),
+            clock=_now,
+        )
+        adapter.connect()
+        adapter.submit_order(_order("OPEN", side=side, quantity=qty))  # fill @entry
+        return adapter  # price_source ahora devuelve `mark`
+
+    def test_long_sin_movimiento_equity_igual_a_inicial(self) -> None:
+        adapter = self._open(OrderSide.BUY, 1.0, 100.0, 100.0)
+        assert adapter.get_account_state().equity == pytest.approx(10_000.0)
+
+    def test_long_con_ganancia(self) -> None:
+        adapter = self._open(OrderSide.BUY, 1.0, 100.0, 110.0)
+        assert adapter.get_account_state().equity == pytest.approx(10_010.0)
+
+    def test_long_con_perdida(self) -> None:
+        adapter = self._open(OrderSide.BUY, 1.0, 100.0, 90.0)
+        assert adapter.get_account_state().equity == pytest.approx(9_990.0)
+
+    def test_short_sin_movimiento_equity_igual_a_inicial(self) -> None:
+        adapter = self._open(OrderSide.SELL, 1.0, 100.0, 100.0)
+        state = adapter.get_account_state()
+        # cash ingreso la venta (10_100); equity NO debe ser 10_100 ni 10_200.
+        assert state.cash == pytest.approx(10_100.0)
+        assert state.equity == pytest.approx(10_000.0)
+
+    def test_short_ganador(self) -> None:
+        adapter = self._open(OrderSide.SELL, 1.0, 100.0, 90.0)
+        assert adapter.get_account_state().equity == pytest.approx(10_010.0)
+
+    def test_short_perdedor(self) -> None:
+        adapter = self._open(OrderSide.SELL, 1.0, 100.0, 110.0)
+        assert adapter.get_account_state().equity == pytest.approx(9_990.0)
+
+    def test_invariante_unrealized_con_signo(self) -> None:
+        for side, qty in ((OrderSide.BUY, 2.0), (OrderSide.SELL, -3.0)):
+            adapter = self._open(side, abs(qty), 100.0, 105.0)
+            positions = adapter.get_positions()
+            pos = positions[0]
+            entry = pos.avg_entry_price
+            unrealized = pos.quantity * (105.0 - entry)
+            expected = 10_000.0 + unrealized
+            assert adapter.get_account_state().equity == pytest.approx(expected)
+
+    def test_posicion_cerrada_unrealized_cero(self) -> None:
+        prices = iter([100.0, 120.0])
+        adapter = PaperBrokerAdapter(
+            account_id="PAPER-EQ", initial_cash=10_000.0,
+            price_source=lambda instrument: next(prices), clock=_now,
+        )
+        adapter.connect()
+        adapter.submit_order(_order("OPEN", side=OrderSide.BUY, quantity=1.0))  # @100
+        adapter.submit_order(_order("CLOSE", side=OrderSide.SELL, quantity=1.0))  # @120
+        assert adapter.get_positions() == []
+        # realizado: +20 (sin fees) → equity 10_020
+        assert adapter.get_account_state().equity == pytest.approx(10_020.0)
+
+    def test_multi_fill_short_avg_y_equity(self) -> None:
+        """SHORT en dos tramos + cierre parcial: avg_entry, qty y equity."""
+        adapter = _paper(price=100.0)
+        # SHORT 1 @100 (market), SHORT 1 @110 (market)
+        adapter.submit_order(_order("S1", side=OrderSide.SELL, quantity=1.0))
+        adapter.price_source = lambda instrument: 110.0
+        adapter.submit_order(_order("S2", side=OrderSide.SELL, quantity=1.0))
+        pos = adapter.get_positions()[0]
+        assert pos.quantity == pytest.approx(-2.0)
+        assert pos.avg_entry_price == pytest.approx(105.0)
+        # `_paper` usa cash=100_000. mark 110: unrealized = -2*(110-105) = -10
+        adapter.price_source = lambda instrument: 110.0
+        assert adapter.get_account_state().equity == pytest.approx(99_990.0)
+
+
+class TestFullLifecycleAccounting:
+    """F-05 validacion formal: equity = cash + Σ(quantity*mark) durante todo el ciclo."""
+
+    def _adapter(self, prices: list[float]) -> "PaperBrokerAdapter":
+        """Precio dirigido por una lista consumida SOLO en submit_order.
+
+        El adapter expone `.px` para fijar el mark sin consumir la cola.
+        """
+        seq = list(prices)
+
+        class _Src:
+            def __init__(self) -> None:
+                self.value = seq[0]
+
+            def next_from(self) -> None:
+                if seq:
+                    self.value = seq.pop(0)
+
+            def __call__(self, instrument: str) -> float:
+                return self.value
+
+        src = _Src()
+        adapter = PaperBrokerAdapter(
+            account_id="PAPER-CYCLE", initial_cash=100_000.0,
+            price_source=src, clock=_now,
+        )
+        adapter.connect()
+        adapter._src = src  # type: ignore[attr-defined]
+        return adapter
+
+    def test_ciclo_completo_long(self) -> None:
+        adapter = self._adapter([100.0, 110.0])  # open@100, close@110
+        adapter.submit_order(_order("L-OPEN", side=OrderSide.BUY, quantity=1.0))  # @100
+        adapter._src.value = 110.0  # mark durante la posicion
+        mid = adapter.get_account_state()
+        assert mid.cash == pytest.approx(99_900.0)
+        assert mid.equity == pytest.approx(100_010.0)
+        adapter._src.value = 110.0  # precio de cierre
+        adapter.submit_order(_order("L-CLOSE", side=OrderSide.SELL, quantity=1.0))  # @110
+        assert adapter.get_positions() == []
+        final = adapter.get_account_state()
+        assert final.equity == pytest.approx(100_010.0)
+        assert final.cash == pytest.approx(100_010.0)  # realizado +10 reflejado en cash
+
+    def test_ciclo_completo_short(self) -> None:
+        adapter = self._adapter([100.0, 90.0])
+        adapter.submit_order(_order("S-OPEN", side=OrderSide.SELL, quantity=1.0))  # @100
+        adapter._src.value = 90.0
+        assert adapter.get_account_state().equity == pytest.approx(100_010.0)
+        adapter.submit_order(_order("S-CLOSE", side=OrderSide.BUY, quantity=1.0))  # @90
+        assert adapter.get_positions() == []
+        final = adapter.get_account_state()
+        assert final.equity == pytest.approx(100_010.0)
+        assert final.cash == pytest.approx(100_010.0)
+
+    def test_short_perdedor_ciclo_completo(self) -> None:
+        adapter = self._adapter([100.0, 110.0])
+        adapter.submit_order(_order("SP-OPEN", side=OrderSide.SELL, quantity=1.0))  # @100
+        adapter._src.value = 110.0
+        assert adapter.get_account_state().equity == pytest.approx(99_990.0)
+        adapter.submit_order(_order("SP-CLOSE", side=OrderSide.BUY, quantity=1.0))  # @110
+        assert adapter.get_positions() == []
+        assert adapter.get_account_state().equity == pytest.approx(99_990.0)
+
+    def test_invariante_delta_equity_igual_unrealized(self) -> None:
+        cases = [
+            (OrderSide.BUY, 100.0, 110.0),   # LONG ganador
+            (OrderSide.BUY, 100.0, 90.0),    # LONG perdedor
+            (OrderSide.SELL, 100.0, 90.0),   # SHORT ganador
+            (OrderSide.SELL, 100.0, 110.0),  # SHORT perdedor
+        ]
+        for side, entry, mark in cases:
+            adapter = self._adapter([entry])
+            adapter.submit_order(_order("OPEN", side=side, quantity=1.0))
+            at_entry = adapter.get_account_state().equity
+            pos = adapter.get_positions()[0]
+            adapter._src.value = mark
+            now = adapter.get_account_state().equity
+            expected_delta = pos.quantity * (mark - pos.avg_entry_price)
+            assert now - at_entry == pytest.approx(expected_delta)
+
+    def test_multi_fill_short_ciclo_cierre(self) -> None:
+        # SHORT 1 @100, SHORT 1 @110 → avg 105, qty -2; mark 100 → unrealized +10
+        adapter = self._adapter([100.0, 110.0])
+        adapter._src.value = 100.0
+        adapter.submit_order(_order("S1", side=OrderSide.SELL, quantity=1.0))  # @100
+        adapter._src.value = 110.0
+        adapter.submit_order(_order("S2", side=OrderSide.SELL, quantity=1.0))  # @110
+        pos = adapter.get_positions()[0]
+        assert pos.quantity == pytest.approx(-2.0)
+        assert pos.avg_entry_price == pytest.approx(105.0)
+        adapter._src.value = 100.0
+        assert adapter.get_account_state().equity == pytest.approx(100_010.0)
+        # cierre completo: BUY 2 @100
+        adapter.submit_order(_order("SC", side=OrderSide.BUY, quantity=2.0))
+        assert adapter.get_positions() == []
+        assert adapter.get_account_state().equity == pytest.approx(100_010.0)
+
+
 class TestDeterminism:
     def test_same_inputs_same_output(self) -> None:
         def run() -> tuple:

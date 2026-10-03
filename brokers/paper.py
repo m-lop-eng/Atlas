@@ -228,10 +228,16 @@ class PaperBrokerAdapter(BrokerAdapter):
                 f"Broker {self.account_id}: no conectado (get_account_state)"
             )
         positions = self.get_positions()
-        # Equity: caja + valor a mercado de las posiciones (precio de referencia).
-        equity = self._cash + sum(
-            abs(p.quantity) * self._price(p.instrument) for p in positions
-        )
+        # Equity mark-to-market con el SIGNO de la posicion (no abs):
+        #   unrealized = quantity * (mark_price - avg_entry_price)
+        #   equity     = cash + sum(quantity * mark_price)
+        # El signo de `quantity` decide LONG (+) vs SHORT (-). Para LONG, `cash`
+        # ya pago el coste y `quantity*price` lo revalua; para SHORT, `cash` ya
+        # ingreso la venta (pasivo) y restar `|quantity|*price` es la obligacion
+        # economica. Sumar `abs(quantity)*price` duplicaba la posicion corta.
+        # El modelo de este broker no aplica comisiones (BrokerFill.commission=0),
+        # por lo que no hay componente adicional de fees que restar aqui.
+        equity = self._cash + sum(p.quantity * self._price(p.instrument) for p in positions)
         return AccountState(
             account_id=self.account_id,
             cash=self._cash,
