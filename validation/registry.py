@@ -7,8 +7,9 @@ definen por estrategia (no hay guardas vacías silenciosas).
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from enum import Enum
+from typing import Any
 
 
 class StrategyStage(str, Enum):
@@ -49,3 +50,79 @@ def is_gate_passed(stage: StrategyStage, requirements: dict[str, bool]) -> GateR
         )
     result = GateResult(stage=stage, passed=all(requirements.values()), requirements=requirements)
     return result
+
+
+# ---------------------------------------------------------------------------
+# G1 — Integración de gates en el lifecycle (M4)
+# ---------------------------------------------------------------------------
+#
+# Las puertas viven aquí (API pura); la autoridad de estado del lifecycle vive
+# en research/evidence + research/hypothesis. `evaluate_transition` calcula el
+# GateResult de una transición y NUNCA promueve por sí sola: el llamante (flujo
+# de research) persiste el resultado y decide. Un fallo de gate = parada.
+
+
+@dataclass(frozen=True, slots=True)
+class GateTransitionResult:
+    """Resultado persistible de evaluar una transición de etapa."""
+
+    strategy_id: str
+    from_stage: str
+    to_stage: str
+    passed: bool
+    requirements: dict[str, bool]
+    decided_at: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+def gate_for_transition(
+    from_stage: StrategyStage,
+    to_stage: StrategyStage,
+    requirements: dict[str, bool],
+) -> GateResult:
+    """Evalúa la puerta que habilita `from_stage -> to_stage`.
+
+    La puerta evaluada es la de la etapa de ORIGEN (debe estar superada para
+    avanzar). Requisitos explícitos obligatorios (no puertas vacías).
+    """
+    if from_stage is to_stage:
+        raise ValidationError("Transición a la misma etapa: sin promoción.")
+    return is_gate_passed(from_stage, requirements)
+
+
+def evaluate_transition(
+    strategy_id: str,
+    from_stage: StrategyStage,
+    to_stage: StrategyStage,
+    requirements: dict[str, bool],
+    *,
+    decided_at: str,
+) -> GateTransitionResult:
+    """Devuelve el resultado de la transición SIN mutar estado.
+
+    Invariante: `passed=False` ⇒ no hay promoción (el llamante no debe avanzar).
+    """
+    gate = gate_for_transition(from_stage, to_stage, requirements)
+    return GateTransitionResult(
+        strategy_id=strategy_id,
+        from_stage=from_stage.value,
+        to_stage=to_stage.value,
+        passed=gate.passed,
+        requirements=dict(gate.requirements),
+        decided_at=decided_at,
+    )
+
+
+__all__ = [
+    "GateResult",
+    "GateTransitionResult",
+    "PROTOTYPE_LIMIT",
+    "STAGE_ORDER",
+    "StrategyStage",
+    "ValidationError",
+    "evaluate_transition",
+    "gate_for_transition",
+    "is_gate_passed",
+]
