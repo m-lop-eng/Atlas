@@ -1,0 +1,17 @@
+environment: paper
+logging:
+  level: INFO
+database:
+  pool_size: 10
+  max_overflow: 20
+risk:
+  max_open_positions: 3
+  risk_per_trade: 0.0025
+  max_daily_loss: 0.01
+  max_drawdown: 0.05
+portfolio:
+  max_strategies: 5
+execution:
+  default_time_in_force: GTC
+paper_account:
+  initial_equity: 100000

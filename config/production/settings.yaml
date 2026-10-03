@@ -1,0 +1,17 @@
+environment: production
+logging:
+  level: INFO
+database:
+  pool_size: 20
+  max_overflow: 40
+risk:
+  max_open_positions: null
+  risk_per_trade: null
+  max_daily_loss: null
+  max_drawdown: null
+portfolio:
+  max_strategies: 3
+execution:
+  default_time_in_force: GTC
+monitoring:
+  alerts_email: null

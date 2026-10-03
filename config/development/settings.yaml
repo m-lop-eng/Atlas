@@ -1,0 +1,16 @@
+environment: development
+logging:
+  level: DEBUG
+  format: "%(asctime)s %(levelname)s %(name)s %(message)s"
+database:
+  pool_size: 5
+  max_overflow: 10
+risk:
+  max_open_positions: 3
+  risk_per_trade: 0.0025
+  max_daily_loss: 0.01
+  max_drawdown: 0.05
+portfolio:
+  max_strategies: 5
+execution:
+  default_time_in_force: GTC
