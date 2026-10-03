@@ -36,6 +36,13 @@ class RiskEngine:
           el riesgo monetario en stop es, por construcción, equity*risk_per_trade.
         * Estimador (externo): riesgo teórico total provisto por callable.
 
+    Contrato canonico de `max_strategy_risk` (F-02): es el MAXIMO riesgo por
+    operacion expresado como fraccion de equity. Se exige:
+        risk_per_trade <= max_strategy_risk
+    En el modo sizing se comprueba esta coherencia de configuracion; en el modo
+    estimador el limite absoluto es `max_strategy_risk * equity` (NO
+    `risk_cap * max_strategy_risk`).
+
     Fail-safe (RULE-036): sin stop, sin precio y sin fuente de riesgo
     cuantificable la intención es rechazada.
     """
@@ -116,12 +123,25 @@ class RiskEngine:
                 _check("quantifiable_risk", False, ok_reason)
             else:
                 _check("quantifiable_risk", True, "")
-                _check("risk_per_trade", True, "")
+                # Contrato canonico F-02: `max_strategy_risk` es el MAXIMO
+                # riesgo por operacion como fraccion de equity. El riesgo
+                # objetivo por operacion es `risk_per_trade`; se exige
+                #   risk_per_trade <= max_strategy_risk
+                # (no se altera el algoritmo de sizing).
+                _check(
+                    "max_strategy_risk",
+                    self.config.risk_per_trade <= self.config.max_strategy_risk,
+                    "risk_per_trade excede max_strategy_risk: la configuracion "
+                    "opera por encima del maximo de riesgo por operacion de la "
+                    "estrategia",
+                )
                 approved_quantity = quantity
         elif self.trade_risk_estimator is not None:
             _check("quantifiable_risk", True, "")
             theoretical_risk = self.trade_risk_estimator(signal)
-            limit = self.config.max_strategy_risk * risk_cap
+            # Contrato canonico F-02: limite absoluto por operacion relativo a
+            # equity (no `risk_cap * max_strategy_risk`).
+            limit = self.config.max_strategy_risk * state.equity
             _check(
                 "risk_per_trade",
                 theoretical_risk <= limit,

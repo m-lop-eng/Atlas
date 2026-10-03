@@ -338,6 +338,21 @@ strategy:
 
 These values are examples of configuration structure, not permanent project-wide limits.
 
+`max_strategy_risk` is the MAXIMUM risk per trade expressed as a fraction of
+equity. It is an absolute per-trade ceiling (not a multiplier of the risk
+budget). The system must therefore enforce:
+
+```text id="msr-contract"
+max_strategy_risk = max risk per trade / equity
+risk_per_trade <= max_strategy_risk
+```
+
+- Sizing mode (`point_value`): a configuration with
+  `risk_per_trade > max_strategy_risk` is rejected (it would operate above the
+  strategy's per-trade ceiling); otherwise the fixed-fractional size is used.
+- Estimator mode (`trade_risk_estimator`): the estimated trade risk must satisfy
+  `theoretical_risk <= max_strategy_risk * equity`.
+
 ---
 
 # 14. Instrument-Level Risk

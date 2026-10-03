@@ -54,6 +54,8 @@ class RiskConfig:
 
     risk_per_trade: float = 0.0025
     max_open_positions: int = 3
+    # Maximo riesgo por operacion como fraccion de equity (contrato F-02:
+    # `risk_per_trade <= max_strategy_risk`).
     max_strategy_risk: float = 0.01
     max_daily_loss: float = 0.01
     max_drawdown: float = 0.05

@@ -133,22 +133,67 @@ Cobertura por módulo crítico (term-missing):
   offset del string se respeta (correcto); sin otro uso sospechoso en
   `backtesting/`.
 
-### F-02 — `max_strategy_risk` no se aplica cuando hay `point_value`
+### F-02 — `max_strategy_risk` no se aplica con `point_value` — **RESOLVED — pending commit**
 - ID: F-02
 - severidad: **MEDIUM**
-- archivo: `risk/engine.py:102-120,154-173`
-- función: `RiskEngine.validate` / `_size_fixed_fractional`
-- descripción: con `point_value` el sizing fixed-fractional deriva la cantidad de
-  `risk_per_trade`; la rama que usa `max_strategy_risk` (`:124`) solo se ejecuta
-  sin `point_value` (vía `trade_risk_estimator`). En el pipeline real
-  (`build_engine`) siempre se pasa `point_value`, por lo que `max_strategy_risk`
-  **no** forma parte del veto efectivo.
-- impacto: un límite declarado en `RiskConfig` no protege en el camino real.
-- evidencia: `risk/engine.py:111` (`elif point_value is not None`) vs `:124`.
-- test existente: `test_risk_engine.py`, `test_risk_sizing.py`.
-- test necesario: verificar que `max_strategy_risk` se respeta con `point_value`.
-- recomendación: aplicar ambos límites (o documentar que `risk_per_trade` lo
-  subsume).
+- archivo: `risk/engine.py` (`RiskEngine.validate`)
+- **estado: RESOLVED — pending commit**
+- **Decisión humana ratificada (contrato canónico, opción A)**: `max_strategy_risk`
+  = **máximo riesgo por operación como fracción de equity** →
+  `risk_per_trade <= max_strategy_risk`.
+- **Fórmula por rama (después)**:
+  - Sizing (`point_value`): se rechaza si `risk_per_trade > max_strategy_risk`
+    (check `max_strategy_risk`); el algoritmo de sizing no cambia
+    (`qty = risk_cap/(distance·point_value)`).
+  - Estimator (`trade_risk_estimator`): `theoretical_risk <= max_strategy_risk × equity`
+    (antes `≤ max_strategy_risk × risk_cap`).
+- **Fórmula por rama (antes)**:
+  - Sizing: sin comprobación de `max_strategy_risk` (inerte).
+  - Estimator: `theoretical_risk <= max_strategy_risk × risk_cap`.
+- **Configs `max_strategy_risk: 0.9`** (research/experiment; `h002`,
+  `first_experiment`, `real_market_first`, `trend_filter`, `config/final_oos`):
+  - **NO se modifican.** Bajo el contrato A, `0.9` = 90% de equity de riesgo por
+    operación → requiere revisión.
+  - Inspección: no hay documentación ni commit que justifique `0.9`; §13 usa
+    `1.00%`. Los manifests de paper/forward registran `0.01` (1%). **No se
+    determina inequívocamente** el valor pretendido → **pendiente de decisión**
+    documentada (NO se inventa). Con `risk_per_trade=0.01`, `0.9` sigue siendo
+    coherente (`0.01 ≤ 0.9`) y no altera backtests.
+  - **Nota**: cambiar el contrato a A no cambia resultados de experimentos
+    existentes, porque en sizing solo añade un check que `0.9` satisface; el
+    sizing permanece idéntico.
+- **Tests**: `TestMaxStrategyRiskContract` (sizing: below/at/above ceiling,
+  reproducción del bug, unidades numéricas) y `TestEstimatorMaxStrategyRiskContract`
+  (below/at/above, límite `×equity`). Ajustados dos tests legacy que codificaban
+  la fórmula B.
+- **Documentación**: `03_RISK_MANAGEMENT.md §13`, docstring de `RiskEngine`,
+  comentario en `risk/types.py` — definición única y equivalente.
+- **Evidencia**: `pytest` → 833 passed; `compileall` OK; `risk/engine.py` 98%.
+- **no cerrado del todo** hasta el commit.
+
+### F-03 — exposure/leverage/margin/correlation/concentration — **REQUIRES MINI-SPEC / INFRASTRUCTURE GAP**
+- ID: F-03
+- severidad: **HIGH**
+- archivo: `risk/engine.py`, `risk/types.py`, `portfolio/engine.py`
+- **estado: REQUIRES MINI-SPEC / INFRASTRUCTURE GAP** — NO corregido.
+- Los campos existentes **no** constituyen un contrato operacional completo:
+  faltan límites configurables y/o datos runtime/modelos necesarios. **No** se
+  implementan gates para no introducir política de riesgo no especificada.
+
+| Gate | Definición | Límite config | Dato runtime | Modelo | Tests | Clasificación |
+|---|---|---|---|---|---|---|
+| Gross exposure | `portfolio/engine.py`; campo muerto `AccountRiskState.gross_exposure` | No | No poblado | Parcial | Solo cálculo | Requiere mini-spec |
+| Net exposure | idem | No | No | Parcial | Solo cálculo | Requiere mini-spec |
+| Margin | §20 (texto) | No | No | No | No | Gap de infraestructura |
+| Leverage | §19 fórmula `gross/equity` | No (`max_leverage` inexistente) | No | Doc sin impl | No | Gap de infraestructura |
+| Correlation | §11-12 | No | No | No | No | Gap de infraestructura |
+| Concentration | §18 | No | No | No | No | Gap de infraestructura |
+
+- Gross/net requieren además **integrar** `portfolio.compute_portfolio_risk`
+  (hoy no wired) con el risk path y poblar `AccountRiskState`.
+- Margin/leverage/correlation/concentration requieren **definición/modelado**
+  adicional (límites, ventanas, datos de margen por instrumento).
+- **NO implementar gates** sin contrato.
 
 ### F-03 — El veto de riesgo NO incluye exposición/leverage/margin/correlación/concentración
 - ID: F-03

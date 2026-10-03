@@ -43,9 +43,12 @@ def _state(**overrides) -> AccountRiskState:
 
 class TestRiskEngineApproved:
     def test_estimator_over_cap_rejected(self) -> None:
-        """Estimator sobre el límite (100 > 0.01*250=2.5) → REJECTED."""
+        """Estimator sobre el límite (100 > 0.01*100000=1000) → REJECTED.
+
+        Contrato F-02: `limit = max_strategy_risk * equity` (default 0.01).
+        """
         engine = RiskEngine(
-            config=RiskConfig(),
+            config=RiskConfig(max_strategy_risk=0.0005),
             trade_risk_estimator=lambda s: 100.0,
         )
         decision = engine.validate(_signal(), _state())
@@ -126,13 +129,14 @@ class TestRiskEngineRejected:
         assert "estimator" in decision.reason.lower()
 
     def test_risk_per_trade_exceeded(self) -> None:
+        """Riesgo estimado por encima de `max_strategy_risk * equity` → REJECTED."""
         engine = RiskEngine(
-            config=RiskConfig(risk_per_trade=0.0025, max_strategy_risk=0.01),
+            config=RiskConfig(risk_per_trade=0.0025, max_strategy_risk=0.0005),
             trade_risk_estimator=lambda s: 100.0,
         )
         decision = engine.validate(_signal(), _state())
         assert decision.decision == RiskDecisionState.REJECTED
-        assert "risk_per_trade" in decision.checks
+        assert decision.checks["risk_per_trade"] is False
 
     def test_check_names_present(self) -> None:
         engine = RiskEngine(config=RiskConfig(), trade_risk_estimator=lambda s: 1.0)
