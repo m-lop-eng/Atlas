@@ -1,0 +1,54 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "atlas"
+version = "0.1.0"
+description = "Modular multi-market algorithmic trading system"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "Proprietary" }
+dependencies = [
+    "PyYAML>=6.0",
+    "SQLAlchemy>=2.0",
+    "psycopg[binary]>=3.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=5.0",
+]
+streaming = [
+    "websocket-client>=1.6",
+]
+
+[tool.setuptools.packages.find]
+include = [
+    "config*",
+    "data*",
+    "research*",
+    "strategies*",
+    "backtesting*",
+    "validation*",
+    "portfolio*",
+    "risk*",
+    "execution*",
+    "brokers*",
+    "live*",
+    "streaming*",
+    "sessions*",
+    "reconciliation*",
+    "killswitches*",
+    "monitoring*",
+    "papertrading*",
+    "database*",
+    "reporting*",
+    "deployment*",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+python_files = ["test_*.py"]
