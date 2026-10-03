@@ -1,0 +1,45 @@
+{
+  "version": 1,
+  "dataset": {
+    "observed_through": 1788217200,
+    "observed_through_iso": "2026-08-31T23:00:00Z",
+    "final_oos": {
+      "status": "CONSUMED",
+      "minimum_start": 1788220800,
+      "minimum_start_iso": "2026-09-01T00:00:00Z",
+      "note": "FINAL_OOS limpio [2026-09-01T00:00:00Z, 2027-10-06T00:00:00Z)"
+    }
+  },
+  "hypotheses": {
+    "H001": {
+      "state": "RESEARCH_REQUIRED",
+      "decided_at": "2026-09-19T00:00:00Z",
+      "note": "Breakout vs controles nulos: edge bruto pero sin neto en 30 dias; no se optimizo."
+    },
+    "H002": {
+      "state": "RESEARCH_REQUIRED",
+      "decided_at": "2026-09-19T00:00:00Z",
+      "note": "Asimetria LONG/SHORT persiste en OOS; caveat: BTC 2019-2026 alcista estructural, la asimetria puede ser beta. H004-B (2026-09): ventaja LONG temporalmente INESTABLE (6/12 folds trimestrales positivas) - refuerza el caveat de beta direccional."
+    },
+    "H003": {
+      "state": "RESEARCH_REQUIRED",
+      "decided_at": "2026-09-19T00:00:00Z",
+      "note": "Breakout LONG > B&H escalado y > control neutro en train y test; Caso A timing preliminar; test 2024-2026 ya observado."
+    },
+    "H004": {
+      "state": "RESEARCH_REQUIRED",
+      "decided_at": "2026-09-19T00:00:00Z",
+      "note": "Walk-forward fixed-parameter: 4/4 ventanas superan neutral y B&H escalado pero W2 (2022) es neta en los 3 regimenes y W3 concentra 63.7% del P&L positivo. H004-B (2026-09): inestabilidad SISTEMATICA a granularidad trimestral (6/12 folds positivas, 3 vecindades negativas 2021-2023); concentracion ALTA y ventaja vs controles inconsistente por ventana."
+    },
+    "H004-B": {
+      "state": "RESEARCH_REQUIRED",
+      "decided_at": "2026-09-19T00:00:00Z",
+      "note": "Diagnostico de localizacion temporal (estrategia fija x 12 ventanas trimestrales re-ancladas, pre-registrado): SYSTEMATIC_INSTABILITY. 6/12 folds positivas, mediana +0.3%, media +5.4%, 3 vecindades negativas (2021Q2; 2021Q4-2022Q3; 2023Q3). Positivos concentrados en ~3 folds; ventaja vs control neutro no consistente por ventana (2023Q4/2024Q1: neutral > breakout). NO sube a ROBUSTNESS_SUPPORTED; no abre H006; FINAL_OOS evaluado SOLO con estrategia congelada y datos nuevos."
+    },
+    "H005": {
+      "state": "RESEARCH_REQUIRED",
+      "decided_at": "2026-09-19T00:00:00Z",
+      "note": "Diagnostico W2: causa = beta direccional adversa del filtro LONG en bear estructural (-64.5% en 2022), no trades extremos, costes ni evento concentrado. La logica breakout no desaparece (ambas direcciones ~ -2.7%). H006 NO abierto."
+    }
+  }
+}

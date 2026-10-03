@@ -1,0 +1,341 @@
+{
+  "hypothesis": "H003: el breakout LONG contiene info incremental vs B&H (no es solo beta alcista de BTC).",
+  "treatment_unchanged": "CERO par\u00e1metros tocados: id\u00e9ntico a H002-A (dir=long).",
+  "oos_note": "Split 75/25; el test 25% ya fue observado por H002. No reutilizar indefinidamente; H004 definir\u00e1 TRAIN->VALIDATION->FINAL OOS.",
+  "annualization": "retorno simple por barra (1h), \u00d7sqrt(8766)/a\u00f1o para Sharpe/Sortino/volatilidad; CAGR sobre a\u00f1os.",
+  "train": {
+    "strategy": "atlas-breakout",
+    "experiment_id": "exp-a2bc0b44d4d4",
+    "treatment_row": {
+      "label": "H003-A atlas-breakout",
+      "trades": 757,
+      "wins": 231,
+      "losses": 526,
+      "win_rate": 0.3052,
+      "expectancy": 1094.3791,
+      "expectancy_e": 1094.3791,
+      "payoff_ratio": 2.9983,
+      "profit_factor": 1.3168,
+      "avg_win": 14908.5615,
+      "avg_loss": 4972.3056,
+      "median_trade": -3410.0901,
+      "trade_std": 13636.9784,
+      "gross_profit": 3443877.7153,
+      "gross_loss": 2615432.7526,
+      "costs": 3891.9357,
+      "max_consecutive_wins": 5,
+      "max_consecutive_losses": 23,
+      "net_pnl": 828444.9787000001,
+      "avg_mae": 5584.5545,
+      "avg_mfe": 9849.516,
+      "avg_bars": 25.8124,
+      "long_trades": 757,
+      "experiment_id": "exp-a2bc0b44d4d4"
+    },
+    "benchmarks": [
+      {
+        "label": "H003-A Breakout LONG",
+        "num_trades": 757,
+        "metrics": {
+          "net_return": 8.284449627255203,
+          "cagr": 0.47390966793196165,
+          "max_drawdown": 0.3491100859240554,
+          "return_over_max_dd": 23.73019274228984,
+          "annual_volatility": 0.2610043422979516,
+          "sharpe": 1.6160088093722431,
+          "sortino": 1.4432781017094807,
+          "calmar": 1.3574791649962668
+        },
+        "exposure_frac": 0.38804488134246845,
+        "costs": 3891.9357
+      },
+      {
+        "label": "H003-B Buy & Hold",
+        "num_trades": 1,
+        "metrics": {
+          "net_return": 15.985299481523711,
+          "cagr": 0.6373294329504953,
+          "max_drawdown": 0.7719848663243954,
+          "return_over_max_dd": 20.70675239740585,
+          "annual_volatility": 0.6641248816544081,
+          "sharpe": 1.0753936562525062,
+          "sortino": 1.3086221850631363,
+          "calmar": 0.8255724441658722,
+          "annualization": "sqrt(8766.0) per-bar (1h)"
+        },
+        "exposure_frac": 1.0,
+        "costs": 8.105413605747279
+      },
+      {
+        "label": "H003-C B&H \u00d7exp-cap",
+        "num_trades": 1,
+        "metrics": {
+          "net_return": 4.498393758754461,
+          "cagr": 0.34543653992365364,
+          "max_drawdown": 0.6785448563187695,
+          "return_over_max_dd": 6.629471459203263,
+          "annual_volatility": 0.45663402309798923,
+          "sharpe": 0.8783447950029214,
+          "sortino": 1.0657618330125287,
+          "calmar": 0.5090843099124063,
+          "annualization": "sqrt(8766.0) per-bar (1h)"
+        },
+        "exposure_frac": 1.0,
+        "costs": 2.2809295514519556
+      },
+      {
+        "label": "H003-E Exp-matched",
+        "num_trades": 1049,
+        "metrics": {
+          "net_return": 1.4289929981094702,
+          "cagr": 0.16706903644372484,
+          "max_drawdown": 0.18240461814608727,
+          "return_over_max_dd": 7.834193084766057,
+          "annual_volatility": 0.1438058981128993,
+          "sharpe": 1.1455915788166677,
+          "sortino": 0.9761506385578296,
+          "calmar": 0.9159254745947265,
+          "annualization": "sqrt(8766.0) per-bar (1h)"
+        },
+        "exposure_frac": 0.3958097507695363,
+        "costs": 1584.3356455570856
+      }
+    ],
+    "exposure": {
+      "time_frac": 0.38804488134246845,
+      "cond_capital": 0.7251948842029117,
+      "total_capital_frac": 0.28140816279068404
+    },
+    "regimes": [
+      {
+        "regime": "BULL",
+        "trades": 294,
+        "wins": 90,
+        "losses": 204,
+        "win_rate": 0.30612244897959184,
+        "expectancy": 1335.2242524993078,
+        "net_pnl": 392555.9302347965,
+        "net_return_pct": 392.55593023479645,
+        "exposure": 0.15545626055009434,
+        "bh_blocks": 331,
+        "bh_compounded": 253.20295736969223,
+        "avg_bh_block": 0.019068
+      },
+      {
+        "regime": "BEAR",
+        "trades": 147,
+        "wins": 47,
+        "losses": 100,
+        "win_rate": 0.3197278911564626,
+        "expectancy": 779.7011620378743,
+        "net_pnl": 114616.07081956751,
+        "net_return_pct": 114.61607081956751,
+        "exposure": 0.07490815211994836,
+        "bh_blocks": 323,
+        "bh_compounded": -0.9136099837509633,
+        "avg_bh_block": -0.006859
+      },
+      {
+        "regime": "LATERAL",
+        "trades": 316,
+        "wins": 94,
+        "losses": 222,
+        "win_rate": 0.2974683544303797,
+        "expectancy": 1016.6865875669461,
+        "net_pnl": 321272.96167115495,
+        "net_return_pct": 321.2729616711549,
+        "exposure": 0.15768046867242577,
+        "bh_blocks": 654,
+        "bh_compounded": 0.31579705786141754,
+        "avg_bh_block": 0.000681
+      }
+    ]
+  },
+  "test": {
+    "strategy": "atlas-breakout",
+    "experiment_id": "exp-a2bc0b44d4d4",
+    "treatment_row": {
+      "label": "H003-A atlas-breakout",
+      "trades": 275,
+      "wins": 87,
+      "losses": 188,
+      "win_rate": 0.3164,
+      "expectancy": 193.5468,
+      "expectancy_e": 193.5468,
+      "payoff_ratio": 2.7091,
+      "profit_factor": 1.2537,
+      "avg_win": 3023.6392,
+      "avg_loss": 1116.1236,
+      "median_trade": -1072.7631,
+      "trade_std": 3235.9329,
+      "gross_profit": 263056.6069,
+      "gross_loss": 209831.2319,
+      "costs": 118.3861,
+      "max_consecutive_wins": 4,
+      "max_consecutive_losses": 14,
+      "net_pnl": 53225.369999999995,
+      "avg_mae": 1245.5113,
+      "avg_mfe": 2113.8567,
+      "avg_bars": 24.9455,
+      "long_trades": 275,
+      "experiment_id": "exp-a2bc0b44d4d4"
+    },
+    "benchmarks": [
+      {
+        "label": "H003-A Breakout LONG",
+        "num_trades": 275,
+        "metrics": {
+          "net_return": 0.5322537491607864,
+          "cagr": 0.24963609432953904,
+          "max_drawdown": 0.2209180787560372,
+          "return_over_max_dd": 2.4092810880750117,
+          "annual_volatility": 0.25753713999079003,
+          "sharpe": 0.9934878209382528,
+          "sortino": 0.9546661236097631,
+          "calmar": 1.1299939585533674
+        },
+        "exposure_frac": 0.408673894912427,
+        "costs": 118.3861
+      },
+      {
+        "label": "H003-B Buy & Hold",
+        "num_trades": 1,
+        "metrics": {
+          "net_return": 0.24996007431585476,
+          "cagr": 0.12357272976860312,
+          "max_drawdown": 0.5374206479139391,
+          "return_over_max_dd": 0.46511066384610256,
+          "annual_volatility": 0.4520539916392345,
+          "sharpe": 0.4838583815333102,
+          "sortino": 0.6289254294551172,
+          "calmar": 0.22993669902387465,
+          "annualization": "sqrt(8766.0) per-bar (1h)"
+        },
+        "exposure_frac": 1.0,
+        "costs": 0.47719941209032424
+      },
+      {
+        "label": "H003-C B&H \u00d7exp-cap",
+        "num_trades": 1,
+        "metrics": {
+          "net_return": 0.1027648335961453,
+          "cagr": 0.0524112030081787,
+          "max_drawdown": 0.3134383627301962,
+          "return_over_max_dd": 0.3278629734440132,
+          "annual_volatility": 0.22051648598529833,
+          "sharpe": 0.34193951650323523,
+          "sortino": 0.44207640120197284,
+          "calmar": 0.1672137467527981,
+          "annualization": "sqrt(8766.0) per-bar (1h)"
+        },
+        "exposure_frac": 1.0,
+        "costs": 0.19618860455959614
+      },
+      {
+        "label": "H003-E Exp-matched",
+        "num_trades": 350,
+        "metrics": {
+          "net_return": 0.30138295205067633,
+          "cagr": 0.14747898612020482,
+          "max_drawdown": 0.26111360388536586,
+          "return_over_max_dd": 1.1542215632050696,
+          "annual_volatility": 0.19072859748682883,
+          "sharpe": 0.8164865847601679,
+          "sortino": 0.725812964732148,
+          "calmar": 0.5648077462289214,
+          "annualization": "sqrt(8766.0) per-bar (1h)"
+        },
+        "exposure_frac": 0.4170141784820684,
+        "costs": 115.13189176862895
+      }
+    ],
+    "exposure": {
+      "time_frac": 0.408673894912427,
+      "cond_capital": 1.0059976849243224,
+      "total_capital_frac": 0.41112499217090737
+    },
+    "regimes": [
+      {
+        "regime": "BULL",
+        "trades": 79,
+        "wins": 16,
+        "losses": 63,
+        "win_rate": 0.20253164556962025,
+        "expectancy": -273.4926366743353,
+        "net_pnl": -21605.918297272492,
+        "net_return_pct": -21.605918297272492,
+        "exposure": 0.10103657810079829,
+        "bh_blocks": 91,
+        "bh_compounded": 1.6097073756069022,
+        "avg_bh_block": 0.011583
+      },
+      {
+        "regime": "BEAR",
+        "trades": 33,
+        "wins": 17,
+        "losses": 16,
+        "win_rate": 0.5151515151515151,
+        "expectancy": 342.64085125610865,
+        "net_pnl": 11307.148091451585,
+        "net_return_pct": 11.307148091451586,
+        "exposure": 0.06320743476706779,
+        "bh_blocks": 97,
+        "bh_compounded": -0.4792555908020235,
+        "avg_bh_block": -0.006285
+      },
+      {
+        "regime": "LATERAL",
+        "trades": 163,
+        "wins": 54,
+        "losses": 109,
+        "win_rate": 0.3312883435582822,
+        "expectancy": 389.71868172944517,
+        "net_pnl": 63524.14512189956,
+        "net_return_pct": 63.52414512189956,
+        "exposure": 0.24442988204456095,
+        "bh_blocks": 188,
+        "bh_compounded": 0.02491335864593691,
+        "avg_bh_block": 0.000445
+      }
+    ]
+  },
+  "decision": {
+    "case": "A",
+    "conclusion": "Breakout LONG > B&H con exposici\u00f3n comparable y > control de exposici\u00f3n neutra en train y test, con retorno/riesgo 23.73 (train) / 2.41 (test). Evidencia de timing digna de investigaci\u00f3n adicional (H004 walk-forward). Caveat: r\u00e9gimen BULL del test neto negativo; ver H003-D.",
+    "observations": {
+      "train": {
+        "delta_vs_bh_scaled": 3.7860558685007417,
+        "delta_vs_bh": -7.700849854268508,
+        "delta_vs_exposure_matched": 6.855456629145733,
+        "dd_vs_bh_lower": true,
+        "return_over_dd": 23.73019274228984,
+        "regime_positive": [
+          "BULL",
+          "BEAR",
+          "LATERAL"
+        ],
+        "regime_net_usd": {
+          "BULL": 392555.9302347965,
+          "BEAR": 114616.07081956751,
+          "LATERAL": 321272.96167115495
+        }
+      },
+      "test": {
+        "delta_vs_bh_scaled": 0.4294889155646411,
+        "delta_vs_bh": 0.2822936748449316,
+        "delta_vs_exposure_matched": 0.23087079711011005,
+        "dd_vs_bh_lower": true,
+        "return_over_dd": 2.4092810880750117,
+        "regime_positive": [
+          "BEAR",
+          "LATERAL"
+        ],
+        "regime_net_usd": {
+          "BULL": -21605.918297272492,
+          "BEAR": 11307.148091451585,
+          "LATERAL": 63524.14512189956
+        }
+      }
+    }
+  }
+}

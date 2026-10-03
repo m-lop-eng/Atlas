@@ -1,0 +1,154 @@
+[
+  {
+    "label": "E3-A",
+    "experiment_id": "exp-945890d1b42e",
+    "max_daily_loss": 0.05,
+    "max_bars_in_trade": 48,
+    "diagnostics": {
+      "raw_signals": 119,
+      "signals_while_flat": 24,
+      "signals_while_in_position": 95,
+      "risk_rejected_signals": 0,
+      "orders_created": 24,
+      "risk_rejection_by_reason": {},
+      "trades_completed": 24
+    },
+    "metrics": {
+      "net_return": -0.212363,
+      "profit_factor": 0.2122,
+      "expectancy": -884.8462,
+      "win_rate": 0.1667,
+      "max_drawdown": 0.235727,
+      "num_trades": 24,
+      "equity_final": 78763.69,
+      "equity_min": 78763.69,
+      "equity_max": 103057.07,
+      "raw": {
+        "curve_points": 721,
+        "initial_equity": 100000,
+        "final_equity": 78763.69233643658,
+        "execution_costs_unaccounted": "exposure/turnover/commission requieren Milestone 2"
+      }
+    },
+    "trades_summary": {
+      "count": 24,
+      "wins": 4,
+      "losses": 20,
+      "stopped": 17
+    }
+  },
+  {
+    "label": "E3-B",
+    "experiment_id": "exp-de66cae9b104",
+    "max_daily_loss": 0.2,
+    "max_bars_in_trade": 48,
+    "diagnostics": {
+      "raw_signals": 119,
+      "signals_while_flat": 24,
+      "signals_while_in_position": 95,
+      "risk_rejected_signals": 0,
+      "orders_created": 24,
+      "risk_rejection_by_reason": {},
+      "trades_completed": 24
+    },
+    "metrics": {
+      "net_return": -0.212363,
+      "profit_factor": 0.2122,
+      "expectancy": -884.8462,
+      "win_rate": 0.1667,
+      "max_drawdown": 0.235727,
+      "num_trades": 24,
+      "equity_final": 78763.69,
+      "equity_min": 78763.69,
+      "equity_max": 103057.07,
+      "raw": {
+        "curve_points": 721,
+        "initial_equity": 100000,
+        "final_equity": 78763.69233643658,
+        "execution_costs_unaccounted": "exposure/turnover/commission requieren Milestone 2"
+      }
+    },
+    "trades_summary": {
+      "count": 24,
+      "wins": 4,
+      "losses": 20,
+      "stopped": 17
+    }
+  },
+  {
+    "label": "E3-C",
+    "experiment_id": "exp-59c41a4900ea",
+    "max_daily_loss": 0.2,
+    "max_bars_in_trade": 120,
+    "diagnostics": {
+      "raw_signals": 119,
+      "signals_while_flat": 15,
+      "signals_while_in_position": 104,
+      "risk_rejected_signals": 0,
+      "orders_created": 15,
+      "risk_rejection_by_reason": {},
+      "trades_completed": 15
+    },
+    "metrics": {
+      "net_return": -0.079252,
+      "profit_factor": 0.5661,
+      "expectancy": -528.3496,
+      "win_rate": 0.2,
+      "max_drawdown": 0.140044,
+      "num_trades": 15,
+      "equity_final": 92074.76,
+      "equity_min": 92074.76,
+      "equity_max": 107069.18,
+      "raw": {
+        "curve_points": 721,
+        "initial_equity": 100000,
+        "final_equity": 92074.75627981444,
+        "execution_costs_unaccounted": "exposure/turnover/commission requieren Milestone 2"
+      }
+    },
+    "trades_summary": {
+      "count": 15,
+      "wins": 3,
+      "losses": 12,
+      "stopped": 11
+    }
+  },
+  {
+    "label": "E3-D",
+    "experiment_id": "exp-7b6bea44d394",
+    "max_daily_loss": 0.9999,
+    "max_bars_in_trade": 10000,
+    "diagnostics": {
+      "raw_signals": 119,
+      "signals_while_flat": 9,
+      "signals_while_in_position": 110,
+      "risk_rejected_signals": 0,
+      "orders_created": 9,
+      "risk_rejection_by_reason": {},
+      "trades_completed": 9
+    },
+    "metrics": {
+      "net_return": -0.135224,
+      "profit_factor": 0.0,
+      "expectancy": -1502.4859,
+      "win_rate": 0.0,
+      "max_drawdown": 0.208906,
+      "num_trades": 9,
+      "equity_final": 86477.63,
+      "equity_min": 86477.63,
+      "equity_max": 109313.99,
+      "raw": {
+        "curve_points": 721,
+        "initial_equity": 100000,
+        "final_equity": 86477.626907464,
+        "execution_costs_unaccounted": "exposure/turnover/commission requieren Milestone 2"
+      }
+    },
+    "trades_summary": {
+      "count": 9,
+      "wins": 0,
+      "losses": 9,
+      "stopped": 8
+    }
+  }
+]

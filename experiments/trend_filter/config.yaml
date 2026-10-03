@@ -1,0 +1,58 @@
+experiment:
+  name: atlas-breakout-trend-filter
+  environment: BACKTEST
+  type: ABLATION
+  hypothesis: h001-breakout
+  change: sma50_filter
+  parent: exp-bb2cb3867462
+
+# Variante controlada del baseline (atlas-first-breakout).
+# ÚNICO cambio: parametro `trend_filter` (filtro close vs SMA(close)).
+# Dataset, capital, RiskEngine, riesgo, stop, ejecucion, costes y
+# metodologia de backtest son identicos al baseline (exp-945890d1b42e).
+strategy:
+  strategy_id: atlas-breakout-trend-filter
+  strategy_name: "Atlas Breakout + Trend Filter (SMA50)"
+  strategy_family: breakout
+  market: cash
+  instrument: SAMPLE
+  timeframe: 1h
+  version: 2.0.0
+  parameter_set_version: tp1
+  data_version: v1
+  params:
+    lookback: 20
+    atr_period: 14
+    stop_atr_mult: 2.0
+    trend_filter: 50
+
+risk:
+  risk_per_trade: 0.01
+  max_open_positions: 3
+  max_strategy_risk: 0.9
+  max_daily_loss: 0.05
+  max_drawdown: 0.2
+
+costs:
+  spread_ticks: 0
+  tick_size: 0
+  slippage_per_side: 0.05
+  commission_per_unit: 0.1
+  initial_equity: 100000
+
+engine:
+  account_id: BACKTEST-SAMPLE
+  point_value: 1.0
+  min_size: 0.001
+  max_bars_in_trade: 48
+
+dataset:
+  path: experiments/data/sample_1h.csv
+  n_bars: 720
+  start_price: 100.0
+  start_epoch: 1700000000
+  interval_seconds: 3600
+  seed: 42
+  drift: 0.00005
+  volatility: 0.0022
+  regenerate: true

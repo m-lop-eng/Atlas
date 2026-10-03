@@ -1,0 +1,1423 @@
+{
+  "hypothesis": "H005-W2: la perdida de 2022 (W2) procede de beta direccional adversa (bear estructural -64.5%), no de un fallo de la logica breakout ni de trades extremos, costes o un evento concentrado.",
+  "method": "Diagnostico del ciclo H004 con config CONGELADA (H002-A/H003-A). Ningun parametro modificado; la direccion (long/both/short) se usa solo como diagnostico de hipotesis sobre la logica breakout. Se contrasta W2 vs W1/W3/W4 como control temporal.",
+  "lineage": {
+    "hypothesis_id": "H005-W2",
+    "parent_hypothesis": "H004",
+    "strategy_id": "atlas-breakout",
+    "params_long_frozen": {
+      "lookback": 20,
+      "atr_period": 14,
+      "stop_atr_mult": 2.0,
+      "direction": "long"
+    },
+    "params_hash": "d15885cfc9472982f6567b498391a9e7437a6a9e5b890d38c98b92629f0016f6",
+    "parameters_changed": false,
+    "optimization_performed": false,
+    "previous_oos_consumed": true,
+    "final_oos_consumed": false,
+    "experiment_id": "exp-5780c1f1376b"
+  },
+  "data_roles": {
+    "development_range": [
+      1546300800,
+      1727787600
+    ],
+    "observed_range": [
+      1727787600,
+      1788217200
+    ],
+    "note": "Diagnostico dentro de DEVELOPMENT (W2 = 2022). No se toca OBSERVED ni FINAL_OOS. final_oos_consumed=false."
+  },
+  "windows_long": [
+    {
+      "label": "W1",
+      "months": "2021",
+      "valid_range": [
+        1609459200,
+        1640995200
+      ],
+      "valid_bars": 8747,
+      "metrics_row": {
+        "trades": 139,
+        "net_return": 0.1261141462089277,
+        "net_pnl": 12611.414620892769,
+        "expectancy": 90.7296,
+        "win_rate": 0.3237,
+        "profit_factor": 1.1173,
+        "max_drawdown": 0.14953881231875885,
+        "sharpe": 0.6620679936847211,
+        "exposure_time": 0.45215502457985596,
+        "capital_exposure_cond": 0.43878203563948504,
+        "max_consecutive_losses": 10
+      },
+      "pnl_distribution": {
+        "n": 139,
+        "mean": 90.73,
+        "median": -1134.43,
+        "std": 2209.6,
+        "skew": 1.928,
+        "min": -1312.5,
+        "max": 8971.86,
+        "quantiles": {
+          "q10": -1264.02,
+          "q25": -1209.61,
+          "q50": -1134.43,
+          "q75": 826.94,
+          "q90": 3862.29
+        },
+        "wins": 45,
+        "losses": 94,
+        "gross_pos": 120127.25,
+        "gross_neg": 107515.84,
+        "concentration": {
+          "topK_gross_pos": 36941.92,
+          "topK_share_gross_pos": 0.3075,
+          "botK_gross_neg": 6507.54,
+          "botK_share_gross_neg": 0.0605
+        }
+      },
+      "expectancy_decomp": {
+        "win_rate": 0.3237,
+        "avg_win": 2669.49,
+        "avg_loss_mag": 1143.79,
+        "payoff_ratio": 2.3339,
+        "expectancy": 90.73
+      },
+      "exit_breakdown": {
+        "STOP": {
+          "trades": 89,
+          "win_rate": 0.0,
+          "avg_pnl": -1187.89,
+          "net_pnl": -105722.04,
+          "avg_bars": 16.9,
+          "median_bars": 13
+        },
+        "TIME": {
+          "trades": 50,
+          "win_rate": 0.9,
+          "avg_pnl": 2366.67,
+          "net_pnl": 118333.46,
+          "avg_bars": 49,
+          "median_bars": 49.0
+        }
+      },
+      "streaks": {
+        "max_consecutive_wins": 5,
+        "max_consecutive_losses": 10
+      },
+      "mae_mfe": {
+        "n": 139,
+        "avg_mae": 1146.7,
+        "median_mae": 1244.34,
+        "avg_mfe": 1845.69,
+        "median_mfe": 1124.78,
+        "mfe_mae_ratio": 1.6096,
+        "quantiles_mae": {
+          "q10": 328.68,
+          "q25": 659.0,
+          "q50": 1244.34,
+          "q75": 1444.49,
+          "q90": 1705.4
+        },
+        "quantiles_mfe": {
+          "q10": 179.6,
+          "q25": 400.19,
+          "q50": 1124.78,
+          "q75": 2519.31,
+          "q90": 4513.31
+        }
+      },
+      "cost_drag": {
+        "avg_share_costs_of_move": 0.0003,
+        "median_share_costs_of_move": 0.0003,
+        "avg_costs_per_trade": 0.34,
+        "total_costs": 46.67,
+        "costs_pct_initial_equity": 0.00047
+      },
+      "monthly": {
+        "months": [
+          {
+            "month": "2021-01",
+            "trades": 11,
+            "wins": 3,
+            "net_pnl": 2249.87,
+            "avg_pnl": 204.53
+          },
+          {
+            "month": "2021-02",
+            "trades": 11,
+            "wins": 6,
+            "net_pnl": 13847.62,
+            "avg_pnl": 1258.87
+          },
+          {
+            "month": "2021-03",
+            "trades": 13,
+            "wins": 6,
+            "net_pnl": 3726.44,
+            "avg_pnl": 286.65
+          },
+          {
+            "month": "2021-04",
+            "trades": 12,
+            "wins": 3,
+            "net_pnl": -3313.69,
+            "avg_pnl": -276.14
+          },
+          {
+            "month": "2021-05",
+            "trades": 12,
+            "wins": 3,
+            "net_pnl": -6287.48,
+            "avg_pnl": -523.96
+          },
+          {
+            "month": "2021-06",
+            "trades": 8,
+            "wins": 4,
+            "net_pnl": 4071.97,
+            "avg_pnl": 509.0
+          },
+          {
+            "month": "2021-07",
+            "trades": 12,
+            "wins": 6,
+            "net_pnl": 11050.03,
+            "avg_pnl": 920.84
+          },
+          {
+            "month": "2021-08",
+            "trades": 14,
+            "wins": 4,
+            "net_pnl": -1734.98,
+            "avg_pnl": -123.93
+          },
+          {
+            "month": "2021-09",
+            "trades": 10,
+            "wins": 3,
+            "net_pnl": 1660.94,
+            "avg_pnl": 166.09
+          },
+          {
+            "month": "2021-10",
+            "trades": 14,
+            "wins": 2,
+            "net_pnl": -4188.58,
+            "avg_pnl": -299.18
+          },
+          {
+            "month": "2021-11",
+            "trades": 11,
+            "wins": 2,
+            "net_pnl": -1099.83,
+            "avg_pnl": -99.98
+          },
+          {
+            "month": "2021-12",
+            "trades": 11,
+            "wins": 3,
+            "net_pnl": -7370.91,
+            "avg_pnl": -670.08
+          }
+        ],
+        "month_count": 12,
+        "worst_month": {
+          "month": "2021-01",
+          "trades": 11,
+          "wins": 3,
+          "net_pnl": 2249.87,
+          "avg_pnl": 204.53
+        },
+        "best_month": {
+          "month": "2021-12",
+          "trades": 11,
+          "wins": 3,
+          "net_pnl": -7370.91,
+          "avg_pnl": -670.08
+        },
+        "top3_pos_months_share": 0.7914
+      },
+      "market_context": {
+        "bars": 8747,
+        "market_return": 0.594,
+        "avg_close": 47359.3,
+        "max_close": 68633.69,
+        "min_close": 28995.13,
+        "avg_daily_range_pct": 1.305,
+        "atr_mean": 618.005,
+        "annual_vol_per_bar": 0.8613,
+        "sharpe_style_ret_per_bar": 0.8385
+      },
+      "regimes": {
+        "rows": [
+          {
+            "regime": "BULL",
+            "trades": 61,
+            "win_rate": 0.3115,
+            "expectancy": 78.89,
+            "net_pnl": 4812.35,
+            "avg_mae": 1245.54,
+            "avg_mfe": 2006.71,
+            "small_sample": false
+          },
+          {
+            "regime": "BEAR",
+            "trades": 32,
+            "win_rate": 0.375,
+            "expectancy": -25.45,
+            "net_pnl": -814.52,
+            "avg_mae": 1046.7,
+            "avg_mfe": 1528.31,
+            "small_sample": false
+          },
+          {
+            "regime": "LATERAL",
+            "trades": 46,
+            "win_rate": 0.3043,
+            "expectancy": 187.25,
+            "net_pnl": 8613.59,
+            "avg_mae": 1085.18,
+            "avg_mfe": 1852.93,
+            "small_sample": false
+          }
+        ],
+        "min_sample": 10
+      },
+      "diagnostics": {
+        "raw_signals": 448,
+        "raw_signals_long": 448,
+        "raw_signals_short": 0,
+        "signals_while_flat": 139,
+        "signals_while_in_position": 309,
+        "risk_rejected_signals": 0,
+        "orders_created": 139,
+        "risk_rejection_by_reason": {},
+        "trades_completed": 139
+      }
+    },
+    {
+      "label": "W2",
+      "months": "2022",
+      "valid_range": [
+        1640995200,
+        1672531200
+      ],
+      "valid_bars": 8760,
+      "metrics_row": {
+        "trades": 120,
+        "net_return": -0.11967169503481079,
+        "net_pnl": -11967.169503481075,
+        "expectancy": -99.7264,
+        "win_rate": 0.2333,
+        "profit_factor": 0.8421,
+        "max_drawdown": 0.23345548900923196,
+        "sharpe": -0.5159495373321984,
+        "exposure_time": 0.3202054794520548,
+        "capital_exposure_cond": 0.6516684627487406,
+        "max_consecutive_losses": 14
+      },
+      "pnl_distribution": {
+        "n": 120,
+        "mean": -99.73,
+        "median": -837.43,
+        "std": 1675.18,
+        "skew": 2.696,
+        "min": -1000.43,
+        "max": 7410.2,
+        "quantiles": {
+          "q10": -965.08,
+          "q25": -889.7,
+          "q50": -836.5,
+          "q75": -8.23,
+          "q90": 2204.2
+        },
+        "wins": 28,
+        "losses": 92,
+        "gross_pos": 63831.03,
+        "gross_neg": 75798.2,
+        "concentration": {
+          "topK_gross_pos": 31108.83,
+          "topK_share_gross_pos": 0.4874,
+          "botK_gross_neg": 4977.08,
+          "botK_share_gross_neg": 0.0657
+        }
+      },
+      "expectancy_decomp": {
+        "win_rate": 0.2333,
+        "avg_win": 2279.68,
+        "avg_loss_mag": 823.89,
+        "payoff_ratio": 2.767,
+        "expectancy": -99.73
+      },
+      "exit_breakdown": {
+        "STOP": {
+          "trades": 84,
+          "win_rate": 0.0,
+          "avg_pnl": -879.63,
+          "net_pnl": -73889.24,
+          "avg_bars": 12.4,
+          "median_bars": 7.0
+        },
+        "TIME": {
+          "trades": 36,
+          "win_rate": 0.7778,
+          "avg_pnl": 1720.06,
+          "net_pnl": 61922.07,
+          "avg_bars": 49,
+          "median_bars": 49.0
+        }
+      },
+      "streaks": {
+        "max_consecutive_wins": 3,
+        "max_consecutive_losses": 14
+      },
+      "mae_mfe": {
+        "n": 120,
+        "avg_mae": 947.82,
+        "median_mae": 990.44,
+        "avg_mfe": 1348.9,
+        "median_mfe": 704.8,
+        "mfe_mae_ratio": 1.4232,
+        "quantiles_mae": {
+          "q10": 354.29,
+          "q25": 699.93,
+          "q50": 992.72,
+          "q75": 1131.47,
+          "q90": 1580.82
+        },
+        "quantiles_mfe": {
+          "q10": 111.28,
+          "q25": 327.81,
+          "q50": 726.39,
+          "q75": 1538.52,
+          "q90": 3283.24
+        }
+      },
+      "cost_drag": {
+        "avg_share_costs_of_move": 0.0041,
+        "median_share_costs_of_move": 0.0006,
+        "avg_costs_per_trade": 0.77,
+        "total_costs": 92.2,
+        "costs_pct_initial_equity": 0.00092
+      },
+      "monthly": {
+        "months": [
+          {
+            "month": "2022-01",
+            "trades": 10,
+            "wins": 2,
+            "net_pnl": -5055.85,
+            "avg_pnl": -505.59
+          },
+          {
+            "month": "2022-02",
+            "trades": 12,
+            "wins": 5,
+            "net_pnl": 3358.17,
+            "avg_pnl": 279.85
+          },
+          {
+            "month": "2022-03",
+            "trades": 10,
+            "wins": 3,
+            "net_pnl": -2567.74,
+            "avg_pnl": -256.77
+          },
+          {
+            "month": "2022-04",
+            "trades": 10,
+            "wins": 2,
+            "net_pnl": -5593.95,
+            "avg_pnl": -559.39
+          },
+          {
+            "month": "2022-05",
+            "trades": 11,
+            "wins": 1,
+            "net_pnl": -4979.19,
+            "avg_pnl": -452.65
+          },
+          {
+            "month": "2022-06",
+            "trades": 6,
+            "wins": 2,
+            "net_pnl": -2129.62,
+            "avg_pnl": -354.94
+          },
+          {
+            "month": "2022-07",
+            "trades": 13,
+            "wins": 4,
+            "net_pnl": 4500.21,
+            "avg_pnl": 346.17
+          },
+          {
+            "month": "2022-08",
+            "trades": 10,
+            "wins": 0,
+            "net_pnl": -7573.47,
+            "avg_pnl": -757.35
+          },
+          {
+            "month": "2022-09",
+            "trades": 11,
+            "wins": 1,
+            "net_pnl": -750.75,
+            "avg_pnl": -68.25
+          },
+          {
+            "month": "2022-10",
+            "trades": 10,
+            "wins": 3,
+            "net_pnl": 3477.61,
+            "avg_pnl": 347.76
+          },
+          {
+            "month": "2022-11",
+            "trades": 8,
+            "wins": 3,
+            "net_pnl": 2910.4,
+            "avg_pnl": 363.8
+          },
+          {
+            "month": "2022-12",
+            "trades": 9,
+            "wins": 2,
+            "net_pnl": 2437.01,
+            "avg_pnl": 270.78
+          }
+        ],
+        "month_count": 12,
+        "worst_month": {
+          "month": "2022-01",
+          "trades": 10,
+          "wins": 2,
+          "net_pnl": -5055.85,
+          "avg_pnl": -505.59
+        },
+        "best_month": {
+          "month": "2022-12",
+          "trades": 9,
+          "wins": 2,
+          "net_pnl": 2437.01,
+          "avg_pnl": 270.78
+        },
+        "top3_pos_months_share": 0.6795
+      },
+      "market_context": {
+        "bars": 8760,
+        "market_return": -0.6454,
+        "avg_close": 28224.54,
+        "max_close": 47970.99,
+        "min_close": 15649.52,
+        "avg_daily_range_pct": 0.946,
+        "atr_mean": 267.021,
+        "annual_vol_per_bar": 0.6377,
+        "sharpe_style_ret_per_bar": -0.8343
+      },
+      "regimes": {
+        "rows": [
+          {
+            "regime": "BULL",
+            "trades": 25,
+            "win_rate": 0.28,
+            "expectancy": -250.25,
+            "net_pnl": -6256.15,
+            "avg_mae": 889.85,
+            "avg_mfe": 985.07,
+            "small_sample": false
+          },
+          {
+            "regime": "BEAR",
+            "trades": 44,
+            "win_rate": 0.2045,
+            "expectancy": -105.78,
+            "net_pnl": -4654.25,
+            "avg_mae": 909.1,
+            "avg_mfe": 1076.43,
+            "small_sample": false
+          },
+          {
+            "regime": "LATERAL",
+            "trades": 51,
+            "win_rate": 0.2353,
+            "expectancy": -20.72,
+            "net_pnl": -1056.77,
+            "avg_mae": 1009.65,
+            "avg_mfe": 1762.32,
+            "small_sample": false
+          }
+        ],
+        "min_sample": 10
+      },
+      "diagnostics": {
+        "raw_signals": 296,
+        "raw_signals_long": 296,
+        "raw_signals_short": 0,
+        "signals_while_flat": 120,
+        "signals_while_in_position": 176,
+        "risk_rejected_signals": 0,
+        "orders_created": 120,
+        "risk_rejection_by_reason": {},
+        "trades_completed": 120
+      }
+    },
+    {
+      "label": "W3",
+      "months": "2023",
+      "valid_range": [
+        1672531200,
+        1704067200
+      ],
+      "valid_bars": 8759,
+      "metrics_row": {
+        "trades": 131,
+        "net_return": 0.6285547535152993,
+        "net_pnl": 62855.47535152988,
+        "expectancy": 479.8128,
+        "win_rate": 0.2595,
+        "profit_factor": 1.4656,
+        "max_drawdown": 0.30412058158722005,
+        "sharpe": 1.717088764236549,
+        "exposure_time": 0.3442173764128325,
+        "capital_exposure_cond": 1.1497758520847057,
+        "max_consecutive_losses": 23
+      },
+      "pnl_distribution": {
+        "n": 131,
+        "mean": 479.81,
+        "median": -1334.03,
+        "std": 4331.45,
+        "skew": 2.95,
+        "min": -1694.79,
+        "max": 23371.93,
+        "quantiles": {
+          "q10": -1616.74,
+          "q25": -1538.21,
+          "q50": -1334.03,
+          "q75": 227.05,
+          "q90": 3596.16
+        },
+        "wins": 34,
+        "losses": 97,
+        "gross_pos": 197848.12,
+        "gross_neg": 134992.64,
+        "concentration": {
+          "topK_gross_pos": 86264.77,
+          "topK_share_gross_pos": 0.436,
+          "botK_gross_neg": 8401.54,
+          "botK_share_gross_neg": 0.0622
+        }
+      },
+      "expectancy_decomp": {
+        "win_rate": 0.2595,
+        "avg_win": 5819.06,
+        "avg_loss_mag": 1391.68,
+        "payoff_ratio": 4.1813,
+        "expectancy": 479.81
+      },
+      "exit_breakdown": {
+        "END": {
+          "trades": 1,
+          "win_rate": 1.0,
+          "avg_pnl": 157.07,
+          "net_pnl": 157.07,
+          "avg_bars": 33,
+          "median_bars": 33
+        },
+        "STOP": {
+          "trades": 92,
+          "win_rate": 0.0,
+          "avg_pnl": -1457.64,
+          "net_pnl": -134102.53,
+          "avg_bars": 12.2,
+          "median_bars": 9.5
+        },
+        "TIME": {
+          "trades": 38,
+          "win_rate": 0.8684,
+          "avg_pnl": 5178.97,
+          "net_pnl": 196800.93,
+          "avg_bars": 49,
+          "median_bars": 49.0
+        }
+      },
+      "streaks": {
+        "max_consecutive_wins": 5,
+        "max_consecutive_losses": 23
+      },
+      "mae_mfe": {
+        "n": 131,
+        "avg_mae": 1717.02,
+        "median_mae": 1610.06,
+        "avg_mfe": 3653.7,
+        "median_mfe": 1992.95,
+        "mfe_mae_ratio": 2.1279,
+        "quantiles_mae": {
+          "q10": 525.5,
+          "q25": 1161.29,
+          "q50": 1610.06,
+          "q75": 2075.86,
+          "q90": 2600.49
+        },
+        "quantiles_mfe": {
+          "q10": 143.8,
+          "q25": 477.66,
+          "q50": 1992.95,
+          "q75": 4410.81,
+          "q90": 8713.73
+        }
+      },
+      "cost_drag": {
+        "avg_share_costs_of_move": 0.002,
+        "median_share_costs_of_move": 0.0011,
+        "avg_costs_per_trade": 1.99,
+        "total_costs": 260.34,
+        "costs_pct_initial_equity": 0.0026
+      },
+      "monthly": {
+        "months": [
+          {
+            "month": "2023-01",
+            "trades": 11,
+            "wins": 5,
+            "net_pnl": 27956.32,
+            "avg_pnl": 2541.48
+          },
+          {
+            "month": "2023-02",
+            "trades": 8,
+            "wins": 2,
+            "net_pnl": 5305.58,
+            "avg_pnl": 663.2
+          },
+          {
+            "month": "2023-03",
+            "trades": 10,
+            "wins": 3,
+            "net_pnl": 23167.87,
+            "avg_pnl": 2316.79
+          },
+          {
+            "month": "2023-04",
+            "trades": 11,
+            "wins": 1,
+            "net_pnl": -207.0,
+            "avg_pnl": -18.82
+          },
+          {
+            "month": "2023-05",
+            "trades": 11,
+            "wins": 3,
+            "net_pnl": -3813.41,
+            "avg_pnl": -346.67
+          },
+          {
+            "month": "2023-06",
+            "trades": 12,
+            "wins": 4,
+            "net_pnl": 10734.3,
+            "avg_pnl": 894.52
+          },
+          {
+            "month": "2023-07",
+            "trades": 16,
+            "wins": 0,
+            "net_pnl": -23052.42,
+            "avg_pnl": -1440.78
+          },
+          {
+            "month": "2023-08",
+            "trades": 12,
+            "wins": 1,
+            "net_pnl": -13589.99,
+            "avg_pnl": -1132.5
+          },
+          {
+            "month": "2023-09",
+            "trades": 9,
+            "wins": 2,
+            "net_pnl": -3344.5,
+            "avg_pnl": -371.61
+          },
+          {
+            "month": "2023-10",
+            "trades": 12,
+            "wins": 5,
+            "net_pnl": 24176.56,
+            "avg_pnl": 2014.71
+          },
+          {
+            "month": "2023-11",
+            "trades": 9,
+            "wins": 3,
+            "net_pnl": -2419.06,
+            "avg_pnl": -268.78
+          },
+          {
+            "month": "2023-12",
+            "trades": 10,
+            "wins": 5,
+            "net_pnl": 17941.21,
+            "avg_pnl": 1794.12
+          }
+        ],
+        "month_count": 12,
+        "worst_month": {
+          "month": "2023-01",
+          "trades": 11,
+          "wins": 5,
+          "net_pnl": 27956.32,
+          "avg_pnl": 2541.48
+        },
+        "best_month": {
+          "month": "2023-12",
+          "trades": 10,
+          "wins": 5,
+          "net_pnl": 17941.21,
+          "avg_pnl": 1794.12
+        },
+        "top3_pos_months_share": 0.6891
+      },
+      "market_context": {
+        "bars": 8759,
+        "market_return": 1.558,
+        "avg_close": 28805.28,
+        "max_close": 44527.34,
+        "min_close": 16513.34,
+        "avg_daily_range_pct": 0.586,
+        "atr_mean": 168.772,
+        "annual_vol_per_bar": 0.4252,
+        "sharpe_style_ret_per_bar": 1.0306
+      },
+      "regimes": {
+        "rows": [
+          {
+            "regime": "BULL",
+            "trades": 49,
+            "win_rate": 0.2041,
+            "expectancy": 491.81,
+            "net_pnl": 24098.57,
+            "avg_mae": 1757.35,
+            "avg_mfe": 3907.41,
+            "small_sample": false
+          },
+          {
+            "regime": "BEAR",
+            "trades": 7,
+            "win_rate": 0.1429,
+            "expectancy": 2179.26,
+            "net_pnl": 15254.79,
+            "avg_mae": 1598.64,
+            "avg_mfe": 5472.26,
+            "small_sample": true
+          },
+          {
+            "regime": "LATERAL",
+            "trades": 75,
+            "win_rate": 0.3067,
+            "expectancy": 313.36,
+            "net_pnl": 23502.11,
+            "avg_mae": 1701.72,
+            "avg_mfe": 3318.22,
+            "small_sample": false
+          }
+        ],
+        "min_sample": 10
+      },
+      "diagnostics": {
+        "raw_signals": 361,
+        "raw_signals_long": 361,
+        "raw_signals_short": 0,
+        "signals_while_flat": 131,
+        "signals_while_in_position": 230,
+        "risk_rejected_signals": 0,
+        "orders_created": 131,
+        "risk_rejection_by_reason": {},
+        "trades_completed": 131
+      }
+    },
+    {
+      "label": "W4",
+      "months": "2024 (ene-oct)",
+      "valid_range": [
+        1704067200,
+        1727787600
+      ],
+      "valid_bars": 6589,
+      "metrics_row": {
+        "trades": 111,
+        "net_return": 0.2326017899263182,
+        "net_pnl": 23260.178992631816,
+        "expectancy": 209.5512,
+        "win_rate": 0.2883,
+        "profit_factor": 1.2575,
+        "max_drawdown": 0.13548816326007287,
+        "sharpe": 1.2440552541556646,
+        "exposure_time": 0.4088632569433905,
+        "capital_exposure_cond": 0.7776911859633222,
+        "max_consecutive_losses": 10
+      },
+      "pnl_distribution": {
+        "n": 111,
+        "mean": 209.55,
+        "median": -1183.56,
+        "std": 2792.85,
+        "skew": 3.011,
+        "min": -1295.55,
+        "max": 17326.09,
+        "quantiles": {
+          "q10": -1247.65,
+          "q25": -1227.51,
+          "q50": -1183.56,
+          "q75": 406.8,
+          "q90": 4105.55
+        },
+        "wins": 32,
+        "losses": 79,
+        "gross_pos": 113576.83,
+        "gross_neg": 90316.65,
+        "concentration": {
+          "topK_gross_pos": 47790.81,
+          "topK_share_gross_pos": 0.4208,
+          "botK_gross_neg": 6418.08,
+          "botK_share_gross_neg": 0.0711
+        }
+      },
+      "expectancy_decomp": {
+        "win_rate": 0.2883,
+        "avg_win": 3549.28,
+        "avg_loss_mag": 1143.25,
+        "payoff_ratio": 3.1046,
+        "expectancy": 209.55
+      },
+      "exit_breakdown": {
+        "STOP": {
+          "trades": 76,
+          "win_rate": 0.0,
+          "avg_pnl": -1181.26,
+          "net_pnl": -89775.87,
+          "avg_bars": 12.9,
+          "median_bars": 10.5
+        },
+        "TIME": {
+          "trades": 35,
+          "win_rate": 0.9143,
+          "avg_pnl": 3229.6,
+          "net_pnl": 113036.04,
+          "avg_bars": 49,
+          "median_bars": 49
+        }
+      },
+      "streaks": {
+        "max_consecutive_wins": 3,
+        "max_consecutive_losses": 10
+      },
+      "mae_mfe": {
+        "n": 111,
+        "avg_mae": 1359.97,
+        "median_mae": 1347.34,
+        "avg_mfe": 2088.78,
+        "median_mfe": 1127.55,
+        "mfe_mae_ratio": 1.5359,
+        "quantiles_mae": {
+          "q10": 231.98,
+          "q25": 825.2,
+          "q50": 1347.34,
+          "q75": 1761.97,
+          "q90": 2180.66
+        },
+        "quantiles_mfe": {
+          "q10": 149.33,
+          "q25": 352.21,
+          "q50": 1127.55,
+          "q75": 2422.23,
+          "q90": 5437.35
+        }
+      },
+      "cost_drag": {
+        "avg_share_costs_of_move": 0.0005,
+        "median_share_costs_of_move": 0.0003,
+        "avg_costs_per_trade": 0.49,
+        "total_costs": 54.74,
+        "costs_pct_initial_equity": 0.00055
+      },
+      "monthly": {
+        "months": [
+          {
+            "month": "2024-01",
+            "trades": 13,
+            "wins": 3,
+            "net_pnl": -2487.99,
+            "avg_pnl": -191.38
+          },
+          {
+            "month": "2024-02",
+            "trades": 12,
+            "wins": 4,
+            "net_pnl": 25797.6,
+            "avg_pnl": 2149.8
+          },
+          {
+            "month": "2024-03",
+            "trades": 12,
+            "wins": 2,
+            "net_pnl": -3745.99,
+            "avg_pnl": -312.17
+          },
+          {
+            "month": "2024-04",
+            "trades": 11,
+            "wins": 4,
+            "net_pnl": -311.0,
+            "avg_pnl": -28.27
+          },
+          {
+            "month": "2024-05",
+            "trades": 13,
+            "wins": 4,
+            "net_pnl": 7206.41,
+            "avg_pnl": 554.34
+          },
+          {
+            "month": "2024-06",
+            "trades": 13,
+            "wins": 2,
+            "net_pnl": -5896.22,
+            "avg_pnl": -453.56
+          },
+          {
+            "month": "2024-07",
+            "trades": 13,
+            "wins": 3,
+            "net_pnl": 1282.04,
+            "avg_pnl": 98.62
+          },
+          {
+            "month": "2024-08",
+            "trades": 9,
+            "wins": 5,
+            "net_pnl": 1216.89,
+            "avg_pnl": 135.21
+          },
+          {
+            "month": "2024-09",
+            "trades": 15,
+            "wins": 5,
+            "net_pnl": 198.43,
+            "avg_pnl": 13.23
+          }
+        ],
+        "month_count": 9,
+        "worst_month": {
+          "month": "2024-01",
+          "trades": 13,
+          "wins": 3,
+          "net_pnl": -2487.99,
+          "avg_pnl": -191.38
+        },
+        "best_month": {
+          "month": "2024-09",
+          "trades": 15,
+          "wins": 5,
+          "net_pnl": 198.43,
+          "avg_pnl": 13.23
+        },
+        "top3_pos_months_share": 0.9604
+      },
+      "market_context": {
+        "bars": 6589,
+        "market_return": 0.4989,
+        "avg_close": 60043.37,
+        "max_close": 73577.35,
+        "min_close": 38767.74,
+        "avg_daily_range_pct": 0.774,
+        "atr_mean": 464.949,
+        "annual_vol_per_bar": 0.5315,
+        "sharpe_style_ret_per_bar": 0.68
+      },
+      "regimes": {
+        "rows": [
+          {
+            "regime": "BULL",
+            "trades": 37,
+            "win_rate": 0.2703,
+            "expectancy": 336.6,
+            "net_pnl": 12454.13,
+            "avg_mae": 1365.21,
+            "avg_mfe": 2364.59,
+            "small_sample": false
+          },
+          {
+            "regime": "BEAR",
+            "trades": 19,
+            "win_rate": 0.3158,
+            "expectancy": 197.35,
+            "net_pnl": 3749.65,
+            "avg_mae": 1176.71,
+            "avg_mfe": 1927.58,
+            "small_sample": false
+          },
+          {
+            "regime": "LATERAL",
+            "trades": 55,
+            "win_rate": 0.2909,
+            "expectancy": 128.3,
+            "net_pnl": 7056.4,
+            "avg_mae": 1419.75,
+            "avg_mfe": 1958.92,
+            "small_sample": false
+          }
+        ],
+        "min_sample": 10
+      },
+      "diagnostics": {
+        "raw_signals": 307,
+        "raw_signals_long": 307,
+        "raw_signals_short": 0,
+        "signals_while_flat": 111,
+        "signals_while_in_position": 196,
+        "risk_rejected_signals": 0,
+        "orders_created": 111,
+        "risk_rejection_by_reason": {},
+        "trades_completed": 111
+      }
+    }
+  ],
+  "w2_benchmarks": {
+    "bh": {
+      "net_return": -0.6420770483889777,
+      "net_pnl": -64207.70483889777,
+      "max_drawdown": 0.6737711687834669,
+      "sharpe": -1.293241528790562
+    },
+    "bh_scaled": {
+      "net_return": -0.1339808131811817,
+      "net_pnl": -13398.081318118171,
+      "max_drawdown": 0.14478368249529405,
+      "sharpe": -1.5356423753130684,
+      "scale_frac": 0.208667812558244
+    },
+    "neutral": {
+      "net_return": -0.29544068121980605,
+      "net_pnl": -29544.068121980603,
+      "max_drawdown": 0.356734229327625,
+      "sharpe": -1.5157348244354107,
+      "exposure_frac": 0.3133561643835616,
+      "blocks": 183
+    },
+    "target_eq_frac": 0.3202054794520548,
+    "contrasts": {
+      "delta_vs_neutral_pp": 17.6,
+      "delta_vs_bh_scaled_pp": 1.4,
+      "expectancy_breakout_vs_neutral": 61.72
+    }
+  },
+  "w2_directions": {
+    "long": {
+      "direction": "long",
+      "trades": 120,
+      "long_trades": 120,
+      "short_trades": 0,
+      "net_return": -0.11967169503481079,
+      "net_pnl": -11967.169503481075,
+      "expectancy": -99.7264,
+      "win_rate": 0.2333,
+      "profit_factor": 0.8421,
+      "max_drawdown": 0.23345548900923196,
+      "expectancy_decomp": {
+        "win_rate": 0.2333,
+        "avg_win": 2279.68,
+        "avg_loss_mag": 823.89,
+        "payoff_ratio": 2.767,
+        "expectancy": -99.73
+      },
+      "pnl_distribution": {
+        "n": 120,
+        "mean": -99.73,
+        "median": -837.43,
+        "std": 1675.18,
+        "skew": 2.696,
+        "min": -1000.43,
+        "max": 7410.2,
+        "quantiles": {
+          "q10": -965.08,
+          "q25": -889.7,
+          "q50": -836.5,
+          "q75": -8.23,
+          "q90": 2204.2
+        },
+        "wins": 28,
+        "losses": 92,
+        "gross_pos": 63831.03,
+        "gross_neg": 75798.2,
+        "concentration": {
+          "topK_gross_pos": 31108.83,
+          "topK_share_gross_pos": 0.4874,
+          "botK_gross_neg": 4977.08,
+          "botK_share_gross_neg": 0.0657
+        }
+      },
+      "by_side": {
+        "LONG": {
+          "trades": 120,
+          "net_pnl": -11967.17,
+          "expectancy": -99.73,
+          "win_rate": 0.2333
+        },
+        "SHORT": {
+          "trades": 0,
+          "net_pnl": 0,
+          "expectancy": null,
+          "win_rate": null
+        }
+      }
+    },
+    "short": {
+      "direction": "short",
+      "trades": 143,
+      "long_trades": 0,
+      "short_trades": 143,
+      "net_return": -0.011444759067610999,
+      "net_pnl": -1144.4759067611087,
+      "expectancy": -8.0033,
+      "win_rate": 0.2657,
+      "profit_factor": 0.989,
+      "max_drawdown": 0.14839485946897543,
+      "expectancy_decomp": {
+        "win_rate": 0.2657,
+        "avg_win": 2710.7,
+        "avg_loss_mag": 991.92,
+        "payoff_ratio": 2.7328,
+        "expectancy": -8.0
+      },
+      "pnl_distribution": {
+        "n": 143,
+        "mean": -8.0,
+        "median": -1007.3,
+        "std": 1932.52,
+        "skew": 1.962,
+        "min": -1123.14,
+        "max": 7398.64,
+        "quantiles": {
+          "q10": -1086.3,
+          "q25": -1057.32,
+          "q50": -1007.3,
+          "q75": 230.22,
+          "q90": 3068.36
+        },
+        "wins": 38,
+        "losses": 105,
+        "gross_pos": 103006.68,
+        "gross_neg": 104151.16,
+        "concentration": {
+          "topK_gross_pos": 31764.62,
+          "topK_share_gross_pos": 0.3084,
+          "botK_gross_neg": 5543.09,
+          "botK_share_gross_neg": 0.0532
+        }
+      },
+      "by_side": {
+        "LONG": {
+          "trades": 0,
+          "net_pnl": 0,
+          "expectancy": null,
+          "win_rate": null
+        },
+        "SHORT": {
+          "trades": 143,
+          "net_pnl": -1144.48,
+          "expectancy": -8.0,
+          "win_rate": 0.2657
+        }
+      }
+    },
+    "both": {
+      "direction": "both",
+      "trades": 239,
+      "long_trades": 107,
+      "short_trades": 132,
+      "net_return": -0.02670968817585806,
+      "net_pnl": -2670.9688175858,
+      "expectancy": -11.1756,
+      "win_rate": 0.2469,
+      "profit_factor": 0.9833,
+      "max_drawdown": 0.2732530870232808,
+      "expectancy_decomp": {
+        "win_rate": 0.2469,
+        "avg_win": 2662.64,
+        "avg_loss_mag": 887.59,
+        "payoff_ratio": 2.9998,
+        "expectancy": -11.18
+      },
+      "pnl_distribution": {
+        "n": 239,
+        "mean": -11.18,
+        "median": -902.32,
+        "std": 1992.33,
+        "skew": 3.409,
+        "min": -1088.58,
+        "max": 15689.77,
+        "quantiles": {
+          "q10": -998.22,
+          "q25": -964.99,
+          "q50": -902.32,
+          "q75": -2.4,
+          "q90": 2502.06
+        },
+        "wins": 59,
+        "losses": 180,
+        "gross_pos": 157095.75,
+        "gross_neg": 159766.72,
+        "concentration": {
+          "topK_gross_pos": 42257.31,
+          "topK_share_gross_pos": 0.269,
+          "botK_gross_neg": 5344.15,
+          "botK_share_gross_neg": 0.0334
+        }
+      },
+      "by_side": {
+        "LONG": {
+          "trades": 107,
+          "net_pnl": -14720.87,
+          "expectancy": -137.58,
+          "win_rate": 0.2336
+        },
+        "SHORT": {
+          "trades": 132,
+          "net_pnl": 12049.9,
+          "expectancy": 91.29,
+          "win_rate": 0.2576
+        }
+      }
+    }
+  },
+  "conclusion": {
+    "cause_class": "DIRECTIONAL_BETA_ADVERSA",
+    "market_regime_2022": "bear estructural: mercado -64.5% en 2022",
+    "extreme_trades": {
+      "botK_share_gross_neg": 0.0657,
+      "avg_stop_pnl_w2": -879.63,
+      "other_windows_botK_range": [
+        0.0605,
+        0.0622,
+        0.0711
+      ],
+      "note": "bottom-5 6.6% del gross negativo (rango otras ventanas 6.0%-7.1%) y el stop medio en 2022 es MENOR ($-880 vs $-1458 a $-1181 en resto): sin trades extremos."
+    },
+    "expectancy_decay": {
+      "win_rate": 0.2333,
+      "avg_win": 2279.68,
+      "avg_loss_mag": 823.89,
+      "median_trade": -837.43,
+      "skew": 2.696,
+      "note": "win rate 23% (vs 26%-32%), avg win $2280 (vs $5819) y avg loss $824 (MENOR que $1392 del resto): deterioro del lado ganador, no de las perdedoras."
+    },
+    "both_directions_2022": {
+      "long": {
+        "net_return": -0.11967169503481079,
+        "profit_factor": 0.8421,
+        "expectancy": -99.7264
+      },
+      "short": {
+        "net_return": -0.011444759067610999,
+        "profit_factor": 0.989,
+        "expectancy": -8.0033
+      },
+      "both": {
+        "net_return": -0.02670968817585806,
+        "profit_factor": 0.9833,
+        "expectancy": -11.1756
+      },
+      "note": "LONG-only -12.0%; con ambas direcciones juntas \u2248 -2.7% (PF 0.98): la logica breakout no desaparece en 2022; el filtro LONG concentra todo el riesgo de un bear estructural."
+    },
+    "mfe_mae": {
+      "ratio": 1.4232,
+      "median_mfe": 704.8,
+      "median_mae": 990.44,
+      "other_windows_ratio": [
+        1.6096,
+        2.1279,
+        1.5359
+      ],
+      "note": "MFE/MAE 1.42 (el mas bajo; resto 1.54-2.13): mediana MFE $705 < mediana MAE $990 -> sin follow-through alcista."
+    },
+    "time_vs_stop": {
+      "TIME": {
+        "win_rate": 0.7778,
+        "avg_pnl": 1720.06,
+        "net_pnl": 61922.07,
+        "trades": 36
+      },
+      "STOP": {
+        "win_rate": 0.0,
+        "avg_pnl": -879.63,
+        "net_pnl": -73889.24,
+        "trades": 84
+      },
+      "note": "TIME-exits wr 78% avg $1720 (en W1/W3/W4 ganan 87%-91% y aportan la mayoria del P&L)."
+    },
+    "costs": {
+      "costs_pct_equity": 0.00092,
+      "total_costs": 92.2,
+      "note": "0.09% del equity -> descartada."
+    },
+    "temporal_concentration": {
+      "negative_months": 7,
+      "total_months": 12,
+      "worst_month": "2022-01",
+      "note": "7/12 meses negativos, peor mes 2022-01 (-5056$); perdida repartida, no un evento."
+    },
+    "regimes": {
+      "rows": [
+        {
+          "regime": "BULL",
+          "trades": 25,
+          "win_rate": 0.28,
+          "expectancy": -250.25,
+          "net_pnl": -6256.15,
+          "avg_mae": 889.85,
+          "avg_mfe": 985.07,
+          "small_sample": false
+        },
+        {
+          "regime": "BEAR",
+          "trades": 44,
+          "win_rate": 0.2045,
+          "expectancy": -105.78,
+          "net_pnl": -4654.25,
+          "avg_mae": 909.1,
+          "avg_mfe": 1076.43,
+          "small_sample": false
+        },
+        {
+          "regime": "LATERAL",
+          "trades": 51,
+          "win_rate": 0.2353,
+          "expectancy": -20.72,
+          "net_pnl": -1056.77,
+          "avg_mae": 1009.65,
+          "avg_mfe": 1762.32,
+          "small_sample": false
+        }
+      ],
+      "note": "BULL n=25 E -250.25$ | BEAR n=44 E -105.78$ | LATERAL n=51 E -20.72$; perdida en los tres regimenes con muestras validas (>=10 cada uno)."
+    },
+    "benchmark_within_w2": {
+      "breakout_long": -0.11967169503481079,
+      "bh": -0.6420770483889777,
+      "bh_scaled": -0.1339808131811817,
+      "neutral": -0.29544068121980605,
+      "delta_vs_neutral_pp": 17.6,
+      "delta_vs_bh_scaled_pp": 1.4,
+      "note": "incluso perdiendo (-12.0%), LONG supera a B&H puro (-64.2%), a B&H escalado (-13.4%) y al control neutral (-29.5%) -> el timing no desaparece; la direccion es el problema."
+    },
+    "implication": "W2 no invalida el edge de timing: lo expone a la beta. La limitacion estructural es la restriccion LONG (H002) en mercados que pierden ~65%. Implicaciones abiertas (NO se implementan aqui; prohibido hasta el FINAL_OOS): (a) filtro direccional por regimen, (b) aceptar drawdown en bears, o (c) direction=both. Requiere nueva hipotesis documentada + FINAL_OOS limpio."
+  },
+  "decision": {
+    "state": "RESEARCH_REQUIRED",
+    "note": "Diagnostico; no cierra ciclo. La causa de W2 queda documentada: beta direccional adversa del filtro LONG en un bear estructural. H005 se evalua con el FINAL_OOS limpio cuando existan datos nuevos; no se tocan parametros."
+  }
+}

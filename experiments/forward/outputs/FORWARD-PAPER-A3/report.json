@@ -1,0 +1,181 @@
+{
+  "APROBADO": true,
+  "_meta": {
+    "config_hash": "cb639bbf55f0b1f25aee21841b7291e0de7d8e360580090e9dd987fba6d9653c",
+    "end": "2026-09-25T23:00:00Z",
+    "fix_fifo": "brokers.paper._avg_entry FIFO (solo neto abierto) - e5c5fc4",
+    "paperbroker": "PaperBrokerAdapter",
+    "provider": "BinanceVisionDailySource (binance.vision daily klines 1h)",
+    "run_id": "FORWARD-PAPER-A3",
+    "start": "2026-09-14T00:00:00Z",
+    "strategy_hash": "491ed76d79f1034452e98f72453141a4c69110cc8d487f166a89072df332687f",
+    "warmup_bars": 120,
+    "window_bars": 168,
+    "window_days": 7,
+    "window_start": "2026-09-19T00:00:00Z"
+  },
+  "adquisicion": {
+    "bars": 288,
+    "gaps": [],
+    "gaps_detectados": 0
+  },
+  "barras": {
+    "decisiones_riesgo": {
+      "APPROVED": 3,
+      "NOT_EVALUATED": 285
+    },
+    "fills_quantity_total": 1.505459,
+    "senales": {
+      "LONG": 3,
+      "NO_TRADE": 275,
+      "SIGNAL_WHILE_IN_POSITION": 10
+    },
+    "senales_ventana": {
+      "LONG": 2,
+      "NO_TRADE": 160,
+      "SIGNAL_WHILE_IN_POSITION": 6
+    },
+    "submission_status": {
+      "FILLED": 5
+    },
+    "total_records": 288,
+    "ventana_barras": 168
+  },
+  "criterios_aprobacion": {
+    "0_UNKNOWN_sin_resolver": true,
+    "0_discrepancias_reconciliacion_persistentes": true,
+    "0_duplicaciones_procesadas": true,
+    "0_procesamiento_fuera_de_orden_no_recuperado": true,
+    "final_oos_evidence_config_congelados": true,
+    "gaps_detectados_y_reconciliados": true,
+    "monitoring_coherente": true,
+    "ninguna_orden_atraviesa_kill_switch_bloqueado": true,
+    "outputs_reproducibles": true,
+    "paperbroker_exclusivo": true,
+    "restart_replay_determinista": true,
+    "sin_auto_recovery_del_latch_B5": true
+  },
+  "ejecucion": {
+    "barras_procesadas": 288,
+    "duplicados_replay": 0,
+    "out_of_order": 0,
+    "restarted_skips": 0
+  },
+  "equity": {
+    "equity_final": 101305.106284,
+    "mdd": -0.007566
+  },
+  "incidencias": [
+    {
+      "causa_raiz": "PaperBrokerAdapter._avg_entry promediaba TODOS los fills del lado de la posicion: los fills del trade 1 (ya cerrado) seguian influyendo en el avg del neto abierto tras reabrir (trade 2) -> divergencia con el avg interno del engine",
+      "comportamiento_correcto": "B4 detecta POSITION MISMATCH; B5 latchea y NO hace auto-recovery (fail-safe valido). El defecto era de representacion de estado del broker, no de B4/B5",
+      "descubierto_en": "Fase A2, barra 2026-09-21T10:00Z (idx 57)",
+      "fix": "FIFO por lotes sobre el neto abierto (brokers/paper.py) - commit e5c5fc4",
+      "id": "OP-DEFECT-A2-001",
+      "mismatch": "POSITION BTCUSDT 'precio medio de entrada divergente' internal=83760.0 broker=82411.18 (7 MATCH + 1 MISMATCH)",
+      "resultado_post_fix": "A2 168/168 RECONCILIATION_OK, kill switch ALLOW 168, 0 bloqueos",
+      "sintoma": "RECONCILIATION_BLOCKED -> kill switch latch (BLOCK_NEW_ORDERS, sin auto-recovery) durante toda la sesion continua",
+      "tests_regresion": [
+        "tests/test_broker_adapter.py::TestPositionsAndAccount::test_avg_entry_only_open_quantity_fifo",
+        "tests/test_forward_runner.py::test_multi_trade_session_keeps_reconciliation_ok"
+      ]
+    }
+  ],
+  "monitoring": {
+    "overall": {
+      "HEALTHY": 288
+    }
+  },
+  "operativa": {
+    "audit": {
+      "events": {
+        "BAR_CLOSED": 288,
+        "ENTRY_FILLED": 3,
+        "ENTRY_STAGED": 3,
+        "ENTRY_SUBMITTED": 3,
+        "EXIT_FILLED": 6,
+        "EXIT_STOP": 1,
+        "EXIT_SUBMITTED": 3,
+        "EXIT_TIME": 2,
+        "MONITORING": 288,
+        "POSITION_CLOSED": 3,
+        "POSITION_OPENED": 3,
+        "RECONCILIATION": 288,
+        "RISK_DECISION": 3,
+        "SIGNAL": 3,
+        "SIGNAL_WHILE_IN_POSITION": 10
+      },
+      "unknown_events": []
+    }
+  },
+  "posiciones": {
+    "broker": [],
+    "broker_abiertas": 0,
+    "position_final": 0.0
+  },
+  "reconciliacion": {
+    "bars_blocked": 0,
+    "bars_con_diffs": 288,
+    "bars_ok": 288,
+    "status": {
+      "RECONCILIATION_OK": 288
+    },
+    "status_ventana": {
+      "RECONCILIATION_OK": 168
+    }
+  },
+  "restart_replay": {
+    "byte_identical": true,
+    "duplicados_al_replay": 288,
+    "hashes": {
+      "audit.jsonl": "157c976bca603de086b47ed325562e12947f72d6e6cf20a948ce91b7564df3e6",
+      "bars.jsonl": "35da19ae2b9e2a80585785a587179e8ca4beb23def1691f1337dd8c039368c9a",
+      "records.ndjson": "9c8dc2e4651feb242b2892c23a9923bcff997d2939791bd60b173fad35be9709",
+      "snapshot.json": "c5b8f9deda316ca0bf7db6084e6288d3bd24b3af910124eb091c61b734fc5f74"
+    }
+  },
+  "riesgo": {
+    "barras_can_trade_false": 0,
+    "episodios_activacion": 0,
+    "kill_switch_estados": {
+      "ALLOW": 288
+    },
+    "kill_switch_ventana": {
+      "ALLOW": 168
+    },
+    "recuperaciones_latch": 0
+  },
+  "trades": {
+    "detalle": [
+      {
+        "entry_price": 77383.47,
+        "entry_time": "2026-09-18T05:00:00+00:00",
+        "exit_price": 80432.4,
+        "exit_reason": "TIME",
+        "pnl": 1118.559084
+      },
+      {
+        "entry_price": 81607.72,
+        "entry_time": "2026-09-21T02:00:00+00:00",
+        "exit_price": 80889.88571428572,
+        "exit_reason": "STOP",
+        "pnl": -252.796398
+      },
+      {
+        "entry_price": 83759.99999999999,
+        "entry_time": "2026-09-21T10:00:00+00:00",
+        "exit_price": 85854.33000000002,
+        "exit_reason": "TIME",
+        "pnl": 439.343598
+      }
+    ],
+    "exit_reasons": {
+      "STOP": 1,
+      "TIME": 2
+    },
+    "losses": 1,
+    "pnl_total": 1305.106284,
+    "trades": 3,
+    "wins": 2
+  }
+}

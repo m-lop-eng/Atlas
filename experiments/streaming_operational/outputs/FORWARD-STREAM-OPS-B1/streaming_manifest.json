@@ -1,0 +1,49 @@
+{
+  "backfill": {
+    "auth": "none",
+    "endpoint": "/api/v3/klines",
+    "error_translation": "DataFetchError -> ConnectionError",
+    "host": "https://api.binance.com",
+    "on_unrecoverable": "BLOCKED/UNRECOVERABLE -> B1 DEGRADED, sin emision",
+    "policy": "reconcile_open_ended / IntegrityBackfillProvider",
+    "source": "binance-rest-klines"
+  },
+  "binance_interval": "1h",
+  "created_at": "2026-10-02T20:53:13.931984+00:00",
+  "data_source": "binance-websocket",
+  "integrity": {
+    "authority": "LiveDataEngine (B1)",
+    "clears_on": "IntegrityReport.ok (HEALTHY)",
+    "warm_start": "silencio (no emite, no observa S6)"
+  },
+  "interval_seconds": 3600,
+  "namespace": {
+    "artifacts": [
+      "bars.jsonl",
+      "records.ndjson",
+      "audit.jsonl",
+      "snapshot.json",
+      "manifest.json",
+      "streaming_manifest.json",
+      "streaming_health.ndjson",
+      "ops_log.ndjson",
+      "incidents.ndjson",
+      "report_stream.json"
+    ],
+    "out_dir": "C:\\Users\\marke\\OneDrive\\Documentos\\Proyectos\\Robotrading\\Atlas\\experiments\\streaming_operational\\outputs\\FORWARD-STREAM-OPS-B1",
+    "run_id": "FORWARD-STREAM-OPS-B1"
+  },
+  "provider_name": "binance-websocket",
+  "run_id": "FORWARD-STREAM-OPS-B1",
+  "seed": {
+    "emission_sequence": 23,
+    "open_time": 1790967600,
+    "present": true
+  },
+  "strategy": {
+    "config_hash": "cb639bbf55f0b1f25aee21841b7291e0de7d8e360580090e9dd987fba6d9653c",
+    "hash": "491ed76d79f1034452e98f72453141a4c69110cc8d487f166a89072df332687f"
+  },
+  "streaming_adapter": "BinanceStreamingAdapter",
+  "symbol": "BTCUSDT"
+}

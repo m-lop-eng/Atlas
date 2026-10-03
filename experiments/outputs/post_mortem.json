@@ -1,0 +1,14 @@
+[
+  {
+    "experiment_id": "exp-bb2cb3867462",
+    "experiment_type": "BASELINE",
+    "hypothesis": "h001-breakout",
+    "net_return": -0.212363
+  },
+  {
+    "experiment_id": "exp-241340f5d8fb",
+    "experiment_type": "BASELINE",
+    "hypothesis": "h002-real-btc-1h",
+    "net_return": -0.033926
+  }
+]

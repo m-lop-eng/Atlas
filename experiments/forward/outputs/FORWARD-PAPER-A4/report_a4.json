@@ -1,0 +1,100 @@
+{
+  "_meta": {
+    "generated_at": "2026-10-02T22:30:02.359740+00:00",
+    "modo": "forward continuo (ingesta incremental; B1 -> B2-B7)",
+    "provider": "BinanceVisionDailySource (binance.vision daily klines 1h)",
+    "run_id": "FORWARD-PAPER-A4",
+    "strategy_hash": "491ed76d79f1034452e98f72453141a4c69110cc8d487f166a89072df332687f"
+  },
+  "audit": {
+    "lineas_audit": 1327
+  },
+  "barras": {
+    "senales": {
+      "LONG": 6,
+      "NO_TRADE": 396,
+      "SIGNAL_WHILE_IN_POSITION": 15
+    },
+    "submission_status": {
+      "FILLED": 10
+    }
+  },
+  "ciclos": {
+    "gaps_detectados_b1": 0,
+    "proveedor_errores": 1,
+    "reconcile_rounds_total": 0,
+    "reinicios": 9,
+    "total": 10,
+    "ultimo": {
+      "at": "2026-10-02T22:30:02.359740+00:00",
+      "deduplicadas": 393,
+      "emitidas_b1": 417,
+      "engine_quality": "HEALTHY",
+      "engine_state": "CONNECTED",
+      "incidentes": 0,
+      "last_open_before": 1790809200,
+      "new_bars": 24,
+      "procesadas": 24,
+      "provider_error": null,
+      "reconcile_rounds": 0,
+      "restart": true,
+      "seed_start": "2026-10-01T00:00:00Z"
+    }
+  },
+  "ejecucion": {
+    "barras_totales": 417,
+    "deduplicadas_total": 2817,
+    "primera_barra": "2026-09-14T16:00:00+00:00",
+    "procesadas_total": 417,
+    "ultima_barra": "2026-10-02T00:00:00+00:00"
+  },
+  "equity": {
+    "equity_final": 100792.941676,
+    "mdd": -0.010241
+  },
+  "incidentes": {
+    "por_tipo": {
+      "PROVIDER_ERROR": 1
+    },
+    "total": 1,
+    "ultimos": [
+      {
+        "at": "2026-09-28T00:32:00.275074+00:00",
+        "error": "No se pudo descargar https://data.binance.vision/data/spot/daily/klines/BTCUSDT/1h/BTCUSDT-1h-2026-09-27.zip: <urlopen error [Errno 11001] getaddrinfo failed>",
+        "kind": "PROVIDER_ERROR"
+      }
+    ]
+  },
+  "integridad": {
+    "bars_igual_records": true,
+    "manifest_outputs_presentes": true,
+    "ok": true
+  },
+  "monitoring": {
+    "overall": {
+      "HEALTHY": 417
+    }
+  },
+  "posiciones": {
+    "position_final": 0.2242696463435201,
+    "reconciliacion_posicion": "RECONCILIATION_OK"
+  },
+  "reconciliacion": {
+    "bars_blocked": 0,
+    "bars_con_diffs": 417,
+    "status": {
+      "RECONCILIATION_OK": 417
+    }
+  },
+  "riesgo": {
+    "barras_can_trade_false": 0,
+    "episodios_activacion": 0,
+    "kill_switch_estados": {
+      "ALLOW": 417
+    },
+    "ordenes_atravesando_bloqueo": 0
+  },
+  "unknown": {
+    "abiertos": 0
+  }
+}

@@ -1,0 +1,142 @@
+{
+  "_meta": {
+    "bars_expected": 168,
+    "end": "2026-09-25T23:00:00Z",
+    "fix_applied": "brokers.paper._avg_entry FIFO (solo neto abierto)",
+    "provider": "BinanceVisionDailySource (binance.vision daily klines 1h)",
+    "run_id": "FORWARD-PAPER-A2",
+    "start": "2026-09-19T00:00:00Z",
+    "strategy_hash": "491ed76d79f1034452e98f72453141a4c69110cc8d487f166a89072df332687f",
+    "window": "2026-09-24T00:00:00+00:00 -> 2026-09-25T23:00:00+00:00"
+  },
+  "adquisicion": {
+    "bars": 168,
+    "gaps": [],
+    "gaps_detectados": 0
+  },
+  "barras": {
+    "decisiones_riesgo": {
+      "APPROVED": 2,
+      "NOT_EVALUATED": 166
+    },
+    "fills_quantity_total": 0.763184,
+    "order_intent": {
+      "ENTRY:atlas-breakout:BTCUSDT:1789948800": 1,
+      "ENTRY:atlas-breakout:BTCUSDT:1789977600": 2,
+      "EXIT:EXIT:atlas-breakout:BTCUSDT:1789948800": 1,
+      "EXIT:EXIT:atlas-breakout:BTCUSDT:1789977600": 1
+    },
+    "reason_riesgo_no_vacio": 166,
+    "senales": {
+      "LONG": 2,
+      "NO_TRADE": 161,
+      "SIGNAL_WHILE_IN_POSITION": 5
+    },
+    "submission_status": {
+      "FILLED": 3
+    },
+    "total_records": 168,
+    "ventana_24h_barras": 48
+  },
+  "ejecucion": {
+    "barras_procesadas": 168,
+    "duplicados_replay": 0,
+    "restarted_skips": 0
+  },
+  "equity": {
+    "equity_final": 100184.483641,
+    "mdd": -0.003425,
+    "ultimo_punto": "2026-09-25T23:00:00Z"
+  },
+  "monitoring": {
+    "overall": {
+      "HEALTHY": 168
+    }
+  },
+  "operativa": {
+    "audit": {
+      "events": {
+        "BAR_CLOSED": 168,
+        "ENTRY_FILLED": 2,
+        "ENTRY_STAGED": 2,
+        "ENTRY_SUBMITTED": 2,
+        "EXIT_FILLED": 4,
+        "EXIT_STOP": 1,
+        "EXIT_SUBMITTED": 2,
+        "EXIT_TIME": 1,
+        "MONITORING": 168,
+        "POSITION_CLOSED": 2,
+        "POSITION_OPENED": 2,
+        "RECONCILIATION": 168,
+        "RISK_DECISION": 2,
+        "SIGNAL": 2,
+        "SIGNAL_WHILE_IN_POSITION": 5
+      },
+      "unknown_events": []
+    }
+  },
+  "posiciones": {
+    "posiciones_broker": [],
+    "posiciones_broker_abiertas": 0,
+    "position_final": 0.0
+  },
+  "reconciliacion": {
+    "bars_con_diffs": 168,
+    "bars_reconciliation_blocked": 0,
+    "bars_reconciliation_ok": 168,
+    "primera_bar_blocked": null,
+    "status": {
+      "RECONCILIATION_OK": 168
+    }
+  },
+  "restart_replay": {
+    "byte_identical": true,
+    "dummy_replay_ok": null,
+    "duplicados_al_replay": 0,
+    "hashes_antes": {
+      "audit.jsonl": "e8ebd6a9d0b299d521d93ce9451dc6d02005bec5c55ff5183243006ebba91377",
+      "bars.jsonl": "ad8fd8aef409f0dcd63b6b03d174bd708e708668d1761ab7f2f611c2e6c0b447",
+      "records.ndjson": "c57235ead86c41875bfe07740339365062d6f86350cd11cbe1248d7bab85d386",
+      "snapshot.json": "04f38783b0b74b50050f24c72fb3174d24c9fea93381bf91e9c1b4023c5e5324"
+    },
+    "hashes_despues": {
+      "audit.jsonl": "e8ebd6a9d0b299d521d93ce9451dc6d02005bec5c55ff5183243006ebba91377",
+      "bars.jsonl": "ad8fd8aef409f0dcd63b6b03d174bd708e708668d1761ab7f2f611c2e6c0b447",
+      "records.ndjson": "c57235ead86c41875bfe07740339365062d6f86350cd11cbe1248d7bab85d386",
+      "snapshot.json": "04f38783b0b74b50050f24c72fb3174d24c9fea93381bf91e9c1b4023c5e5324"
+    }
+  },
+  "riesgo": {
+    "barras_can_trade_false": 0,
+    "episodios_activacion_kill_switch": 0,
+    "kill_switch_estados": {
+      "ALLOW": 168
+    }
+  },
+  "trades": {
+    "entry_exit": [
+      {
+        "entry_price": 81607.72,
+        "entry_time": "2026-09-21T02:00:00+00:00",
+        "exit_price": 80889.88571428572,
+        "exit_reason": "STOP",
+        "pnl": -250.0
+      },
+      {
+        "entry_price": 83760.0,
+        "entry_time": "2026-09-21T10:00:00+00:00",
+        "exit_price": 85854.33,
+        "exit_reason": "TIME",
+        "pnl": 434.483641
+      }
+    ],
+    "exit_reasons": {
+      "STOP": 1,
+      "TIME": 1
+    },
+    "losses": 1,
+    "pnl_total": 184.483641,
+    "trades": 2,
+    "wins": 1
+  }
+}

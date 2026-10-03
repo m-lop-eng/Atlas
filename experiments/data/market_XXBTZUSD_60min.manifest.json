@@ -1,0 +1,11 @@
+{
+  "source": "kraken/public/ohlc",
+  "pair": "XXBTZUSD",
+  "interval_seconds": 60,
+  "since": 1785542400,
+  "until": 1789754400,
+  "bars": 721,
+  "csv_path": "C:\\Users\\marke\\OneDrive\\Documentos\\Proyectos\\Robotrading\\Atlas\\experiments\\data\\market_XXBTZUSD_60min.csv",
+  "sha256": "0c3e3192955f8f267d159506aa75f52b2657fba34113cf9bd0280133253bc9b1",
+  "fetched_at": "2026-09-18T18:18:45.289456+00:00"
+}

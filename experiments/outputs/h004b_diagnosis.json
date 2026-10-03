@@ -1,0 +1,1230 @@
+{
+  "hypothesis": "H004-B: la inestabilidad temporal observada en H004 (W2/W3) es LOCALIZADA en su vecindad o SISTEMATICA a traves de ventanas trimestrales re-ancladas.",
+  "method": "Diagnostico de estrategia fija x 12 ventanas trimestrales consecutivas re-ancladas (2021-04-01 -> 2024-04-01), cold-start por ventana, sin recalibracion ni seleccion. Esquema, criterios y configuracion congelados en H004B_PRE_REGISTRATION.json.",
+  "lineage": {
+    "hypothesis_id": "H004-B",
+    "parent_hypothesis": "H004",
+    "strategy_id": "atlas-breakout",
+    "params": {
+      "lookback": 20,
+      "atr_period": 14,
+      "stop_atr_mult": 2.0,
+      "direction": "long"
+    },
+    "strategy_config_hash": "491ed76d79f1034452e98f72453141a4c69110cc8d487f166a89072df332687f",
+    "parameters_changed": false,
+    "optimization_performed": false,
+    "scheme_frozen": true,
+    "criteria_frozen": true,
+    "previous_oos_consumed": true,
+    "final_oos_consumed": false,
+    "final_oos_status": "BLOCKED_BY_DATA_AVAILABILITY"
+  },
+  "pre_registration_snapshot": {
+    "id": "H004B_PRE_REGISTRATION",
+    "titulo": "Pre-registro: re-anclaje de ventanas temporales para diagnosticar la inestabilidad de H004",
+    "pregunta": "La inestabilidad observada en H004 (W2 neta en los 3 regimenes; W3 concentra 63.7% del P&L positivo) es un fenomeno LOCALIZADO en la vecindad 2022-2023 o aparece SISTEMATICAMENTE a traves de ventanas temporales?",
+    "no_reformula_la_pregunta": "H004-B es un DIAGNOSTICO de ubicacion temporal de la inestabilidad. NO responde 'que configuracion funciona mejor', NO selecciona variantes y NO optimiza. No se interpreta como evidencia a favor o en contra de modificar la estrategia; solo caracteriza el patron temporal.",
+    "clasificacion": "DIAGNOSTICO",
+    "tipo_de_ejercicio": "EVALUACION_DE_ESTRATEGIA_FIJA_POR_VENTANA",
+    "nota_sobre_tipo": "El boceto inicial rotulaba el eje como TRAIN -> VALIDATION; ese rotulo se corrige: NO hay walk-forward que recalibre (no hay train que seleccione ni recalibracion por ventana). Es la ESTRATEGIA CONGELADA evaluada sobre 12 ventanas independientes (fixed strategy x window), mismas metricas y benchmarks que e9/e10. El historico previo solo es el necesario para el warm-up de indicadores, computado por el engine en frio al inicio de cada ventana, identico a e9 _run(cfg, valid_bars).",
+    "estado": "AUTHORIZED",
+    "ciclo_estado": [
+      "PRE_REGISTERED",
+      "VALIDATED",
+      "AUTHORIZED",
+      "RUN_IN_PROGRESS",
+      "COMPLETE"
+    ],
+    "estrategia": {
+      "fuente": "experiments/h002/config.yaml",
+      "hash_config": "491ed76d79f1034452e98f72453141a4c69110cc8d487f166a89072df332687f",
+      "parametros_congelados": {
+        "lookback": 20,
+        "atr_period": 14,
+        "stop_atr_mult": 2.0,
+        "direction": "long",
+        "trend_filter": null,
+        "invert": false,
+        "risk_per_trade": 0.01,
+        "initial_equity": 100000.0,
+        "max_bars_in_trade": 48,
+        "point_value": 1.0,
+        "interval_seconds": 3600
+      },
+      "costes": {
+        "per_side": 0.15,
+        "slippage_per_side": 0.0005,
+        "commission_per_side": 0.001
+      }
+    },
+    "esquema_de_folds": {
+      "cantidad_congelada": 12,
+      "granularidad": "TRIMESTRAL_CALENDARIO",
+      "nota_cantidad_vs_intervalo": "12 es la CIFRA CONGELADA del esquema. NO representa el intervalo completo 2021-04-01 -> 2024-09-30 (esa grilla serian 14 trimestres: 2021Q2..2024Q3). El esquema usa 12 (2021Q2..2024Q1) y deja 2024Q2 (2024-04 -> 2024-07) y 2024Q3 (2024-07 -> 2024-10) FUERA por diseno: (a) mantiene exactamente 3 anos calendario alineados a limites de trimestre; (b) evita ventanas cuyo final roza la frontera de OBSERVED. Cambiar la cifra o los limites modifica este pre-registro ANTES de correr; JAMAS despues de ver resultados.",
+      "semantica_de_limite_inclusion": "MITAD_ABIERTA [start, end): una barra con open-time ts pertenece a la ventana sii start <= ts < end. El instante compartido entre dos ventanas consecutivas pertenece a la posterior. Igual que _slice() de e9/e10 (start_ts <= ts < end_ts).",
+      "train": {
+        "tipo": "EXPANDING_COLD_START_SIN_SELECCION",
+        "inicio_epoch": 1546300800,
+        "iso_inicio": "2019-01-01T00:00:00Z",
+        "nota": "El historico 2019-01-01 en adelante es solo el limite conceptual del tramo DEVELOPMENT; no se usa para recalibrar. El engine arranca en frio al inicio de cada ventana."
+      },
+      "folds": [
+        {
+          "fold": "F1",
+          "label": "2021Q2",
+          "start_epoch": 1617235200,
+          "end_epoch": 1625097600,
+          "iso_start": "2021-04-01T00:00:00Z",
+          "iso_end": "2021-07-01T00:00:00Z",
+          "span_days": 91
+        },
+        {
+          "fold": "F2",
+          "label": "2021Q3",
+          "start_epoch": 1625097600,
+          "end_epoch": 1633046400,
+          "iso_start": "2021-07-01T00:00:00Z",
+          "iso_end": "2021-10-01T00:00:00Z",
+          "span_days": 92
+        },
+        {
+          "fold": "F3",
+          "label": "2021Q4",
+          "start_epoch": 1633046400,
+          "end_epoch": 1640995200,
+          "iso_start": "2021-10-01T00:00:00Z",
+          "iso_end": "2022-01-01T00:00:00Z",
+          "span_days": 92
+        },
+        {
+          "fold": "F4",
+          "label": "2022Q1",
+          "start_epoch": 1640995200,
+          "end_epoch": 1648771200,
+          "iso_start": "2022-01-01T00:00:00Z",
+          "iso_end": "2022-04-01T00:00:00Z",
+          "span_days": 90
+        },
+        {
+          "fold": "F5",
+          "label": "2022Q2",
+          "start_epoch": 1648771200,
+          "end_epoch": 1656633600,
+          "iso_start": "2022-04-01T00:00:00Z",
+          "iso_end": "2022-07-01T00:00:00Z",
+          "span_days": 91
+        },
+        {
+          "fold": "F6",
+          "label": "2022Q3",
+          "start_epoch": 1656633600,
+          "end_epoch": 1664582400,
+          "iso_start": "2022-07-01T00:00:00Z",
+          "iso_end": "2022-10-01T00:00:00Z",
+          "span_days": 92
+        },
+        {
+          "fold": "F7",
+          "label": "2022Q4",
+          "start_epoch": 1664582400,
+          "end_epoch": 1672531200,
+          "iso_start": "2022-10-01T00:00:00Z",
+          "iso_end": "2023-01-01T00:00:00Z",
+          "span_days": 92
+        },
+        {
+          "fold": "F8",
+          "label": "2023Q1",
+          "start_epoch": 1672531200,
+          "end_epoch": 1680307200,
+          "iso_start": "2023-01-01T00:00:00Z",
+          "iso_end": "2023-04-01T00:00:00Z",
+          "span_days": 90
+        },
+        {
+          "fold": "F9",
+          "label": "2023Q2",
+          "start_epoch": 1680307200,
+          "end_epoch": 1688169600,
+          "iso_start": "2023-04-01T00:00:00Z",
+          "iso_end": "2023-07-01T00:00:00Z",
+          "span_days": 91
+        },
+        {
+          "fold": "F10",
+          "label": "2023Q3",
+          "start_epoch": 1688169600,
+          "end_epoch": 1696118400,
+          "iso_start": "2023-07-01T00:00:00Z",
+          "iso_end": "2023-10-01T00:00:00Z",
+          "span_days": 92
+        },
+        {
+          "fold": "F11",
+          "label": "2023Q4",
+          "start_epoch": 1696118400,
+          "end_epoch": 1704067200,
+          "iso_start": "2023-10-01T00:00:00Z",
+          "iso_end": "2024-01-01T00:00:00Z",
+          "span_days": 92
+        },
+        {
+          "fold": "F12",
+          "label": "2024Q1",
+          "start_epoch": 1704067200,
+          "end_epoch": 1711929600,
+          "iso_start": "2024-01-01T00:00:00Z",
+          "iso_end": "2024-04-01T00:00:00Z",
+          "span_days": 91
+        }
+      ],
+      "invariantes_mecanicas": [
+        "len(folds) == 12",
+        "consecutivos: start_epoch(F_{k+1}) == end_epoch(F_k)",
+        "start_epoch(F1) == 1617235200 (2021-04-01 00:00 UTC)",
+        "end_epoch(F12) == 1711929600 (2024-04-01 00:00 UTC) < frontera DEV (1727787600)",
+        "cada ventana == 1 trimestre calendario (90/91/92 dias) alineado a limite de trimestre en 00:00 UTC",
+        "ningun fold toca OBSERVED ni FINAL_OOS",
+        "cada fold queda cubierto por el dataset del manifest (first_ts <= 1617235200 y last_ts >= 1711929600 - 3600)",
+        "cada start_epoch/end_epoch coincide con lo derivado de su iso_start/iso_end (validacion en tests/test_h004b_scheme.py)"
+      ]
+    },
+    "semantica_de_ejecucion": {
+      "warm_up": "El engine arranca en frio al inicio de la ventana (como e9/e10). Breakout no emite senal mientras len(bars) <= lookback (20); ATR necesita al menos atr_period (14) barras. En una ventana de ~2180 barras el warm-up (~34 barras) no produce trades; se documenta, no se descarta.",
+      "primera_barra": "La barra con open-time == start_epoch se trata como cualquier otra: se incluye en la ventana (limite inferior incluido) y solo luego del warm-up puede generar senal de entrada. No hay relleno ni rescate parcial de ventana.",
+      "regimen": "research/benchmarking.classify_regimes: SMA de cierres de 720 barras (~30 dias en 1h) y banda +-5%; BULL si r > +5%, BEAR si r < -5%, LATERAL en otro caso. Las primeras 719 barras usan SMA parcial segun la regla del propio funcion (etiquetadas LATERAL cuando aplica). Variable de ANALISIS, nunca parametro de la estrategia.",
+      "metricas_agregadas": {
+        "net_return_pct": "reporting.curve_metrics(barras de la ventana).net_return respecto a initial_equity.",
+        "profit_factor": "reporting.metrics.calculate_metrics.profit_factor (gross_wins / gross_losses)",
+        "n_trades": "reporting.metrics.calculate_metrics.num_trades",
+        "delta_vs_neutral_pct": "net_return_pct(breakout en la ventana) - net_return_pct(control de exposicion temporal neutra)",
+        "delta_vs_bh_scaled_pct": "net_return_pct(breakout en la ventana) - net_return_pct(B&H escalado a la exposicion de capital)",
+        "mfe_mae_ratio": "reporting.metrics.calculate_metrics.mfe_mae_ratio == avg_mfe / avg_mae (medias por trade)",
+        "time_exit_win_rate": "win rate de los trades con salida por max_bars_in_trade (TIME) dentro de la ventana"
+      },
+      "benchmarks": "Identicos a e9/e10 con initial_equity=100000, per_side=0.15, point_value=1.0 sobre las barras de la misma ventana: buy_and_hold (100% expuesto), exposure_scaled_buy_and_hold(exposure_frac = exposure_time * capital_exposure_cond), exposure_matched_long(target_exposure = exposure_time, offset=7, cycle_bars = max_bars_in_trade).",
+      "costes_de_benchmarks": "Mismos costes por lado que la estrategia (slippage 0.05 + comision 0.10 por unidad, per_side=0.15)."
+    },
+    "criterios_de_lectura_preregistrados": {
+      "definiciones": {
+        "fold_negativo": "net_return_pct < 0",
+        "fold_positivo": "net_return_pct >= 0",
+        "vecindad_negativa": "racha maxima de folds negativos consecutivos; dos rachas separadas por al menos un fold positivo son vecindades distintas",
+        "fuera_de_vecindad": "fold que no pertenece a ninguna vecindad negativa"
+      },
+      "precedencia": "Se evalua el orden exacto: 1) LOCALIZADO (requiere las tres condiciones), 2) SISTEMATICO, 3) si ninguno se cumple, INCONCLUSO. Se escribe UN solo veredicto en H004B_RESULT.",
+      "LOCALIZADO": "num_vecindades_negativas <= 2 AND count(fold_positivo) >= 9 AND (para todo fold fuera de vecindad: delta_vs_neutral_pct > 0)",
+      "SISTEMATICO": "num_vecindades_negativas >= 3 OR count(fold_positivo) <= 8",
+      "INCONCLUSO": "No cumple LOCALIZADO ni SISTEMATICO (caso limite de frontera); se reportan los numeros (vecindades, folds positivos, deltas) sin forzar una lectura."
+    },
+    "data_roles": {
+      "rango_total_diagnostico": {
+        "start_epoch": 1617235200,
+        "end_epoch": 1711929600
+      },
+      "pertenece_a": "DEVELOPMENT",
+      "frontera_development_registro": 1727787600,
+      "nota_frontera": "data_roles.json usa 1727787600 como fin de DEVELOPMENT/inicio de OBSERVED, que corresponde a 2024-10-01 13:00 UTC (no 00:00). Es una particularidad conocida del registro; no afecta a los folds (todos terminan en 1711929600, 2024-04-01 00:00 UTC).",
+      "guard_aplicados": [
+        "guard_final_oos",
+        "evidence.guard"
+      ],
+      "note": "Ningun fold toca el tramo OBSERVED (desde 2024-10-01) ni el FINAL_OOS (BLOCKED). El run debe pasar el guard de DATA_ROLE + EVIDENCE antes de ejecutarse."
+    },
+    "validacion_mecanica": {
+      "archivo": "tests/test_h004b_scheme.py",
+      "checks": [
+        "epochs de cada fold == iso (UTC)",
+        "12 folds consecutivos y sin solape",
+        "F1 inicia 2021-04-01 00:00 UTC (1617235200)",
+        "F12 termina 2024-04-01 00:00 UTC (1711929600)",
+        "cada ventana dentro de DEVELOPMENT y sin tocar OBSERVED/FINAL_OOS",
+        "cada ventana cubierta por el dataset del manifest"
+      ]
+    },
+    "ejecucion": {
+      "estado": "RUN_IN_PROGRESS",
+      "autorizacion_requerida": true,
+      "gate": "Se corre unicamente si: (a) la validacion mecanica pasa, (b) el esquema sigue identico a este archivo, (c) hay autorizacion explicita. Tras el run los resultados van a una decision separada (H004B_RESULT) sin modificar este archivo.",
+      "note": "Pre-registrado y congelado. Autorizado para ejecutar una unica vez; el esquema, criterios y configuracion no se modifican."
+    }
+  },
+  "folds": [
+    {
+      "label": "2021Q2",
+      "range": [
+        1617235200,
+        1625097600
+      ],
+      "iso_range": [
+        "2021-04-01T00:00:00Z",
+        "2021-07-01T00:00:00Z"
+      ],
+      "bars": 2179,
+      "metricas": {
+        "net_return_pct": -4.6144,
+        "net_pnl": -4614.44,
+        "max_drawdown": 0.12165118713073754,
+        "expectancy": -144.2011,
+        "expectancy_r": -0.15629927332231297,
+        "profit_factor": 0.7727,
+        "num_trades": 32,
+        "win_rate": 0.3125,
+        "sharpe": -1.0390202235067565,
+        "sortino": -0.9785767765186731,
+        "calmar": -1.4228138932250238,
+        "exposure_time": 0.39880679210647085,
+        "capital_exposure_cond": 0.372310239900556,
+        "avg_mae": 904.6929,
+        "avg_mfe": 1120.8229,
+        "mfe_mae_ratio": 1.2389,
+        "time_exit_win_rate": 0.9091,
+        "delta_vs_neutral_pct": -6.5618,
+        "delta_vs_bh_scaled_pct": 1.3751
+      },
+      "regimen": [
+        {
+          "regime": "BULL",
+          "trades": 1,
+          "win_rate": 0.0,
+          "profit_factor": 0.0,
+          "net_pnl": -998.0756981863211
+        },
+        {
+          "regime": "BEAR",
+          "trades": 15,
+          "win_rate": 0.4,
+          "profit_factor": 0.972700304197144,
+          "net_pnl": -228.32625615911314
+        },
+        {
+          "regime": "LATERAL",
+          "trades": 16,
+          "win_rate": 0.25,
+          "profit_factor": 0.6901759486143778,
+          "net_pnl": -3388.033526957884
+        }
+      ],
+      "benchmarks": {
+        "bh": {
+          "net_return_pct": -0.4033874332518549,
+          "net_pnl": -40338.74332518549,
+          "max_drawdown": 0.5472246732053976
+        },
+        "bh_scaled": {
+          "net_return_pct": -0.059894906566648864,
+          "net_pnl": -5989.490656664886,
+          "max_drawdown": 0.08802802751335846
+        },
+        "neutral": {
+          "net_return_pct": 0.019473749856629308,
+          "net_pnl": 1947.3749856629308,
+          "max_drawdown": 0.08180986449436102
+        },
+        "bh_scaled_frac": 0.14847985244313133,
+        "neutral_target_frac": 0.39880679210647085
+      },
+      "clasificacion_de_ventana": "NEGATIVA"
+    },
+    {
+      "label": "2021Q3",
+      "range": [
+        1625097600,
+        1633046400
+      ],
+      "iso_range": [
+        "2021-07-01T00:00:00Z",
+        "2021-10-01T00:00:00Z"
+      ],
+      "bars": 2202,
+      "metricas": {
+        "net_return_pct": 5.4414,
+        "net_pnl": 5441.39,
+        "max_drawdown": 0.08704160781784666,
+        "expectancy": 151.1498,
+        "expectancy_r": 0.15202947293630403,
+        "profit_factor": 1.238,
+        "num_trades": 36,
+        "win_rate": 0.3611,
+        "sharpe": 1.05322464969307,
+        "sortino": 1.0433676215901448,
+        "calmar": 2.6978541291291727,
+        "exposure_time": 0.49682107175295187,
+        "capital_exposure_cond": 0.5103371279446788,
+        "avg_mae": 1087.9381,
+        "avg_mfe": 1728.4929,
+        "mfe_mae_ratio": 1.5888,
+        "time_exit_win_rate": 0.8571,
+        "delta_vs_neutral_pct": -1.2646,
+        "delta_vs_bh_scaled_pct": -0.91
+      },
+      "regimen": [
+        {
+          "regime": "BULL",
+          "trades": 19,
+          "win_rate": 0.42105263157894735,
+          "profit_factor": 1.620059939585478,
+          "net_pnl": 6906.887861241499
+        },
+        {
+          "regime": "BEAR",
+          "trades": 4,
+          "win_rate": 0.5,
+          "profit_factor": 1.907438775969696,
+          "net_pnl": 1926.338760214954
+        },
+        {
+          "regime": "LATERAL",
+          "trades": 13,
+          "win_rate": 0.23076923076923078,
+          "profit_factor": 0.6468685813537985,
+          "net_pnl": -3391.8350789951214
+        }
+      ],
+      "benchmarks": {
+        "bh": {
+          "net_return_pct": 0.25050078470537884,
+          "net_pnl": 25050.078470537883,
+          "max_drawdown": 0.23131560970055795
+        },
+        "bh_scaled": {
+          "net_return_pct": 0.06351353179372765,
+          "net_pnl": 6351.353179372765,
+          "max_drawdown": 0.07820417712382911
+        },
+        "neutral": {
+          "net_return_pct": 0.06706027775328383,
+          "net_pnl": 6706.027775328383,
+          "max_drawdown": 0.10220354321104666
+        },
+        "bh_scaled_frac": 0.25354623886079863,
+        "neutral_target_frac": 0.49682107175295187
+      },
+      "clasificacion_de_ventana": "POSITIVA"
+    },
+    {
+      "label": "2021Q4",
+      "range": [
+        1633046400,
+        1640995200
+      ],
+      "iso_range": [
+        "2021-10-01T00:00:00Z",
+        "2022-01-01T00:00:00Z"
+      ],
+      "bars": 2208,
+      "metricas": {
+        "net_return_pct": -9.4491,
+        "net_pnl": -9449.1,
+        "max_drawdown": 0.14953881231875887,
+        "expectancy": -262.475,
+        "expectancy_r": -0.2719768653613228,
+        "profit_factor": 0.6624,
+        "num_trades": 36,
+        "win_rate": 0.1944,
+        "sharpe": -2.037157871380831,
+        "sortino": -1.9343099623713331,
+        "calmar": -2.177963094034925,
+        "exposure_time": 0.3990036231884058,
+        "capital_exposure_cond": 0.5102326840547367,
+        "avg_mae": 1009.5397,
+        "avg_mfe": 1290.4299,
+        "mfe_mae_ratio": 1.2782,
+        "time_exit_win_rate": 0.875,
+        "delta_vs_neutral_pct": -20.8926,
+        "delta_vs_bh_scaled_pct": -10.5626
+      },
+      "regimen": [
+        {
+          "regime": "BULL",
+          "trades": 17,
+          "win_rate": 0.058823529411764705,
+          "profit_factor": 0.19940186482872213,
+          "net_pnl": -13024.242185290303
+        },
+        {
+          "regime": "BEAR",
+          "trades": 10,
+          "win_rate": 0.3,
+          "profit_factor": 0.19329352088222584,
+          "net_pnl": -5416.586044325104
+        },
+        {
+          "regime": "LATERAL",
+          "trades": 9,
+          "win_rate": 0.3333333333333333,
+          "profit_factor": 2.7968130182533386,
+          "net_pnl": 8991.726915660327
+        }
+      ],
+      "benchmarks": {
+        "bh": {
+          "net_return_pct": 0.05469236542848788,
+          "net_pnl": 5469.236542848787,
+          "max_drawdown": 0.334712879345406
+        },
+        "bh_scaled": {
+          "net_return_pct": 0.011134528239630459,
+          "net_pnl": 1113.4528239630458,
+          "max_drawdown": 0.09569681461135095
+        },
+        "neutral": {
+          "net_return_pct": 0.11443490811679391,
+          "net_pnl": 11443.49081167939,
+          "max_drawdown": 0.082176111263373
+        },
+        "bh_scaled_frac": 0.20358468960698506,
+        "neutral_target_frac": 0.3990036231884058
+      },
+      "clasificacion_de_ventana": "NEGATIVA"
+    },
+    {
+      "label": "2022Q1",
+      "range": [
+        1640995200,
+        1648771200
+      ],
+      "iso_range": [
+        "2022-01-01T00:00:00Z",
+        "2022-04-01T00:00:00Z"
+      ],
+      "bars": 2160,
+      "metricas": {
+        "net_return_pct": -4.2654,
+        "net_pnl": -4265.42,
+        "max_drawdown": 0.0790148016905878,
+        "expectancy": -133.2943,
+        "expectancy_r": -0.14977017216890529,
+        "profit_factor": 0.7822,
+        "num_trades": 32,
+        "win_rate": 0.3125,
+        "sharpe": -0.922299145221877,
+        "sortino": -0.8033168543161544,
+        "calmar": -2.052030296492722,
+        "exposure_time": 0.38101851851851853,
+        "capital_exposure_cond": 0.4898354634909222,
+        "avg_mae": 998.519,
+        "avg_mfe": 1253.0731,
+        "mfe_mae_ratio": 1.2549,
+        "time_exit_win_rate": 0.7692,
+        "delta_vs_neutral_pct": -12.2568,
+        "delta_vs_bh_scaled_pct": -3.98
+      },
+      "regimen": [
+        {
+          "regime": "BULL",
+          "trades": 11,
+          "win_rate": 0.45454545454545453,
+          "profit_factor": 0.8588822551998103,
+          "net_pnl": -830.4531098787302
+        },
+        {
+          "regime": "BEAR",
+          "trades": 6,
+          "win_rate": 0.16666666666666666,
+          "profit_factor": 1.4315149497441606,
+          "net_pnl": 1458.925813730983
+        },
+        {
+          "regime": "LATERAL",
+          "trades": 15,
+          "win_rate": 0.26666666666666666,
+          "profit_factor": 0.5255129809642479,
+          "net_pnl": -4893.890940057183
+        }
+      ],
+      "benchmarks": {
+        "bh": {
+          "net_return_pct": -0.015295044478289777,
+          "net_pnl": -1529.5044478289776,
+          "max_drawdown": 0.3071080487861015
+        },
+        "bh_scaled": {
+          "net_return_pct": -0.0028546117733962983,
+          "net_pnl": -285.46117733962984,
+          "max_drawdown": 0.05889659880605215
+        },
+        "neutral": {
+          "net_return_pct": 0.07991422125765713,
+          "net_pnl": 7991.422125765713,
+          "max_drawdown": 0.08409734100087746
+        },
+        "bh_scaled_frac": 0.18663638261714305,
+        "neutral_target_frac": 0.38101851851851853
+      },
+      "clasificacion_de_ventana": "NEGATIVA"
+    },
+    {
+      "label": "2022Q2",
+      "range": [
+        1648771200,
+        1656633600
+      ],
+      "iso_range": [
+        "2022-04-01T00:00:00Z",
+        "2022-07-01T00:00:00Z"
+      ],
+      "bars": 2184,
+      "metricas": {
+        "net_return_pct": -14.4306,
+        "net_pnl": -14430.58,
+        "max_drawdown": 0.14929221306925203,
+        "expectancy": -534.4658,
+        "expectancy_r": -0.6294485101136883,
+        "profit_factor": 0.2611,
+        "num_trades": 27,
+        "win_rate": 0.1481,
+        "sharpe": -3.8701334504253393,
+        "sortino": -2.4690926942951448,
+        "calmar": -3.1147716018513805,
+        "exposure_time": 0.288003663003663,
+        "capital_exposure_cond": 0.5345336889636247,
+        "avg_mae": 1074.3988,
+        "avg_mfe": 1062.8383,
+        "mfe_mae_ratio": 0.9892,
+        "time_exit_win_rate": 0.6667,
+        "delta_vs_neutral_pct": 5.3293,
+        "delta_vs_bh_scaled_pct": -5.7816
+      },
+      "regimen": [
+        {
+          "regime": "BULL",
+          "trades": 0,
+          "win_rate": null,
+          "profit_factor": null,
+          "net_pnl": 0
+        },
+        {
+          "regime": "BEAR",
+          "trades": 17,
+          "win_rate": 0.17647058823529413,
+          "profit_factor": 0.4003683649818246,
+          "net_pnl": -6659.8163179390895
+        },
+        {
+          "regime": "LATERAL",
+          "trades": 10,
+          "win_rate": 0.1,
+          "profit_factor": 0.07741667646137822,
+          "net_pnl": -7770.760206240056
+        }
+      ],
+      "benchmarks": {
+        "bh": {
+          "net_return_pct": -0.5618159385722148,
+          "net_pnl": -56181.59385722148,
+          "max_drawdown": 0.6209237973605789
+        },
+        "bh_scaled": {
+          "net_return_pct": -0.08649024933007499,
+          "net_pnl": -8649.024933007498,
+          "max_drawdown": 0.09818848105723531
+        },
+        "neutral": {
+          "net_return_pct": -0.19759870192991247,
+          "net_pnl": -19759.870192991246,
+          "max_drawdown": 0.2199752336373923
+        },
+        "bh_scaled_frac": 0.15394766042038457,
+        "neutral_target_frac": 0.288003663003663
+      },
+      "clasificacion_de_ventana": "NEGATIVA"
+    },
+    {
+      "label": "2022Q3",
+      "range": [
+        1656633600,
+        1664582400
+      ],
+      "iso_range": [
+        "2022-07-01T00:00:00Z",
+        "2022-10-01T00:00:00Z"
+      ],
+      "bars": 2208,
+      "metricas": {
+        "net_return_pct": -3.6415,
+        "net_pnl": -3641.51,
+        "max_drawdown": 0.148462242736349,
+        "expectancy": -110.3486,
+        "expectancy_r": -0.11338222068189868,
+        "profit_factor": 0.8664,
+        "num_trades": 33,
+        "win_rate": 0.1515,
+        "sharpe": -0.5482965411573179,
+        "sortino": -0.4027433219250144,
+        "calmar": -0.9223815603244867,
+        "exposure_time": 0.2726449275362319,
+        "capital_exposure_cond": 0.6018172135984599,
+        "avg_mae": 1146.4939,
+        "avg_mfe": 1637.7871,
+        "mfe_mae_ratio": 1.4285,
+        "time_exit_win_rate": 0.8333,
+        "delta_vs_neutral_pct": -4.2441,
+        "delta_vs_bh_scaled_pct": -3.2137
+      },
+      "regimen": [
+        {
+          "regime": "BULL",
+          "trades": 9,
+          "win_rate": 0.1111111111111111,
+          "profit_factor": 0.5173030228120293,
+          "net_pnl": -3515.895294762069
+        },
+        {
+          "regime": "BEAR",
+          "trades": 8,
+          "win_rate": 0.125,
+          "profit_factor": 1.307951023096655,
+          "net_pnl": 2122.4715003935576
+        },
+        {
+          "regime": "LATERAL",
+          "trades": 16,
+          "win_rate": 0.1875,
+          "profit_factor": 0.8280592763591679,
+          "net_pnl": -2248.0815684470053
+        }
+      ],
+      "benchmarks": {
+        "bh": {
+          "net_return_pct": -0.02607033021916827,
+          "net_pnl": -2607.033021916827,
+          "max_drawdown": 0.26200230197626423
+        },
+        "bh_scaled": {
+          "net_return_pct": -0.004277682627280455,
+          "net_pnl": -427.76826272804544,
+          "max_drawdown": 0.05160327902264998
+        },
+        "neutral": {
+          "net_return_pct": 0.006025545646412889,
+          "net_pnl": 602.5545646412888,
+          "max_drawdown": 0.13624613405283267
+        },
+        "bh_scaled_frac": 0.16408241059160908,
+        "neutral_target_frac": 0.2726449275362319
+      },
+      "clasificacion_de_ventana": "NEGATIVA"
+    },
+    {
+      "label": "2022Q4",
+      "range": [
+        1664582400,
+        1672531200
+      ],
+      "iso_range": [
+        "2022-10-01T00:00:00Z",
+        "2023-01-01T00:00:00Z"
+      ],
+      "bars": 2208,
+      "metricas": {
+        "net_return_pct": 11.1416,
+        "net_pnl": 11141.61,
+        "max_drawdown": 0.06766430276442961,
+        "expectancy": 412.6521,
+        "expectancy_r": 0.4138022218955365,
+        "profit_factor": 1.588,
+        "num_trades": 27,
+        "win_rate": 0.2963,
+        "sharpe": 1.8028829010089222,
+        "sortino": 1.5235892262146984,
+        "calmar": 7.700094786018225,
+        "exposure_time": 0.3242753623188406,
+        "capital_exposure_cond": 0.9866558355938002,
+        "avg_mae": 1034.791,
+        "avg_mfe": 2251.057,
+        "mfe_mae_ratio": 2.1754,
+        "time_exit_win_rate": 0.8,
+        "delta_vs_neutral_pct": -0.1353,
+        "delta_vs_bh_scaled_pct": 15.8867
+      },
+      "regimen": [
+        {
+          "regime": "BULL",
+          "trades": 2,
+          "win_rate": 0.0,
+          "profit_factor": 0.0,
+          "net_pnl": -1202.3052237949564
+        },
+        {
+          "regime": "BEAR",
+          "trades": 7,
+          "win_rate": 0.2857142857142857,
+          "profit_factor": 0.769402206392291,
+          "net_pnl": -1237.9694218092638
+        },
+        {
+          "regime": "LATERAL",
+          "trades": 18,
+          "win_rate": 0.3333333333333333,
+          "profit_factor": 2.09740480587641,
+          "net_pnl": 13581.881094580302
+        }
+      ],
+      "benchmarks": {
+        "bh": {
+          "net_return_pct": -0.1483070503912708,
+          "net_pnl": -14830.705039127079,
+          "max_drawdown": 0.2702352712406521
+        },
+        "bh_scaled": {
+          "net_return_pct": -0.04745057064195091,
+          "net_pnl": -4745.057064195091,
+          "max_drawdown": 0.09238517714785831
+        },
+        "neutral": {
+          "net_return_pct": 0.11276857208451019,
+          "net_pnl": 11276.85720845102,
+          "max_drawdown": 0.08481600908175067
+        },
+        "bh_scaled_frac": 0.31994817857117797,
+        "neutral_target_frac": 0.3242753623188406
+      },
+      "clasificacion_de_ventana": "POSITIVA"
+    },
+    {
+      "label": "2023Q1",
+      "range": [
+        1672531200,
+        1680307200
+      ],
+      "iso_range": [
+        "2023-01-01T00:00:00Z",
+        "2023-04-01T00:00:00Z"
+      ],
+      "bars": 2159,
+      "metricas": {
+        "net_return_pct": 56.4298,
+        "net_pnl": 56429.78,
+        "max_drawdown": 0.08953078294461786,
+        "expectancy": 1945.8545,
+        "expectancy_r": 1.6073526269170413,
+        "profit_factor": 3.4533,
+        "num_trades": 29,
+        "win_rate": 0.3448,
+        "sharpe": 5.3503108380969895,
+        "sortino": 5.470525526789625,
+        "calmar": 57.538438950691365,
+        "exposure_time": 0.3909217230199166,
+        "capital_exposure_cond": 1.0196001620868502,
+        "avg_mae": 1458.486,
+        "avg_mfe": 4886.7699,
+        "mfe_mae_ratio": 3.3506,
+        "time_exit_win_rate": 0.8333,
+        "delta_vs_neutral_pct": 30.0975,
+        "delta_vs_bh_scaled_pct": 27.6999
+      },
+      "regimen": [
+        {
+          "regime": "BULL",
+          "trades": 17,
+          "win_rate": 0.23529411764705882,
+          "profit_factor": 2.5122475534999986,
+          "net_pnl": 23428.018066517725
+        },
+        {
+          "regime": "BEAR",
+          "trades": 2,
+          "win_rate": 0.5,
+          "profit_factor": 17.88470999653224,
+          "net_pnl": 22065.123477959947
+        },
+        {
+          "regime": "LATERAL",
+          "trades": 10,
+          "win_rate": 0.5,
+          "profit_factor": 2.7633125261364917,
+          "net_pnl": 10936.6387466882
+        }
+      ],
+      "benchmarks": {
+        "bh": {
+          "net_return_pct": 0.7207989229689444,
+          "net_pnl": 72079.89229689444,
+          "max_drawdown": 0.21740843715487812
+        },
+        "bh_scaled": {
+          "net_return_pct": 0.28729881134568847,
+          "net_pnl": 28729.88113456885,
+          "max_drawdown": 0.10894991611131721
+        },
+        "neutral": {
+          "net_return_pct": 0.26332276799570375,
+          "net_pnl": 26332.276799570376,
+          "max_drawdown": 0.060508424122581804
+        },
+        "bh_scaled_frac": 0.39858385215437775,
+        "neutral_target_frac": 0.3909217230199166
+      },
+      "clasificacion_de_ventana": "POSITIVA"
+    },
+    {
+      "label": "2023Q2",
+      "range": [
+        1680307200,
+        1688169600
+      ],
+      "iso_range": [
+        "2023-04-01T00:00:00Z",
+        "2023-07-01T00:00:00Z"
+      ],
+      "bars": 2184,
+      "metricas": {
+        "net_return_pct": 4.292,
+        "net_pnl": 4291.95,
+        "max_drawdown": 0.16054749025831178,
+        "expectancy": 126.2339,
+        "expectancy_r": 0.12480724090988322,
+        "profit_factor": 1.1632,
+        "num_trades": 34,
+        "win_rate": 0.2353,
+        "sharpe": 0.7475267782878642,
+        "sortino": 0.5297072928431308,
+        "calmar": 1.144417368254754,
+        "exposure_time": 0.3218864468864469,
+        "capital_exposure_cond": 1.036601953522627,
+        "avg_mae": 1244.7385,
+        "avg_mfe": 2275.9909,
+        "mfe_mae_ratio": 1.8285,
+        "time_exit_win_rate": 1.0,
+        "delta_vs_neutral_pct": -0.2797,
+        "delta_vs_bh_scaled_pct": 1.9401
+      },
+      "regimen": [
+        {
+          "regime": "BULL",
+          "trades": 5,
+          "win_rate": 0.2,
+          "profit_factor": 0.2301104614007126,
+          "net_pnl": -3294.4461588285517
+        },
+        {
+          "regime": "BEAR",
+          "trades": 1,
+          "win_rate": 0.0,
+          "profit_factor": 0.0,
+          "net_pnl": -994.1827352467532
+        },
+        {
+          "regime": "LATERAL",
+          "trades": 28,
+          "win_rate": 0.25,
+          "profit_factor": 1.4081344564472145,
+          "net_pnl": 8580.580671289128
+        }
+      ],
+      "benchmarks": {
+        "bh": {
+          "net_return_pct": 0.0704835631799492,
+          "net_pnl": 7048.35631799492,
+          "max_drawdown": 0.19453140578104103
+        },
+        "bh_scaled": {
+          "net_return_pct": 0.023518117992834542,
+          "net_pnl": 2351.811799283454,
+          "max_drawdown": 0.0685670743858803
+        },
+        "neutral": {
+          "net_return_pct": 0.04571604631993487,
+          "net_pnl": 4571.604631993487,
+          "max_drawdown": 0.06791270466535027
+        },
+        "bh_scaled_frac": 0.3336681196549482,
+        "neutral_target_frac": 0.3218864468864469
+      },
+      "clasificacion_de_ventana": "POSITIVA"
+    },
+    {
+      "label": "2023Q3",
+      "range": [
+        1688169600,
+        1696118400
+      ],
+      "iso_range": [
+        "2023-07-01T00:00:00Z",
+        "2023-10-01T00:00:00Z"
+      ],
+      "bars": 2208,
+      "metricas": {
+        "net_return_pct": -24.5102,
+        "net_pnl": -24510.24,
+        "max_drawdown": 0.26532035254691516,
+        "expectancy": -662.4389,
+        "expectancy_r": -0.7895545822048614,
+        "profit_factor": 0.1408,
+        "num_trades": 37,
+        "win_rate": 0.0811,
+        "sharpe": -4.3661974051626,
+        "sortino": -2.611949212300605,
+        "calmar": -2.5346973260183474,
+        "exposure_time": 0.21875,
+        "capital_exposure_cond": 1.6782310014594073,
+        "avg_mae": 1157.9918,
+        "avg_mfe": 1120.1032,
+        "mfe_mae_ratio": 0.9673,
+        "time_exit_win_rate": 0.75,
+        "delta_vs_neutral_pct": -24.0996,
+        "delta_vs_bh_scaled_pct": -20.2819
+      },
+      "regimen": [
+        {
+          "regime": "BULL",
+          "trades": 0,
+          "win_rate": null,
+          "profit_factor": null,
+          "net_pnl": 0
+        },
+        {
+          "regime": "BEAR",
+          "trades": 4,
+          "win_rate": 0.0,
+          "profit_factor": 0.0,
+          "net_pnl": -3221.1704971501454
+        },
+        {
+          "regime": "LATERAL",
+          "trades": 33,
+          "win_rate": 0.09090909090909091,
+          "profit_factor": 0.15869920850176725,
+          "net_pnl": -21289.067824284986
+        }
+      ],
+      "benchmarks": {
+        "bh": {
+          "net_return_pct": -0.11517889051551933,
+          "net_pnl": -11517.889051551932,
+          "max_drawdown": 0.20835752440754146
+        },
+        "bh_scaled": {
+          "net_return_pct": -0.04228367166993452,
+          "net_pnl": -4228.367166993452,
+          "max_drawdown": 0.0782680667740286
+        },
+        "neutral": {
+          "net_return_pct": -0.004106117503050455,
+          "net_pnl": -410.61175030504546,
+          "max_drawdown": 0.061520567884146705
+        },
+        "bh_scaled_frac": 0.36711303156924535,
+        "neutral_target_frac": 0.21875
+      },
+      "clasificacion_de_ventana": "NEGATIVA"
+    },
+    {
+      "label": "2023Q4",
+      "range": [
+        1696118400,
+        1704067200
+      ],
+      "iso_range": [
+        "2023-10-01T00:00:00Z",
+        "2024-01-01T00:00:00Z"
+      ],
+      "bars": 2208,
+      "metricas": {
+        "net_return_pct": 25.9018,
+        "net_pnl": 25901.82,
+        "max_drawdown": 0.08322755343750705,
+        "expectancy": 835.5426,
+        "expectancy_r": 0.8017999707509071,
+        "profit_factor": 2.3082,
+        "num_trades": 31,
+        "win_rate": 0.3871,
+        "sharpe": 3.259476058518337,
+        "sortino": 3.2922016437697343,
+        "calmar": 17.967453140295873,
+        "exposure_time": 0.4329710144927536,
+        "capital_exposure_cond": 1.006249862752805,
+        "avg_mae": 1170.8815,
+        "avg_mfe": 3333.0132,
+        "mfe_mae_ratio": 2.8466,
+        "time_exit_win_rate": 0.8462,
+        "delta_vs_neutral_pct": -5.0405,
+        "delta_vs_bh_scaled_pct": 1.1457
+      },
+      "regimen": [
+        {
+          "regime": "BULL",
+          "trades": 17,
+          "win_rate": 0.29411764705882354,
+          "profit_factor": 2.2853911247666687,
+          "net_pnl": 16582.32003398182
+        },
+        {
+          "regime": "BEAR",
+          "trades": 0,
+          "win_rate": null,
+          "profit_factor": null,
+          "net_pnl": 0
+        },
+        {
+          "regime": "LATERAL",
+          "trades": 14,
+          "win_rate": 0.5,
+          "profit_factor": 2.350850793858348,
+          "net_pnl": 9319.499356582743
+        }
+      ],
+      "benchmarks": {
+        "bh": {
+          "net_return_pct": 0.5682214269633792,
+          "net_pnl": 56822.14269633792,
+          "max_drawdown": 0.08588768159068103
+        },
+        "bh_scaled": {
+          "net_return_pct": 0.2475610202208871,
+          "net_pnl": 24756.10202208871,
+          "max_drawdown": 0.04813447480797632
+        },
+        "neutral": {
+          "net_return_pct": 0.30942329170505656,
+          "net_pnl": 30942.329170505654,
+          "max_drawdown": 0.06780027857418469
+        },
+        "bh_scaled_frac": 0.43567702390927604,
+        "neutral_target_frac": 0.4329710144927536
+      },
+      "clasificacion_de_ventana": "POSITIVA"
+    },
+    {
+      "label": "2024Q1",
+      "range": [
+        1704067200,
+        1711929600
+      ],
+      "iso_range": [
+        "2024-01-01T00:00:00Z",
+        "2024-04-01T00:00:00Z"
+      ],
+      "bars": 2184,
+      "metricas": {
+        "net_return_pct": 23.0133,
+        "net_pnl": 23013.34,
+        "max_drawdown": 0.12128772466447775,
+        "expectancy": 621.9821,
+        "expectancy_r": 0.6044168400042174,
+        "profit_factor": 1.8283,
+        "num_trades": 37,
+        "win_rate": 0.2703,
+        "sharpe": 3.028733578684144,
+        "sortino": 2.794483727681859,
+        "calmar": 10.688497646660364,
+        "exposure_time": 0.42948717948717946,
+        "capital_exposure_cond": 0.8060970890068279,
+        "avg_mae": 1295.5919,
+        "avg_mfe": 2574.1765,
+        "mfe_mae_ratio": 1.9869,
+        "time_exit_win_rate": 0.8182,
+        "delta_vs_neutral_pct": -17.8598,
+        "delta_vs_bh_scaled_pct": -0.728
+      },
+      "regimen": [
+        {
+          "regime": "BULL",
+          "trades": 17,
+          "win_rate": 0.23529411764705882,
+          "profit_factor": 1.9496451914320803,
+          "net_pnl": 14737.556033497694
+        },
+        {
+          "regime": "BEAR",
+          "trades": 1,
+          "win_rate": 0.0,
+          "profit_factor": 0.0,
+          "net_pnl": -287.25494208865047
+        },
+        {
+          "regime": "LATERAL",
+          "trades": 19,
+          "win_rate": 0.3157894736842105,
+          "profit_factor": 1.7148737260788125,
+          "net_pnl": 8563.03749970111
+        }
+      ],
+      "benchmarks": {
+        "bh": {
+          "net_return_pct": 0.6857539025787314,
+          "net_pnl": 68575.39025787314,
+          "max_drawdown": 0.20183721965394327
+        },
+        "bh_scaled": {
+          "net_return_pct": 0.23741373750726757,
+          "net_pnl": 23741.373750726758,
+          "max_drawdown": 0.07839436524191766
+        },
+        "neutral": {
+          "net_return_pct": 0.40873145196752514,
+          "net_pnl": 40873.14519675251,
+          "max_drawdown": 0.08582901588955034
+        },
+        "bh_scaled_frac": 0.34620836515036835,
+        "neutral_target_frac": 0.42948717948717946
+      },
+      "clasificacion_de_ventana": "POSITIVA"
+    }
+  ],
+  "agregado": {
+    "clasificacion": "SISTEMATICO",
+    "folds_positivos": [
+      "2021Q3",
+      "2022Q4",
+      "2023Q1",
+      "2023Q2",
+      "2023Q4",
+      "2024Q1"
+    ],
+    "folds_negativos": [
+      "2021Q2",
+      "2021Q4",
+      "2022Q1",
+      "2022Q2",
+      "2022Q3",
+      "2023Q3"
+    ],
+    "count_folds_positivos": 6,
+    "num_vecindades_negativas": 3,
+    "vecindades_negativas": [
+      [
+        "2021Q2"
+      ],
+      [
+        "2021Q4",
+        "2022Q1",
+        "2022Q2",
+        "2022Q3"
+      ],
+      [
+        "2023Q3"
+      ]
+    ],
+    "fuera_de_vecindad": [
+      "2021Q3",
+      "2022Q4",
+      "2023Q1",
+      "2023Q2",
+      "2023Q4",
+      "2024Q1"
+    ],
+    "deltas_vs_neutral_fuera_de_vecindad": {
+      "2021Q3": -1.2646,
+      "2022Q4": -0.1353,
+      "2023Q1": 30.0975,
+      "2023Q2": -0.2797,
+      "2023Q4": -5.0405,
+      "2024Q1": -17.8598
+    },
+    "evaluacion": {
+      "localizado": {
+        "num_vecindades_negativas <= 2": false,
+        "count_folds_positivos >= 9": false,
+        "deltas_vs_neutral_fuera_de_vecindad > 0": false
+      },
+      "sistematico": {
+        "num_vecindades_negativas >= 3": true,
+        "count_folds_positivos <= 8": true
+      }
+    }
+  },
+  "conclusion": "H004-B -> SISTEMATICO. Folds positivos 6/12, vecindades negativas 3. Diagnostico de ubicacion; NO modifica la estrategia, NO abre H006 y NO desbloquea el FINAL_OOS."
+}

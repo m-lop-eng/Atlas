@@ -1,0 +1,2 @@
+{"at": "2026-09-30T16:49:04.797077+00:00", "backfill_status": null, "closed_bars": 0, "deduped": 0, "emitted": 0, "engine_quality": "HEALTHY", "engine_state": "CONNECTED", "polls": 1, "processed": 100, "restart": false}
+{"at": "2026-09-30T16:58:45.243157+00:00", "backfill_status": null, "closed_bars": 1, "deduped": 0, "emitted": 1, "engine_quality": "HEALTHY", "engine_state": "CONNECTED", "polls": 2, "processed": 200, "restart": false}

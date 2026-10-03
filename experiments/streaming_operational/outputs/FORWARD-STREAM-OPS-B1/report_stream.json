@@ -1,0 +1,93 @@
+{
+  "_meta": {
+    "generated_at": "2026-10-02T20:53:12.736077+00:00",
+    "manifest_presente": true,
+    "modo": "streaming forward continuo (S7; B1 -> ForwardRunner)",
+    "run_id": "FORWARD-STREAM-OPS-B1",
+    "source": "binance-websocket",
+    "strategy_hash": "491ed76d79f1034452e98f72453141a4c69110cc8d487f166a89072df332687f"
+  },
+  "barras": {
+    "senales": {
+      "NO_TRADE": 23
+    },
+    "submission_status": {}
+  },
+  "ciclos": {
+    "total": 8,
+    "ultimo": {
+      "at": "2026-10-02T20:53:12.736077+00:00",
+      "backfill_status": null,
+      "closed_bars": 0,
+      "completed": true,
+      "deduped": 0,
+      "emitted": 0,
+      "engine_quality": "HEALTHY",
+      "engine_state": "CONNECTED",
+      "polls": 2,
+      "processed": 2,
+      "restart": true,
+      "start_seconds": 3.765,
+      "status": "completed"
+    }
+  },
+  "ejecucion": {
+    "barras_totales": 23,
+    "primera_barra": "2026-10-01T22:00:00+00:00",
+    "ultima_barra": "2026-10-02T20:00:00+00:00"
+  },
+  "equity": {
+    "equity_final": 100000.0,
+    "mdd": 0.0
+  },
+  "health": {
+    "lineas": 17,
+    "ultimo": {
+      "checked_at": "2026-10-02T20:53:17.370848+00:00",
+      "connection_state": "CONNECTED",
+      "consecutive_errors": 0,
+      "freshness_seconds": 1.010600300040096,
+      "gaps_recovered": 0,
+      "gaps_unrecoverable": 0,
+      "heartbeat": "OK",
+      "integrity": "HEALTHY",
+      "last_closed_bar": null,
+      "last_error": null,
+      "last_event_at": "2026-10-02T20:53:16.360142+00:00",
+      "last_integrity_evidence": null,
+      "level": "HEALTHY",
+      "pipeline_state": "CONNECTED",
+      "reconnections": 0
+    }
+  },
+  "incidentes": {
+    "por_tipo": {},
+    "total": 0,
+    "ultimos": []
+  },
+  "integridad": {
+    "bars_igual_records": true,
+    "manifest_outputs_presentes": true,
+    "ok": true
+  },
+  "monitoring": {
+    "overall": {
+      "HEALTHY": 23
+    }
+  },
+  "reconciliacion": {
+    "bars_blocked": 0,
+    "status": {
+      "RECONCILIATION_OK": 23
+    }
+  },
+  "riesgo": {
+    "barras_can_trade_false": 0,
+    "kill_switch_estados": {
+      "ALLOW": 23
+    }
+  },
+  "unknown": {
+    "abiertos": 0
+  }
+}
