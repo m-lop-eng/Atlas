@@ -1,0 +1,122 @@
+{
+  "id": "H004B_PRE_REGISTRATION",
+  "titulo": "Pre-registro: re-anclaje de ventanas temporales para diagnosticar la inestabilidad de H004",
+  "pregunta": "La inestabilidad observada en H004 (W2 neta en los 3 regimenes; W3 concentra 63.7% del P&L positivo) es un fenomeno LOCALIZADO en la vecindad 2022-2023 o aparece SISTEMATICAMENTE a traves de ventanas temporales?",
+  "no_reformula_la_pregunta": "H004-B es un DIAGNOSTICO de ubicacion temporal de la inestabilidad. NO responde 'que configuracion funciona mejor', NO selecciona variantes y NO optimiza. No se interpreta como evidencia a favor o en contra de modificar la estrategia; solo caracteriza el patron temporal.",
+  "clasificacion": "DIAGNOSTICO",
+  "tipo_de_ejercicio": "EVALUACION_DE_ESTRATEGIA_FIJA_POR_VENTANA",
+  "nota_sobre_tipo": "El boceto inicial rotulaba el eje como TRAIN -> VALIDATION; ese rotulo se corrige: NO hay walk-forward que recalibre (no hay train que seleccione ni recalibracion por ventana). Es la ESTRATEGIA CONGELADA evaluada sobre 12 ventanas independientes (fixed strategy x window), mismas metricas y benchmarks que e9/e10. El historico previo solo es el necesario para el warm-up de indicadores, computado por el engine en frio al inicio de cada ventana, identico a e9 _run(cfg, valid_bars).",
+  "estado": "COMPLETE",
+  "ciclo_estado": ["PRE_REGISTERED", "VALIDATED", "AUTHORIZED", "RUN_IN_PROGRESS", "COMPLETE"],
+  "estrategia": {
+    "fuente": "experiments/h002/config.yaml",
+    "hash_config": "491ed76d79f1034452e98f72453141a4c69110cc8d487f166a89072df332687f",
+    "parametros_congelados": {
+      "lookback": 20,
+      "atr_period": 14,
+      "stop_atr_mult": 2.0,
+      "direction": "long",
+      "trend_filter": null,
+      "invert": false,
+      "risk_per_trade": 0.01,
+      "initial_equity": 100000.0,
+      "max_bars_in_trade": 48,
+      "point_value": 1.0,
+      "interval_seconds": 3600
+    },
+    "costes": {
+      "per_side": 0.15,
+      "slippage_per_side": 0.0005,
+      "commission_per_side": 0.001
+    }
+  },
+  "esquema_de_folds": {
+    "cantidad_congelada": 12,
+    "granularidad": "TRIMESTRAL_CALENDARIO",
+    "nota_cantidad_vs_intervalo": "12 es la CIFRA CONGELADA del esquema. NO representa el intervalo completo 2021-04-01 -> 2024-09-30 (esa grilla serian 14 trimestres: 2021Q2..2024Q3). El esquema usa 12 (2021Q2..2024Q1) y deja 2024Q2 (2024-04 -> 2024-07) y 2024Q3 (2024-07 -> 2024-10) FUERA por diseno: (a) mantiene exactamente 3 anos calendario alineados a limites de trimestre; (b) evita ventanas cuyo final roza la frontera de OBSERVED. Cambiar la cifra o los limites modifica este pre-registro ANTES de correr; JAMAS despues de ver resultados.",
+    "semantica_de_limite_inclusion": "MITAD_ABIERTA [start, end): una barra con open-time ts pertenece a la ventana sii start <= ts < end. El instante compartido entre dos ventanas consecutivas pertenece a la posterior. Igual que _slice() de e9/e10 (start_ts <= ts < end_ts).",
+    "train": {
+      "tipo": "EXPANDING_COLD_START_SIN_SELECCION",
+      "inicio_epoch": 1546300800,
+      "iso_inicio": "2019-01-01T00:00:00Z",
+      "nota": "El historico 2019-01-01 en adelante es solo el limite conceptual del tramo DEVELOPMENT; no se usa para recalibrar. El engine arranca en frio al inicio de cada ventana."
+    },
+    "folds": [
+      {"fold": "F1", "label": "2021Q2", "start_epoch": 1617235200, "end_epoch": 1625097600, "iso_start": "2021-04-01T00:00:00Z", "iso_end": "2021-07-01T00:00:00Z", "span_days": 91},
+      {"fold": "F2", "label": "2021Q3", "start_epoch": 1625097600, "end_epoch": 1633046400, "iso_start": "2021-07-01T00:00:00Z", "iso_end": "2021-10-01T00:00:00Z", "span_days": 92},
+      {"fold": "F3", "label": "2021Q4", "start_epoch": 1633046400, "end_epoch": 1640995200, "iso_start": "2021-10-01T00:00:00Z", "iso_end": "2022-01-01T00:00:00Z", "span_days": 92},
+      {"fold": "F4", "label": "2022Q1", "start_epoch": 1640995200, "end_epoch": 1648771200, "iso_start": "2022-01-01T00:00:00Z", "iso_end": "2022-04-01T00:00:00Z", "span_days": 90},
+      {"fold": "F5", "label": "2022Q2", "start_epoch": 1648771200, "end_epoch": 1656633600, "iso_start": "2022-04-01T00:00:00Z", "iso_end": "2022-07-01T00:00:00Z", "span_days": 91},
+      {"fold": "F6", "label": "2022Q3", "start_epoch": 1656633600, "end_epoch": 1664582400, "iso_start": "2022-07-01T00:00:00Z", "iso_end": "2022-10-01T00:00:00Z", "span_days": 92},
+      {"fold": "F7", "label": "2022Q4", "start_epoch": 1664582400, "end_epoch": 1672531200, "iso_start": "2022-10-01T00:00:00Z", "iso_end": "2023-01-01T00:00:00Z", "span_days": 92},
+      {"fold": "F8", "label": "2023Q1", "start_epoch": 1672531200, "end_epoch": 1680307200, "iso_start": "2023-01-01T00:00:00Z", "iso_end": "2023-04-01T00:00:00Z", "span_days": 90},
+      {"fold": "F9", "label": "2023Q2", "start_epoch": 1680307200, "end_epoch": 1688169600, "iso_start": "2023-04-01T00:00:00Z", "iso_end": "2023-07-01T00:00:00Z", "span_days": 91},
+      {"fold": "F10", "label": "2023Q3", "start_epoch": 1688169600, "end_epoch": 1696118400, "iso_start": "2023-07-01T00:00:00Z", "iso_end": "2023-10-01T00:00:00Z", "span_days": 92},
+      {"fold": "F11", "label": "2023Q4", "start_epoch": 1696118400, "end_epoch": 1704067200, "iso_start": "2023-10-01T00:00:00Z", "iso_end": "2024-01-01T00:00:00Z", "span_days": 92},
+      {"fold": "F12", "label": "2024Q1", "start_epoch": 1704067200, "end_epoch": 1711929600, "iso_start": "2024-01-01T00:00:00Z", "iso_end": "2024-04-01T00:00:00Z", "span_days": 91}
+    ],
+    "invariantes_mecanicas": [
+      "len(folds) == 12",
+      "consecutivos: start_epoch(F_{k+1}) == end_epoch(F_k)",
+      "start_epoch(F1) == 1617235200 (2021-04-01 00:00 UTC)",
+      "end_epoch(F12) == 1711929600 (2024-04-01 00:00 UTC) < frontera DEV (1727787600)",
+      "cada ventana == 1 trimestre calendario (90/91/92 dias) alineado a limite de trimestre en 00:00 UTC",
+      "ningun fold toca OBSERVED ni FINAL_OOS",
+      "cada fold queda cubierto por el dataset del manifest (first_ts <= 1617235200 y last_ts >= 1711929600 - 3600)",
+      "cada start_epoch/end_epoch coincide con lo derivado de su iso_start/iso_end (validacion en tests/test_h004b_scheme.py)"
+    ]
+  },
+  "semantica_de_ejecucion": {
+    "warm_up": "El engine arranca en frio al inicio de la ventana (como e9/e10). Breakout no emite senal mientras len(bars) <= lookback (20); ATR necesita al menos atr_period (14) barras. En una ventana de ~2180 barras el warm-up (~34 barras) no produce trades; se documenta, no se descarta.",
+    "primera_barra": "La barra con open-time == start_epoch se trata como cualquier otra: se incluye en la ventana (limite inferior incluido) y solo luego del warm-up puede generar senal de entrada. No hay relleno ni rescate parcial de ventana.",
+    "regimen": "research/benchmarking.classify_regimes: SMA de cierres de 720 barras (~30 dias en 1h) y banda +-5%; BULL si r > +5%, BEAR si r < -5%, LATERAL en otro caso. Las primeras 719 barras usan SMA parcial segun la regla del propio funcion (etiquetadas LATERAL cuando aplica). Variable de ANALISIS, nunca parametro de la estrategia.",
+    "metricas_agregadas": {
+      "net_return_pct": "reporting.curve_metrics(barras de la ventana).net_return respecto a initial_equity.",
+      "profit_factor": "reporting.metrics.calculate_metrics.profit_factor (gross_wins / gross_losses)",
+      "n_trades": "reporting.metrics.calculate_metrics.num_trades",
+      "delta_vs_neutral_pct": "net_return_pct(breakout en la ventana) - net_return_pct(control de exposicion temporal neutra)",
+      "delta_vs_bh_scaled_pct": "net_return_pct(breakout en la ventana) - net_return_pct(B&H escalado a la exposicion de capital)",
+      "mfe_mae_ratio": "reporting.metrics.calculate_metrics.mfe_mae_ratio == avg_mfe / avg_mae (medias por trade)",
+      "time_exit_win_rate": "win rate de los trades con salida por max_bars_in_trade (TIME) dentro de la ventana"
+    },
+    "benchmarks": "Identicos a e9/e10 con initial_equity=100000, per_side=0.15, point_value=1.0 sobre las barras de la misma ventana: buy_and_hold (100% expuesto), exposure_scaled_buy_and_hold(exposure_frac = exposure_time * capital_exposure_cond), exposure_matched_long(target_exposure = exposure_time, offset=7, cycle_bars = max_bars_in_trade).",
+    "costes_de_benchmarks": "Mismos costes por lado que la estrategia (slippage 0.05 + comision 0.10 por unidad, per_side=0.15)."
+  },
+  "criterios_de_lectura_preregistrados": {
+    "definiciones": {
+      "fold_negativo": "net_return_pct < 0",
+      "fold_positivo": "net_return_pct >= 0",
+      "vecindad_negativa": "racha maxima de folds negativos consecutivos; dos rachas separadas por al menos un fold positivo son vecindades distintas",
+      "fuera_de_vecindad": "fold que no pertenece a ninguna vecindad negativa"
+    },
+    "precedencia": "Se evalua el orden exacto: 1) LOCALIZADO (requiere las tres condiciones), 2) SISTEMATICO, 3) si ninguno se cumple, INCONCLUSO. Se escribe UN solo veredicto en H004B_RESULT.",
+    "LOCALIZADO": "num_vecindades_negativas <= 2 AND count(fold_positivo) >= 9 AND (para todo fold fuera de vecindad: delta_vs_neutral_pct > 0)",
+    "SISTEMATICO": "num_vecindades_negativas >= 3 OR count(fold_positivo) <= 8",
+    "INCONCLUSO": "No cumple LOCALIZADO ni SISTEMATICO (caso limite de frontera); se reportan los numeros (vecindades, folds positivos, deltas) sin forzar una lectura."
+  },
+  "data_roles": {
+    "rango_total_diagnostico": {"start_epoch": 1617235200, "end_epoch": 1711929600},
+    "pertenece_a": "DEVELOPMENT",
+    "frontera_development_registro": 1727787600,
+    "nota_frontera": "data_roles.json usa 1727787600 como fin de DEVELOPMENT/inicio de OBSERVED, que corresponde a 2024-10-01 13:00 UTC (no 00:00). Es una particularidad conocida del registro; no afecta a los folds (todos terminan en 1711929600, 2024-04-01 00:00 UTC).",
+    "guard_aplicados": ["guard_final_oos", "evidence.guard"],
+    "note": "Ningun fold toca el tramo OBSERVED (desde 2024-10-01) ni el FINAL_OOS (BLOCKED). El run debe pasar el guard de DATA_ROLE + EVIDENCE antes de ejecutarse."
+  },
+  "validacion_mecanica": {
+    "archivo": "tests/test_h004b_scheme.py",
+    "checks": [
+      "epochs de cada fold == iso (UTC)",
+      "12 folds consecutivos y sin solape",
+      "F1 inicia 2021-04-01 00:00 UTC (1617235200)",
+      "F12 termina 2024-04-01 00:00 UTC (1711929600)",
+      "cada ventana dentro de DEVELOPMENT y sin tocar OBSERVED/FINAL_OOS",
+      "cada ventana cubierta por el dataset del manifest"
+    ]
+  },
+  "ejecucion": {
+    "estado": "COMPLETE",
+    "autorizacion_requerida": true,
+    "gate": "Se corre unicamente si: (a) la validacion mecanica pasa, (b) el esquema sigue identico a este archivo, (c) hay autorizacion explicita. Tras el run los resultados van a una decision separada (H004B_RESULT) sin modificar este archivo.",
+    "note": "Ejecutado una unica vez (veredicto en H004B_RESULT). El esquema, criterios y configuracion no fueron modificados."
+  }
+}

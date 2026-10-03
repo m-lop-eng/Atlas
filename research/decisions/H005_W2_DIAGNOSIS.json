@@ -1,0 +1,93 @@
+{
+  "hypothesis": "H005-W2",
+  "title": "Diagnostico de W2 (2022): causa del fallo del breakout LONG en los tres regimenes",
+  "strategy": "ATLAS_FIRST_BREAKOUT",
+  "parent_hypothesis": "H004",
+  "status": "RESEARCH_REQUIRED",
+  "decided_at": "2026-09-19",
+  "reason": "El ciclo H004 quedo con una pregunta abierta: por que W2 (2022) es netamente negativa en bull+bear+lateral y W3 concentra el 64% del P&L positivo. Este diagnostico responde la causa sin tocar parametros: 2022 fue un bear estructural (mercado -64.5%); la perdida es beta direccional adversa del filtro LONG, no un fallo de la logica breakout.",
+  "lineage": {
+    "hypothesis_id": "H005-W2",
+    "parent_hypothesis": "H004",
+    "strategy_id": "atlas-breakout",
+    "params_frozen_long": {"lookback": 20, "atr_period": 14, "stop_atr_mult": 2.0, "direction": "long"},
+    "strategy_config_hash": "491ed76d79f1034452e98f72453141a4c69110cc8d487f166a89072df332687f",
+    "parameters_changed": false,
+    "optimization_performed": false,
+    "previous_oos_consumed": true,
+    "final_oos_consumed": false
+  },
+  "method": {
+    "type": "diagnostico de hipotesis con config CONGELADA",
+    "recalibration": false,
+    "selection_or_tuning": false,
+    "window_focus": "W2 (2022-01-01 -> 2023-01-01), validacion del walk-forward H004 dentro del tramo DEVELOPMENT.",
+    "direction_as_diagnostic": "direction=long/both/short sobre la misma config solo para separar fallo direccional de fallo estructural de la logica breakout; nunca como estrategia.",
+    "contrast_windows": "W1/W3/W4 (mismo motor, misma config) como control temporal del comportamiento 2022.",
+    "benchmarks_w2": "B&H puro, B&H escalado a la exposicion de capital y control de exposicion temporal neutra (duty-cycle), reutilizados de H003/H004 sin recalibrar.",
+    "data_roles": "Todas las ventanas viven en DEVELOPMENT. No se toca OBSERVED (2024-10->2026-08) ni FINAL_OOS. guard_final_oos activo."
+  },
+  "observation": {
+    "cause_class": "DIRECTIONAL_BETA_ADVERSA",
+    "market_regime_2022": "bear estructural: mercado -64.5% en 2022 (vs +59.4% en 2021, +155.8% en 2023, +49.9% en 2024).",
+    "expectancy_decay_not_extreme_trades": {
+      "win_rate": 0.233,
+      "avg_win_usd": 2279.68,
+      "avg_loss_usd": 823.89,
+      "bot5_share_gross_neg": 0.066,
+      "avg_stop_pnl_w2_usd": -879.6,
+      "median_trade_usd": -836.5,
+      "note": "Sin trades extremos: bottom-5 aporta ~6.6% del gross negativo (rango otras ventanas 6.0-7.1%) y el stop medio es MENOR que en el resto (-880 vs -1458 a -1181). La perdida es deterioro general: win rate 23% (vs 26-32%), avg win $2280 (vs hasta $5819), avg loss menor. La mediana del trade (-$836) es la menor de las 4 ventanas: el stop ATR en el entorno de baja volatilidad relativa de 2022 pega menos fuerte, no mas.",
+      "monthly_concentration": "7/12 meses negativos, peor mes 2022-01 (-$5056). Perdida repartida a lo largo del ano, no un evento unico."
+    },
+    "direction_vs_breakout_logic": {
+      "long_only": {"net_return": -0.1197, "profit_factor": 0.84, "expectancy_usd": -99.73, "trades": 120},
+      "short_only": {"net_return": -0.0114, "profit_factor": 0.99, "expectancy_usd": -8.0, "trades": 143},
+      "both": {"net_return": -0.0267, "profit_factor": 0.98, "expectancy_usd": -11.18, "trades": 239},
+      "note": "Operando ambas direcciones con la misma config, 2022 queda ~break-even (-2.7%). La logica breakout no desaparece en 2022; el filtro LONG (restriccion de H002) concentra todo el riesgo de un bear estructural."
+    },
+    "follow_through": {
+      "mfe_mae_ratio_w2": 1.4232,
+      "mfe_mae_ratio_others": [1.6096, 2.1279, 1.5359],
+      "median_mfe_usd": 704.8,
+      "median_mae_usd": 990.44,
+      "time_exits_w2": {"win_rate": 0.778, "avg_pnl_usd": 1720.1},
+      "time_exits_others_wr_range": [0.868, 0.914],
+      "note": "W2 es la ventana con MFE/MAE mas bajo (1.42 vs 1.54-2.13) y mediana MFE < mediana MAE: sin follow-through alcista. Los TIME-exits (48 barras), que en W1/W3/W4 aportan la mayoria del P&L via win-rate 87-91%, en 2022 ganan solo 78% y menos grandes."
+    },
+    "costs": {
+      "costs_pct_equity": 0.0009,
+      "note": "Costes ~0.09% del equity: descartados como causa."
+    },
+    "regimes": {
+      "BULL": {"trades": 25, "expectancy_usd": -250.25, "net_usd": -6256.1},
+      "BEAR": {"trades": 44, "expectancy_usd": -105.78, "net_usd": -4654.2},
+      "LATERAL": {"trades": 51, "expectancy_usd": -20.72, "net_usd": -1056.8},
+      "note": "Perdida en los tres regimenes con muestras validas (>=10 cada uno). La degradacion es transversal y suave, coherente con beta direccional, no con un fallo de un regimen concreto."
+    },
+    "benchmarks_within_w2": {
+      "breakout_long": -0.1197,
+      "bh": -0.6421,
+      "bh_scaled": -0.134,
+      "neutral": -0.2954,
+      "delta_vs_neutral_pp": 17.6,
+      "delta_vs_bh_scaled_pp": 1.4,
+      "note": "Incluso perdiendo, LONG supera a B&H puro, a B&H escalado y al control neutral en la peor ventana: el timing no desaparece; la direccion es el problema."
+    }
+  },
+  "decision_criteria_applied": {
+    "state": "RESEARCH_REQUIRED",
+    "criteria": "Diagnostico; no cierra ciclo ni decide hipotesis. Documenta la causa de W2 y la condiciona a evaluacion con FINAL_OOS limpio.",
+    "note": "Ningun parametro modificado ni optimizado. Ningun cambio de estrategia derivado de esta observacion. Nuevas hipotesis (filtro direccional por regimen, direction=both) quedan registradas como opciones, PROHIBIDAS de implementar sin pasar por pre-registro y FINAL_OOS."
+  },
+  "evidence": {
+    "e10_script": "experiments/e10_h005_w2_diagnosis.py",
+    "e10_output": "experiments/outputs/h005_w2_diagnosis.json",
+    "parent_output": "experiments/outputs/h004_walk_forward.json",
+    "tests": "python -m pytest (210 passed)",
+    "dataset": "experiments/data/market_BTCUSDT_60min.csv",
+    "engine_version": 2
+  },
+  "production": "NOT_ELIGIBLE",
+  "next_step": "Con la causa documentada (beta direccional adversa del filtro LONG en bears), decidir: (2) H004-B con mas folds/re-anclaje (mas granularidad de la misma informacion) o (N) una nueva hipotesis formal sobre direccion por regimen, pre-registrada, evaluada SOLO contra un FINAL_OOS limpio (datos > 2026-08, pendientes de publicacion de binance.vision). Nunca reutilizar 2024-2026 como OOS ni optimizar lookback/ATR/stops/SMA."
+}

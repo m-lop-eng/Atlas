@@ -1,0 +1,53 @@
+{
+  "hypothesis": "H002",
+  "title": "Long/Short asymmetry in BTC 1h breakout",
+  "strategy": "ATLAS_FIRST_BREAKOUT",
+  "status": "RESEARCH_REQUIRED",
+  "decided_at": "2026-09-18",
+  "reason": "Directional LONG vs SHORT distributions differ, and the contrast persists out-of-sample; the breakout has now positive GROSS P&L on the deep BTC 1h history (unlike the 30-day Kraken sample).",
+  "observation": {
+    "method": "Temporal split 75/25 (train = first 50355 bars, test = last 16786 untouched). No parameter was optimized and no variant was selected on train.",
+    "train": {
+      "both_expectancy_usd": 726.1,
+      "long_expectancy_usd": 1287.7,
+      "short_expectancy_usd": 117.2,
+      "long_minus_short_usd": 1170.4
+    },
+    "test_oos": {
+      "both_expectancy_usd": 146.1,
+      "long_expectancy_usd": 268.2,
+      "short_expectancy_usd": 16.3,
+      "long_minus_short_usd": 251.9
+    },
+    "persistence": "PERSISTE (signo LONG-SHORT positivo en train y test)",
+    "long_only": {"train_net_return": 8.284, "test_net_return": 0.532},
+    "short_only": {"train_net_return": -0.144, "test_net_return": -0.082},
+    "both": {"train_net_return": 9.519, "test_net_return": 0.723}
+  },
+  "caveat": "BTC had a strong structural uptrend over 2019-2026, so a long-biased breakout can capture directional beta rather than an idiosyncratic edge. The asymmetry may be TREND/BETA, not skill. Breakout dominates the random control only on real data; it must be contrasted against buy&hold and market regimes before any directional conclusion.",
+  "temporal_stability_followup": {
+    "decided_at": "2026-09-19",
+    "source": "H004-B (research/decisions/H004B_RESULT.json)",
+    "note": "La ventaja LONG no es temporalmente estable: 6/12 folds trimestrales positivas, 3 vecindades negativas en 2021-2023, y la ventaja frente al control neutro no es consistente por ventana. Refuerza el caveat de que la asimetria puede ser beta direccional, no edge idiosincratico. No justifica pasar a BOTH ni a SHORT."
+  },
+  "evidence": {
+    "e7_script": "experiments/e7_h002_asymmetry.py",
+    "e7_output": "experiments/outputs/h002_asymmetry.json",
+    "baseline_full_dataset": "exp-013a5a3be71c",
+    "dataset": "experiments/data/market_BTCUSDT_60min.csv",
+    "dataset_manifest": "experiments/data/market_BTCUSDT_60min.manifest.json",
+    "n_bars": 67141,
+    "range_epoch": [1546300800, 1788217200],
+    "engine_version": 2,
+    "tests_passing": 188
+  },
+  "data_infrastructure": {
+    "sources": ["KrakenSource (~30d)", "BinanceVisionSource (deep, data.binance.vision)", "CsvSource", "ParquetSource (future)"],
+    "manifest": "DataManifest with sha256 + range (versioned)",
+    "unit_audit": "P&L/costs/MAE/MFE monetized by point_value; risk in $ == P&L in $ verified with point_value=50"
+  },
+  "optimization": "NOT_PERFORMED",
+  "oos": "PERFORMED_TEMPORAL_75_25",
+  "production": "NOT_ELIGIBLE",
+  "next_step": "H003: contrast LONG bias against buy&hold and market regimes (bull/bear/sideways) to separate directional beta from edge. Do NOT tune lookback/ATR/SMA/stops yet."
+}

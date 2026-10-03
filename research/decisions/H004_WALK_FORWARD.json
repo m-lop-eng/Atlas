@@ -1,0 +1,100 @@
+{
+  "hypothesis": "H004",
+  "title": "Walk-forward de parametros FIJOS: estabilidad temporal del timing LONG",
+  "strategy": "ATLAS_FIRST_BREAKOUT",
+  "parent_hypothesis": "H003",
+  "status": "RESEARCH_REQUIRED",
+  "decided_at": "2026-09-19",
+  "reason": "La ventaja vs el control de exposicion neutra y vs el B&H escalado aparece en las 4 validaciones, pero una ventana (W2, 2022) es netamente negativa en los tres regimenes y la ventana W3 concentra el 64% del P&L positivo. Hay ventaja con inestabilidad relevante: robustez temporal NO demostrada, rechazo tampoco.",
+  "lineage": {
+    "hypothesis_id": "H004",
+    "parent_hypothesis": "H003",
+    "strategy_id": "atlas-breakout",
+    "params": {"lookback": 20, "atr_period": 14, "stop_atr_mult": 2.0, "direction": "long"},
+    "strategy_config_hash": "491ed76d79f1034452e98f72453141a4c69110cc8d487f166a89072df332687f",
+    "parameters_changed": false,
+    "optimization_performed": false,
+    "previous_oos_consumed": true,
+    "final_oos_consumed": false
+  },
+  "method": {
+    "type": "fixed-parameter walk-forward diagnostic",
+    "recalibration": false,
+    "selection_or_tuning": false,
+    "windows": "4 validaciones consecutivas de ~1 ano (2021, 2022, 2023, 2024-01->2024-10); train expandido desde 2019-01.",
+    "data_roles": "DEVELOPMENT 2019-01->2024-10; OBSERVED 2024-10->2026-08 (consumido por H002/H003). Ningun FINAL_OOS limpio disponible; guard_final_oos impide reutilizar el tramo OBSERVED.",
+    "benchmarks": "Reutilizados de H003 sin recalibrar: B&H puro, B&H escalado a la exposicion de capital, control de exposicion temporal neutra (duty-cycle).",
+    "annualization": "retorno simple por barra (1h), sqrt(8766)/ano."
+  },
+  "observation": {
+    "validation_windows": {
+      "W1_2021": {"trades": 139, "net_return": 0.1261, "max_drawdown": 0.150, "sharpe": 0.66, "exposure_time": 0.452, "control_neutral": -0.078, "bh_scaled": 0.1186, "bh": 0.5979, "delta_vs_neutral": 0.204, "delta_vs_scaled": 0.007, "regime_net_usd": {"BULL": 4812.3, "BEAR": -814.5, "LATERAL": 8613.6}},
+      "W2_2022": {"trades": 120, "net_return": -0.1197, "max_drawdown": 0.233, "sharpe": -0.52, "exposure_time": 0.320, "control_neutral": -0.2954, "bh_scaled": -0.1340, "bh": -0.6421, "delta_vs_neutral": 0.176, "delta_vs_scaled": 0.014, "regime_net_usd": {"BULL": -6256.2, "BEAR": -4654.2, "LATERAL": -1056.8}},
+      "W3_2023": {"trades": 131, "net_return": 0.6286, "max_drawdown": 0.304, "sharpe": 1.72, "exposure_time": 0.344, "control_neutral": 0.2998, "bh_scaled": 0.6159, "bh": 1.5562, "delta_vs_neutral": 0.329, "delta_vs_scaled": 0.013, "regime_net_usd": {"BULL": 24098.6, "BEAR": 15254.8, "LATERAL": 23502.1}},
+      "W4_2024": {"trades": 111, "net_return": 0.2326, "max_drawdown": 0.135, "sharpe": 1.24, "exposure_time": 0.409, "control_neutral": 0.1325, "bh_scaled": 0.1608, "bh": 0.5057, "delta_vs_neutral": 0.100, "delta_vs_scaled": 0.072, "regime_net_usd": {"BULL": 12454.1, "BEAR": 3749.7, "LATERAL": 7056.4}}
+    },
+    "distribution": {
+      "net_returns": [0.1261, -0.1197, 0.6286, 0.2326],
+      "mean": 0.2169,
+      "median": 0.1794,
+      "std": 0.2698,
+      "positive_windows": 3,
+      "count": 4,
+      "sequence": "+ + - ++ (W1 +, W2 -, W3 ++, W4 +)"
+    },
+    "central_contrast": {
+      "beats_neutral_windows": "4/4 (delta +20.4, +17.6, +32.9, +10.0 pp): la hipotesis central de H003 se mantiene ventana a ventana.",
+      "beats_bh_scaled_windows": "4/4 (delta +0.7, +1.4, +1.3, +7.2 pp): el margen sobre B&H con exposicion comparable es fino salvo en W4.",
+      "expectancy_breakout_vs_neutral": "positivo en 4/4 ventanas (rango +61.7$ a +316.0$ por trade)."
+    },
+    "regime": {
+      "pooled_net_usd": {"BULL": 35108.9, "BEAR": 13535.7, "LATERAL": 38115.3},
+      "pooled_trades": {"BULL": 172, "BEAR": 102, "LATERAL": 227},
+      "regimes_positive": ["BULL", "BEAR", "LATERAL"],
+      "bull_test_negative_recurrence": "El hallazgo de H003 (BULL negativo en test) NO recurre de forma sistematica: solo W2 (2022) tiene BULL negativo. Se registra como informacion, sin corregir la estrategia."
+    },
+    "caveat": "Una unica ventana (W2, 2022) es netamente negativa en bull+bear+lateral, y W3 aporta el 63.7% del P&L positivo de validacion. Periodo de desarrollo alcista estructural; sin OOS limpio."
+  },
+  "decision_criteria_applied": {
+    "state": "RESEARCH_REQUIRED",
+    "criteria": "ROBUSTNESS_SUPPORTED exige mayoria de ventanas con ventaja vs neutral y B&H escalado, neto>0, BULL negativo no recurrente, >=2 regimenes positivos y ninguna ventana >60% del total positivo.",
+    "why_not_robust": "largest_window_share=0.637 (>0.60) y W2 sin neto positivo.",
+    "why_not_rejected": "4/4 ventanas superan neutral y B&H escalado.",
+    "note": "Heuristica de contabilidad del grafo, no umbral de rentabilidad."
+  },
+  "evidence": {
+    "e9_script": "experiments/e9_h004_walk_forward.py",
+    "e9_output": "experiments/outputs/h004_walk_forward.json",
+    "data_role_module": "research/data_role.py",
+    "data_role_registry": "research/data_roles.json",
+    "tests": "tests/test_data_role.py + tests/test_benchmarking.py",
+    "dataset": "experiments/data/market_BTCUSDT_60min.csv",
+    "engine_version": 2
+  },
+  "production": "NOT_ELIGIBLE",
+  "next_step": "Antes de mas ciclos: (1) ampliar datos para declarar un FINAL_OOS limpio y protegerlo; (2) evaluar el FINAL_OOS SOLO contra la estrategia congelada (sin usarlo para elegir LONG/BOTH/regime filter); (3) recien entonces formular una nueva hipotesis (H006) si procede. H004-B ya respondio la pregunta de ubicacion: la inestabilidad es sistematica, no localizada en 2022. No reutilizar 2024-2026 como OOS ni optimizar parametros.",
+  "h004b_closure": {
+    "hypothesis_id": "H004-B",
+    "decided_at": "2026-09-19",
+    "verdict": "SYSTEMATIC (pre-registrado: LOCALIZADO / SISTEMATICO / INCONCLUSO)",
+    "temporal_stability": {
+      "verdict": "SYSTEMATIC_INSTABILITY",
+      "folds_positive": "6/12",
+      "median_return": "+0.3%",
+      "mean_return": "+5.4%",
+      "concentration": "HIGH",
+      "concentration_detail": "los 3 folds mas positivos (2023Q1 +56.4, 2023Q4 +25.9, 2024Q1 +23.0) suman ~83% del P&L positivo; la ventaja frente al control neutro no es consistente por ventana (en 2023Q4 y 2024Q1 el control neutro supero al breakout: -5.0pp y -17.9pp).",
+      "negative_windows": ["2021Q2", "2021Q4", "2022Q1", "2022Q2", "2022Q3", "2023Q3"],
+      "vecindades_negativas": 3
+    },
+    "statement": "Los resultados positivos agregados estan concentrados en pocas ventanas y la ventaja frente a los controles no es consistente por ventana: la hipotesis LONG-only NO presenta una ventaja temporal estable a traves de los 12 folds.",
+    "consequence": "Reduce la confianza en que el problema sea 'arreglar 2022'. La pregunta correcta deviene 'existe una senal generalizable detras del rendimiento observado?'. Estado de evidencia: RESEARCH_REQUIRED (NO se sube a ROBUSTNESS_SUPPORTED).",
+    "evidence_file": "research/decisions/H004B_RESULT.json",
+    "rules_untouched": {
+      "esquema": "congelado en H004B_PRE_REGISTRATION.json, sin modificacion",
+      "criterios": "evaluados tal como escritos antes de conocer los numeros",
+      "config": "hash 491ed76d... inmutado",
+      "no_se_hizo": "nada: ni seleccionar mejores trimestres, ni eliminar folds, ni filtro por regimen, ni re-escalado de riesgo"
+    }
+  }
+}
