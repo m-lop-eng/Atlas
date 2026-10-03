@@ -20,7 +20,7 @@ simulados, sin gaps, sin rollover.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 from execution.order import Fill, OrderSide, OrderStatus, OrderType
@@ -40,12 +40,18 @@ def _day_key(ts) -> Any:
 
     Soporta epoch numérico/string y fechas ISO. Devuelve None si no se
     puede interpretar (entonces no hay reset diario).
+
+    UTC es una decisión EXPLÍCITA del motor: los epoch timestamps son UTC por
+    definición y el "día de trading" que gobierna el reset de `max_daily_loss`
+    NO puede depender del timezone local del host (una barra cerca de medianoche
+    UTC cambiaría de día según el TZ del proceso, alterando el reset y por tanto
+    el resultado del backtest).
     """
     if isinstance(ts, (int, float)):
-        return datetime.fromtimestamp(float(ts)).date()
+        return datetime.fromtimestamp(float(ts), tz=timezone.utc).date()
     if isinstance(ts, str):
         if ts.isdigit():
-            return datetime.fromtimestamp(float(ts)).date()
+            return datetime.fromtimestamp(float(ts), tz=timezone.utc).date()
         try:
             return datetime.fromisoformat(ts.replace("Z", "+00:00")).date()
         except ValueError:

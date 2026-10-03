@@ -99,22 +99,39 @@ Cobertura por módulo crítico (term-missing):
 
 ## Confirmed Findings
 
-### F-01 — `_day_key()` depende del timezone local (reset diario incorrecto)
+### F-01 — `_day_key()` depende del timezone local (reset diario incorrecto) — **RESOLVED — pending commit**
 - ID: F-01
 - severidad: **HIGH**
-- archivo: `backtesting/engine.py:44,48`
+- archivo: `backtesting/engine.py:38-56`
 - función: `_day_key`
-- descripción: usa `datetime.fromtimestamp(float(ts))` **sin** `tz=timezone.utc`.
-  El día de trading (base del reset de `max_daily_loss`) se calcula en el
-  timezone local de la máquina.
-- impacto: el límite de pérdida diaria puede resetearse en un instante distinto
-  según el TZ del host; resultados de backtest no reproducibles entre máquinas.
-- evidencia: código; nota `data/quality._ts_delta_seconds` ya fue corregido a
-  UTC-aware (mismo tipo de bug) pero el motor no.
-- test existente: `tests/test_daily_reset.py` (no fija TZ).
-- test necesario: con `TZ` alternativo/`time.tzset` o monkeypatch, demostrar que
-  `_day_key` es UTC y que el reset diario no cambia.
-- recomendación: `datetime.fromtimestamp(float(ts), tz=timezone.utc).date()`.
+- **estado: RESOLVED — pending commit**
+- **causa raíz**: `datetime.fromtimestamp(float(ts))` sin `tz=timezone.utc`
+  convertía el epoch (UTC por definición) al **TZ local** del host antes de
+  `.date()`. Una barra cerca de medianoche UTC cambiaba de "día de trading"
+  según el offset local, alterando el reset de `max_daily_loss` y el resultado
+  del backtest entre máquinas.
+- **decisión**: UTC explícito en el motor (epoch son UTC; el "día de trading" no
+  es configurable).
+- **corrección**: `datetime.fromtimestamp(float(ts), tz=timezone.utc).date()`
+  (y `from datetime import datetime, timezone`). Mínima; sin deps nuevas.
+- **tests añadidos** (`tests/test_daily_reset.py`):
+  - `TestDayKeyTimezoneInvariance`: valor UTC en medianoche; iteración de TZ
+    (`UTC`, `Pacific/Kiritimati` +14, `Etc/GMT+12` −12) con `_tz_guard`
+    (`TZ`+`time.tzset()` cuando el SO lo permite, restaurado siempre); con −12
+    la representación ingenua da `2024-01-01` mientras `_day_key` da `2024-01-02`
+    (demuestra el bug); independencia del TZ real del host; ISO con offset.
+  - `TestDailyResetTimezoneInvariance`: el backtest completo (2 días alrededor
+    de medianoche) produce resultado idéntico bajo 3 TZ.
+- **nota de entorno**: `time.tzset` no existe en Windows; `_tz_guard` lo maneja
+  (cambia `TZ` solo si hay `tzset`, restaura siempre) y el caso −12 se verifica
+  explícitamente cuando el SO lo permite.
+- **evidencia pruebas**: `pytest tests/test_daily_reset.py` → 11 passed;
+  suite → **817 passed**.
+- **cobertura**: `backtesting/engine.py` 95% → **96%** (global 85%).
+- **no cerrado del todo** hasta el commit.
+- **hallazgo relacionado**: `.date()` en `engine.py:50` (ISO con offset) — el
+  offset del string se respeta (correcto); sin otro uso sospechoso en
+  `backtesting/`.
 
 ### F-02 — `max_strategy_risk` no se aplica cuando hay `point_value`
 - ID: F-02
