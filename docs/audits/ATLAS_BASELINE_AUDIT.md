@@ -274,36 +274,51 @@ Cobertura por módulo crítico (term-missing):
   mismatch.
 - recomendación: mantener un ledger interno (cash/equity propios) y reconciliarlo.
 
-### F-07 — `OrderManager` admite transiciones de estado inválidas
+### F-07 — `OrderManager` admite transiciones de estado inválidas — **RESOLVED — pending commit**
 - ID: F-07
 - severidad: **HIGH**
-- archivo: `execution/order_manager.py:156-166`
-- función: `_transition`
-- descripción: solo rechaza transiciones **desde** estado terminal. No valida el
-  grafo: p. ej. `CREATED → SUBMITTED` (sin `APPROVED`), `ACKNOWLEDGED → APPROVED`,
-  `APPROVED → CREATED`… todas permitidas. Las transiciones legales no están
-  codificadas.
-- impacto: ciclo de vida de orden laxo; un adapter/estado inconsistente podría
-  producir secuencias imposibles sin error.
-- evidencia: `_transition` no consulta estado actual.
-- test existente: `test_orders.py`.
-- test necesario: tabla de transiciones permitidas + rechazo de las inválidas.
-- recomendación: definir tabla explícita (ver abajo) y aplicarla en `_transition`.
-
-Tabla de transiciones propuesta (permitidas):
-
-```
-CREATED        -> RISK_CHECKED, APPROVED, REJECTED, CANCELLED
-RISK_CHECKED   -> APPROVED, REJECTED, CANCELLED
-APPROVED       -> SUBMITTING, SUBMITTED, REJECTED, CANCELLED
-SUBMITTING     -> SUBMITTED, ACKNOWLEDGED, UNKNOWN, FAILED, REJECTED
-SUBMITTED      -> ACKNOWLEDGED, PARTIALLY_FILLED, FILLED, CANCELLED, REJECTED, EXPIRED, UNKNOWN, FAILED
-ACKNOWLEDGED   -> PARTIALLY_FILLED, FILLED, CANCELLED, REJECTED, EXPIRED, UNKNOWN, FAILED
-PARTIALLY_FILLED -> PARTIALLY_FILLED, FILLED, CANCELLED, EXPIRED, UNKNOWN, FAILED
-FILLED/CANCELLED/REJECTED/EXPIRED/FAILED/UNKNOWN -> (terminal: ninguna)
-```
-(UNKNOWN se modela como terminal en `OrderStatus.terminal`; su resolución
-correcta requeriría un estado no terminal — hallazgo adicional, ver F-15.)
+- archivo: `execution/order_manager.py` (`_transition`)
+- **estado: RESOLVED — pending commit**
+- **Causa raíz**: `_transition` solo rechazaba transiciones **desde** estado
+  terminal; no validaba que la arista perteneciera al grafo. Permitía
+  `CREATED → ACKNOWLEDGED`, `CREATED → SUBMITTED`, `APPROVED → ACKNOWLEDGED`,
+  etc. (reproducido).
+- **Grafo contractual reconstruido** (de `06_EXECUTION_OPERATION.md §7` y de los
+  callers reales `create→approve→submit→acknowledge/fill/reject/cancel`),
+  ahora en `ALLOWED_TRANSITIONS` (fuente única):
+  ```
+  CREATED          -> RISK_CHECKED, APPROVED, REJECTED, CANCELLED
+  RISK_CHECKED     -> APPROVED, REJECTED, CANCELLED
+  APPROVED         -> SUBMITTING, SUBMITTED, REJECTED, CANCELLED
+  SUBMITTING       -> SUBMITTED, ACKNOWLEDGED, REJECTED, UNKNOWN, FAILED
+  SUBMITTED        -> ACKNOWLEDGED, PARTIALLY_FILLED, FILLED, REJECTED, CANCELLED, EXPIRED, UNKNOWN, FAILED
+  ACKNOWLEDGED     -> PARTIALLY_FILLED, FILLED, REJECTED, CANCELLED, EXPIRED, UNKNOWN, FAILED
+  PARTIALLY_FILLED -> PARTIALLY_FILLED, FILLED, REJECTED, CANCELLED, EXPIRED, UNKNOWN, FAILED
+  FILLED/CANCELLED/REJECTED/EXPIRED/FAILED/UNKNOWN -> (terminal: sin salidas)
+  ```
+- **Estados terminales**: `FILLED, CANCELLED, REJECTED, EXPIRED, FAILED, UNKNOWN`
+  (`OrderStatus.terminal`), sin aristas de salida.
+- **Implementación**: `_transition` valida el grafo **antes** de mutar; mantiene
+  el tipo de error (`OrderStateError`), el retorno (`Order`) y la semántica
+  terminal. `from == to` solo si el grafo lo permite (`PARTIALLY_FILLED → PARTIALLY_FILLED`);
+  `CREATED → CREATED` se rechaza.
+- **Sin mutación parcial**: la comprobación precede al `replace`; una transición
+  inválida deja `status/fill_quantity/average_fill_price/commission/reject_reason`
+  intactos (verificado por test).
+- **`apply_fill` no se toca**: usa `replace()` directo (no `_transition`), por lo
+  que `SUBMITTED/ACKNOWLEDGED → PARTIALLY_FILLED/FILLED` sigue funcionando.
+- **Callers reales**: `backtesting/engine.py` y `papertrading/engine.py` usan
+  `create→approve→submit` (legal) y `reject`/`apply_fill` (legales); sin cambios.
+- **Tests**: `TestTransitionGraph` (12): lifecycle legal, `CREATED→ACK`,
+  `CREATED→SUB`, `APPROVED→ACK`, `SUBMITTED→APPROVED` rechazadas; sin mutación
+  parcial; terminal sin salida; `CREATED→REJECTED/CANCELLED` permitidas;
+  `reject_reason` preservado; self-transition `CREATED` inválida y
+  `PARTIALLY_FILLED` válida; todos los terminales sin salidas.
+- **Evidencia**: `pytest` → 845 passed; `execution/order_manager.py` 99%.
+- **no cerrado del todo** hasta el commit.
+- **Hallazgo incidental (NO corregido)**: `UNKNOWN` está modelado como terminal,
+  pero §8 lo describe como estado a **resolver** con `get_order`; al ser terminal,
+  no hay arista para salir de él. Fuera del alcance de F-07.
 
 ### F-08 — Position sizing produce cantidades fraccionarias sin soporte de enteros
 - ID: F-08

@@ -112,6 +112,112 @@ class TestOrderTransitions:
         assert rejected.reject_reason == "riesgo"
 
 
+class TestTransitionGraph:
+    """F-07: `_transition` debe validar el grafo contractual."""
+
+    def _order(self, cid: str = "G") -> tuple[OrderManager, Order]:
+        m = OrderManager()
+        return m, m.create_order(**_make(client_order_id=cid))
+
+    def test_legal_lifecycle_sequence(self) -> None:
+        m, o = self._order()
+        assert m.approve(o.order_id).status == OrderStatus.APPROVED
+        assert m.submit(o.order_id).status == OrderStatus.SUBMITTED
+        assert m.acknowledge(o.order_id).status == OrderStatus.ACKNOWLEDGED
+
+    def test_illegal_created_to_acknowledged_rejected(self) -> None:
+        m, o = self._order()
+        with pytest.raises(OrderStateError, match="inválida"):
+            m.acknowledge(o.order_id)
+        assert m.orders[o.order_id].status == OrderStatus.CREATED
+
+    def test_illegal_created_to_submitted_rejected(self) -> None:
+        m, o = self._order()
+        with pytest.raises(OrderStateError, match="inválida"):
+            m.submit(o.order_id)
+        assert m.orders[o.order_id].status == OrderStatus.CREATED
+
+    def test_illegal_approved_to_acknowledged_rejected(self) -> None:
+        m, o = self._order()
+        m.approve(o.order_id)
+        with pytest.raises(OrderStateError, match="inválida"):
+            m.acknowledge(o.order_id)
+        assert m.orders[o.order_id].status == OrderStatus.APPROVED
+
+    def test_illegal_submitted_to_approved_rejected(self) -> None:
+        m, o = self._order()
+        m.approve(o.order_id)
+        m.submit(o.order_id)
+        with pytest.raises(OrderStateError, match="inválida"):
+            m.approve(o.order_id)
+        assert m.orders[o.order_id].status == OrderStatus.SUBMITTED
+
+    def test_invalid_transition_no_partial_mutation(self) -> None:
+        m, o = self._order()
+        before = m.orders[o.order_id]
+        with pytest.raises(OrderStateError):
+            m.acknowledge(o.order_id)
+        after = m.orders[o.order_id]
+        assert after.status == before.status == OrderStatus.CREATED
+        assert after.fill_quantity == before.fill_quantity == 0
+        assert after.average_fill_price == before.average_fill_price
+        assert after.commission == before.commission
+        assert after.reject_reason == before.reject_reason
+
+    def test_terminal_cannot_leave(self) -> None:
+        m, o = self._order()
+        m.approve(o.order_id)
+        m.submit(o.order_id)
+        m.cancel(o.order_id)
+        for target in (m.approve, m.submit, m.acknowledge, m.cancel):
+            with pytest.raises(OrderStateError, match="terminal"):
+                target(o.order_id)
+        assert m.orders[o.order_id].status == OrderStatus.CANCELLED
+
+    def test_created_to_rejected_and_cancelled_allowed(self) -> None:
+        m, o = self._order("R1")
+        assert m.reject(o.order_id, "risco").status == OrderStatus.REJECTED
+        m2, o2 = self._order("C1")
+        assert m2.cancel(o2.order_id).status == OrderStatus.CANCELLED
+
+    def test_reject_reason_side_effect_preserved(self) -> None:
+        m, o = self._order()
+        rej = m.reject(o.order_id, "motivo")
+        assert rej.reject_reason == "motivo"
+
+    def test_self_transition_created_invalid(self) -> None:
+        """CREATED -> CREATED no esta en el grafo (debe rechazarse)."""
+        m, o = self._order()
+        with pytest.raises(OrderStateError, match="inválida"):
+            m._transition(o.order_id, OrderStatus.CREATED)
+        assert m.orders[o.order_id].status == OrderStatus.CREATED
+
+    def test_self_transition_partially_filled_allowed(self) -> None:
+        """PARTIALLY_FILLED -> PARTIALLY_FILLED si esta permitido (grafo)."""
+        from execution.order import Fill
+
+        m = OrderManager()
+        o = m.create_order(**_make(quantity=5))
+        m.apply_fill(o.order_id, Fill(order_id=o.order_id, quantity=1, price=100.0))
+        assert m.orders[o.order_id].status == OrderStatus.PARTIALLY_FILLED
+        # self-transition explicita via _transition
+        same = m._transition(o.order_id, OrderStatus.PARTIALLY_FILLED)
+        assert same.status == OrderStatus.PARTIALLY_FILLED
+
+    def test_all_terminal_states_have_no_outgoing(self) -> None:
+        from execution.order_manager import ALLOWED_TRANSITIONS
+
+        for status in (
+            OrderStatus.FILLED,
+            OrderStatus.CANCELLED,
+            OrderStatus.REJECTED,
+            OrderStatus.EXPIRED,
+            OrderStatus.FAILED,
+            OrderStatus.UNKNOWN,
+        ):
+            assert ALLOWED_TRANSITIONS[status] == frozenset()
+
+
 class TestFills:
     def test_full_fill(self) -> None:
         manager = OrderManager()

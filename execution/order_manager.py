@@ -19,6 +19,73 @@ class OrderStateError(ValueError):
     """Transición de estado inválida o duplicación de orden."""
 
 
+# F-07: grafo contractual de transiciones (fuente unica de verdad).
+# Reconstruido de 06_EXECUTION_OPERATION.md §7 (lifecycle) y de los callers
+# reales (backtesting/papertrading: create -> approve -> submit ->
+# acknowledge/fill/reject/cancel). Los estados terminales no admiten salida.
+ALLOWED_TRANSITIONS: dict[OrderStatus, frozenset[OrderStatus]] = {
+    OrderStatus.CREATED: frozenset({
+        OrderStatus.RISK_CHECKED,
+        OrderStatus.APPROVED,
+        OrderStatus.REJECTED,
+        OrderStatus.CANCELLED,
+    }),
+    OrderStatus.RISK_CHECKED: frozenset({
+        OrderStatus.APPROVED,
+        OrderStatus.REJECTED,
+        OrderStatus.CANCELLED,
+    }),
+    OrderStatus.APPROVED: frozenset({
+        OrderStatus.SUBMITTING,
+        OrderStatus.SUBMITTED,
+        OrderStatus.REJECTED,
+        OrderStatus.CANCELLED,
+    }),
+    OrderStatus.SUBMITTING: frozenset({
+        OrderStatus.SUBMITTED,
+        OrderStatus.ACKNOWLEDGED,
+        OrderStatus.REJECTED,
+        OrderStatus.UNKNOWN,
+        OrderStatus.FAILED,
+    }),
+    OrderStatus.SUBMITTED: frozenset({
+        OrderStatus.ACKNOWLEDGED,
+        OrderStatus.PARTIALLY_FILLED,
+        OrderStatus.FILLED,
+        OrderStatus.REJECTED,
+        OrderStatus.CANCELLED,
+        OrderStatus.EXPIRED,
+        OrderStatus.UNKNOWN,
+        OrderStatus.FAILED,
+    }),
+    OrderStatus.ACKNOWLEDGED: frozenset({
+        OrderStatus.PARTIALLY_FILLED,
+        OrderStatus.FILLED,
+        OrderStatus.REJECTED,
+        OrderStatus.CANCELLED,
+        OrderStatus.EXPIRED,
+        OrderStatus.UNKNOWN,
+        OrderStatus.FAILED,
+    }),
+    OrderStatus.PARTIALLY_FILLED: frozenset({
+        OrderStatus.PARTIALLY_FILLED,
+        OrderStatus.FILLED,
+        OrderStatus.REJECTED,
+        OrderStatus.CANCELLED,
+        OrderStatus.EXPIRED,
+        OrderStatus.UNKNOWN,
+        OrderStatus.FAILED,
+    }),
+    # Terminales: sin salidas.
+    OrderStatus.FILLED: frozenset(),
+    OrderStatus.CANCELLED: frozenset(),
+    OrderStatus.REJECTED: frozenset(),
+    OrderStatus.EXPIRED: frozenset(),
+    OrderStatus.FAILED: frozenset(),
+    OrderStatus.UNKNOWN: frozenset(),
+}
+
+
 @dataclass(slots=True)
 class OrderManager:
     """Registra y controla órdenes en memoria (MVP).
@@ -154,6 +221,13 @@ class OrderManager:
         return updated
 
     def _transition(self, order_id: str, target: OrderStatus) -> Order:
+        """Aplica una transición SOLO si pertenece al grafo contractual.
+
+        La validez se comprueba ANTES de cualquier mutación: una transición
+        inválida deja la orden intacta y no produce side effects. Estados
+        terminales no admiten salida. `from == to` solo es válido si el grafo
+        lo permite explícitamente (p. ej. PARTIALLY_FILLED → PARTIALLY_FILLED).
+        """
         order = self.orders.get(order_id)
         if order is None:
             raise KeyError(f"Orden desconocida: {order_id}")
@@ -161,6 +235,12 @@ class OrderManager:
             raise OrderStateError(
                 f"No se puede pasar {order.status.value} → {target.value} "
                 f"(orden terminal)"
+            )
+        allowed = ALLOWED_TRANSITIONS.get(order.status, frozenset())
+        if target not in allowed:
+            raise OrderStateError(
+                f"Transición de estado inválida: {order.status.value} → "
+                f"{target.value}"
             )
         self.orders[order_id] = replace(order, status=target)
         return self.orders[order_id]
