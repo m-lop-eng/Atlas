@@ -263,52 +263,53 @@ Cobertura por módulo crítico (term-missing):
 - **no cerrado del todo** hasta la validación de regresión completa (suite
   entera verde + revisión).
 
-### F-06 — `_internal_snapshot()` toma la cuenta del propio broker — **REQUIRES MINI-SPEC / INFRASTRUCTURE GAP**
+### F-06 — ledger interno autoritativo + ACCOUNT reconciliation — **IN PROGRESS — F-06A/F-06B IMPLEMENTED; F-06C PENDING**
 - ID: F-06
 - severidad: **MEDIUM**
-- archivo: `papertrading/engine.py` (`_internal_snapshot`), `reconciliation/orchestrator.py`
-- **estado: REQUIRES MINI-SPEC / INFRASTRUCTURE GAP** — NO corregido.
-- **Hallazgo: CONFIRMADO (ACCOUNT tautológico).**
-- **Flujo actual**:
-  - `_internal_snapshot()` → `account = AccountSnapshot(acct...)` desde
-    `self.broker.get_account_state()` (`papertrading/engine.py:701-702`).
-  - `broker_state_from_adapter()` → `account` desde el **mismo**
-    `adapter.get_account_state()` (`orchestrator.py:91-96`).
-  - `_reconcile_account` compara `internal.account` vs `broker.account` → ambas
-    derivan del broker → **siempre MATCH** (salvo mutación síncrona inexistente).
-- **Qué NO puede detectarse**: cualquier divergencia real entre el cash/equity
-  que Atlas *debería* tener (por sus propios fills/P&L) y el que el broker
-  declara. La reconciliación ACCOUNT no aporta contraste.
-- **Independencia de fuentes**:
-
-| Fuente | Representa | Independiente del broker | Integrada runtime | Adecuada expected |
-|---|---|---:|---:|---:|
-| Portfolio (`portfolio/`) | exposición agregada (descriptiva) | Sí | **No** (0 importadores) | No |
-| OrderManager (`execution/`) | ciclo de órdenes | Sí | Sí | Solo ORDER/FILL |
-| Database (`database/`) | ORM | Sí | **No** (0 importadores) | No |
-| Backtest state | realized P&L interno | Sí | Sí | No (no reconcilia) |
-| `_last_cash/_last_equity` | caché del broker | **No** | Sí | No |
-| Broker account | cash/equity del broker | **No** | Sí | No (para expected) |
-
-- **No existe** hoy un ledger interno de cash/equity independiente. `PaperBrokerAdapter`
-  es fuente observada + ejecutora + única poseedora de cash/positions.
-- **ORDER/FILL/POSITION** sí comparan `OrderManager`/`_position` (interno) vs broker
-  → independientes; **no afectados** por F-06.
-- **Por qué NO se hace un pseudo-fix**: copiar el estado del broker a otro objeto
-  sería una segunda referencia, no independencia semántica; no detectaría nada.
-- **Mini-spec necesaria (fuera de una corrección puntual)**:
-  - componente que **posea** el ledger interno (candidato: un `AccountLedger`);
-  - **eventos** que lo actualicen (fills adoptados, P&L realizado/no realizado,
-    costes) — el `PaperTradingEngine` ya tiene `_realized_pnl`/fills, pero no un
-    cash/equity interno **autoritativo e independiente**;
-  - **qué compara ACCOUNT**: cash y equity internos vs `broker.get_account_state()`;
-  - integrar el ledger en el lifecycle de paper (hoy el cash/equity se leen del
-    broker en `_mark`);
-  - decidir el alcance (paper primero; backtest no reconcilia).
-- **Evidencia**: inspección de `reconciliation/`, `papertrading/engine.py`,
-  `portfolio/`, `database/` (0 integración).
-- **no se implementa gate ni ledger ad hoc.**
-- **no cerrado** hasta su mini-spec.
+- archivo: `papertrading/ledger.py`, `papertrading/engine.py`, `reconciliation/orchestrator.py`
+- **estado: IN PROGRESS — F-06A/F-06B IMPLEMENTED; F-06C PENDING** (no `RESOLVED` todavía).
+- **Hallazgo original: CONFIRMADO (ACCOUNT tautológico).** `_internal_snapshot().account`
+  todavía obtiene la cuenta del broker (`self.broker.get_account_state()`,
+  `papertrading/engine.py:793`), igual que `broker_state_from_adapter()`
+  (`orchestrator.py`); por tanto la reconciliación ACCOUNT **sigue siendo
+  tautológica** (siempre MATCH, salvo mutación síncrona inexistente).
+- **F-06A — IMPLEMENTED, cerrado en commit `4bb66c2`**:
+  - `AccountLedger` (`papertrading/ledger.py`) = **autoridad interna única** de
+    `cash`, `positions` (quantity dirigida + avg_entry) y `realized_pnl`.
+  - Bootstrap **por configuración** (`initial_cash`; nunca del broker).
+  - `PaperTradingEngine._position` es **proyección** (metadata operativa), no
+    autoridad contable; `realized_pnl` delegado al ledger.
+  - Fill identity estable `(client_order_id, fill_sequence)`; idempotencia
+    individual **y** de lote multi-fill.
+  - Accounting spot/`point_value=1`/USD: BUY `cash-=q·p`, SELL `cash+=q·p`;
+    LONG/SHORT/reducción/cierre preservados.
+- **F-06B — IMPLEMENTED, pendiente de commit**:
+  - Derivaciones internas (estado **derivado**, no primario) en
+    `AccountLedger.valuation(marks) -> ValuationSnapshot`:
+    `equity = cash + Σ quantity·mark` (sin `abs`; conserva F-05),
+    `unrealized = Σ quantity·(mark − avg_entry)`,
+    `gross = Σ |quantity·mark|`, `net = Σ quantity·mark`, `by_instrument` (signed
+    notional).
+  - Marks del runtime de mercado (`PaperTradingEngine._marks()`, mismo
+    `price_source` que el PaperBroker); mark inválido/ausente con posición
+    abierta → `valuation()=None` (fail-closed); sin posiciones → `equity=cash`.
+  - `PaperTradingEngine._mark()` deriva de `ledger.cash` + `ledger.valuation()`
+    en lugar de `broker.get_account_state()`; salud de broker/monitoring intactos.
+- **F-06C — PENDING**: conectará `expected_account` al **ledger** (romperá la
+  tautología de ACCOUNT). Requiere cambiar `_internal_snapshot()` para usar
+  `{cash, equity}` del ledger con el mark compartido. NO implementado.
+- **ORDER/FILL/POSITION** ya eran independientes (OrderManager/`_position` vs
+  broker); no afectados.
+- **Fuera de F-06 (deuda F-06A/B)**: **I2** reversión LONG↔SHORT (semántica
+  pre-existente, sin re-anclaje de avg_entry), **I3** snapshots legacy restauran
+  `applied_fills=[]`, **I4** comisiones no aplicadas (fase posterior).
+- **Issues no bloqueantes conocidos (F-06B)**: **I5** `BROKER_ERROR` usado como
+  etiqueta de audit para mark inválido (semánticamente sería market-data/
+  degraded; no existe taxonomía equivalente, no se inventa). **I6** `_valid_mark`
+  exige `finite && >0` (supuesto razonable para el modelo spot de Fase 1).
+- **Evidencia**: `papertrading/ledger.py`, `papertrading/engine.py`,
+  `reconciliation/orchestrator.py`. Suite **896 passed**; `ledger.py` 100%.
+- **NO cerrado** hasta F-06C.
 
 ### F-07 — `OrderManager` admite transiciones de estado inválidas — **RESOLVED — pending commit**
 - ID: F-07

@@ -681,16 +681,22 @@ class PaperTradingEngine:
     # ---------------------------------------------------------- mark / equity
 
     def _mark(self, bar: dict, closed: ClosedBarEvent, now: datetime) -> None:
-        try:
-            self._set_price(float(bar["close"]))
-            acct = self.broker.get_account_state()
-        except BrokerError:
-            self._broker_errors += 1
-            self._audit_rec(PaperEvent.BROKER_ERROR, {"detail": "mark sin broker"})
-            return
+        # F-06B: la valoracion interna se DERIVA del ledger + mark del runtime,
+        # NO de `broker.get_account_state()` (el expected interno no depende del
+        # broker). El broker sigue alimentando solo el `price_source` de fills.
+        self._set_price(float(bar["close"]))
         self._note_broker_success(now)
-        self._last_cash = acct.cash
-        self._last_equity = acct.equity
+        marks = self._marks()
+        val = self._ledger.valuation(marks)
+        if val is None:
+            # Fail-closed: posicion abierta sin mark valido -> valoracion
+            # incompleta. NO se emite equity falsa; no se muta accounting.
+            self._audit_rec(
+                PaperEvent.BROKER_ERROR, {"detail": "mark invalido/ausente"}
+            )
+            return
+        self._last_cash = self._ledger.cash
+        self._last_equity = val.equity
         self._equity_curve.append([closed.open_time, self._last_equity])
         self._peak_equity = max(self._peak_equity, self._last_equity)
         day = _dt_from_open(closed.close_time).date()
@@ -698,6 +704,19 @@ class PaperTradingEngine:
             self._day_key = day
             self._day_start_equity = self._last_equity
         self._day_pnl = self._last_equity - (self._day_start_equity or 0.0)
+
+    def _marks(self) -> dict[str, float]:
+        """Marks por instrumento para la valoracion (runtime de mercado).
+
+        En paper, el precio de la barra en curso es el mark vigente del
+        instrumento (misma referencia que usa el PaperBroker para fills).
+        """
+        try:
+            return {self.config.instrument: float(self.broker.price_source(
+                self.config.instrument
+            ))}
+        except Exception:  # noqa: BLE001 - price_source no disponible
+            return {}
 
     # ------------------------------------------------------- broker helpers
 

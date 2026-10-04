@@ -23,6 +23,8 @@ de reporting; NO se suma a equity (equity = cash + Σ quantity*mark, F-06B).
 
 from __future__ import annotations
 
+import math
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 
 _EPS = 1e-9
@@ -30,6 +32,14 @@ _EPS = 1e-9
 
 class LedgerError(ValueError):
     """Fill no aplicable al modelo contable de Fase 1."""
+
+
+def _valid_mark(price: object) -> bool:
+    """Mark valido: numero, finito y > 0 (nunca NaN/Inf/0/negativo)."""
+    if not isinstance(price, (int, float)):
+        return False
+    p = float(price)
+    return math.isfinite(p) and p > 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,6 +53,21 @@ class LedgerPosition:
     @property
     def is_long(self) -> bool:
         return self.quantity > 0
+
+
+@dataclass(frozen=True, slots=True)
+class ValuationSnapshot:
+    """Estado DERIVADO de valoracion (F-06B). No es estado primario.
+
+    `equity`/`unrealized_pnl`/exposure son funciones puras de
+    cash+positions+marks; un cambio de mark NO muta cash/positions/realized.
+    """
+
+    equity: float
+    unrealized_pnl: float
+    gross_exposure: float
+    net_exposure: float
+    exposure_by_instrument: dict[str, float] = field(default_factory=dict)
 
 
 @dataclass
@@ -178,6 +203,64 @@ class AccountLedger:
         self._realized_pnl += pnl
         return pnl
 
+    # ------------------------------------------------- derivaciones (F-06B)
+
+    def _open_positions(self) -> tuple[LedgerPosition, ...]:
+        return tuple(
+            p for p in self._positions.values() if abs(p.quantity) > _EPS
+        )
+
+    def valuation(self, marks: Mapping[str, float]) -> "ValuationSnapshot | None":
+        """Deriva equity/unrealized/exposure de cash+positions+marks.
+
+        Retorna `None` (valoracion INCOMPLETA, fail-closed) si alguna posicion
+        abierta carece de mark valido (ausente/NaN/Inf/<=0). Sin posiciones
+        abiertas no se requiere mark: `equity = cash`, exposure 0.
+        NO muta cash/positions/realized.
+
+        Fase 1: spot/equity, `point_value = 1`, moneda unica USD.
+        """
+        open_positions = self._open_positions()
+        by_instrument: dict[str, float] = {}
+        unrealized = 0.0
+        gross = 0.0
+        net = 0.0
+        for pos in open_positions:
+            mark = marks.get(pos.instrument)
+            if not _valid_mark(mark):
+                return None  # fail-closed: no emitir valoracion completa
+            m = float(mark)  # type: ignore[arg-type]
+            notional = pos.quantity * m
+            net += notional
+            gross += abs(notional)
+            unrealized += pos.quantity * (m - pos.avg_entry_price)
+            by_instrument[pos.instrument] = notional
+        # `equity = cash + Σ quantity*mark` (sin abs; conserva F-05).
+        equity = self._cash + net
+        return ValuationSnapshot(
+            equity=equity,
+            unrealized_pnl=unrealized,
+            gross_exposure=gross,
+            net_exposure=net,
+            exposure_by_instrument=by_instrument,
+        )
+
+    def equity(self, marks: Mapping[str, float]) -> float | None:
+        val = self.valuation(marks)
+        return None if val is None else val.equity
+
+    def unrealized_pnl(self, marks: Mapping[str, float]) -> float | None:
+        val = self.valuation(marks)
+        return None if val is None else val.unrealized_pnl
+
+    def gross_exposure(self, marks: Mapping[str, float]) -> float | None:
+        val = self.valuation(marks)
+        return None if val is None else val.gross_exposure
+
+    def net_exposure(self, marks: Mapping[str, float]) -> float | None:
+        val = self.valuation(marks)
+        return None if val is None else val.net_exposure
+
     # ------------------------------------------------------- snapshot/restore
 
     def snapshot(self) -> dict:
@@ -212,4 +295,9 @@ class AccountLedger:
         }
 
 
-__all__ = ["AccountLedger", "LedgerError", "LedgerPosition"]
+__all__ = [
+    "AccountLedger",
+    "LedgerError",
+    "LedgerPosition",
+    "ValuationSnapshot",
+]
