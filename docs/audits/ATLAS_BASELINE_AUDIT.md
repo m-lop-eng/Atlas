@@ -450,22 +450,57 @@ Cobertura por módulo crítico (term-missing):
 - recomendación: validar orden y fallar (o registrar issue) en vez de reordenar
   silenciosamente.
 
-### F-11 — `config/production/settings.yaml`: `null` en métricas de riesgo
+### F-11 — `config/production/settings.yaml`: `null` en métricas de riesgo — **REQUIRES DECISION (config no ejecutable)**
 - ID: F-11
-- severidad: **HIGH**
-- archivo: `config/production/settings.yaml` (`risk.*: null`)
-- descripción: `max_open_positions/risk_per_trade/max_daily_loss/max_drawdown = null`.
-  `config.load_config` **no** valida el bloque `risk`; `RiskConfig` solo se
-  construye desde el `config.yaml` de experimento, no desde `settings.yaml`. No
-  hay camino que hoy consuma `settings.yaml.risk`, pero tampoco hay guard: si se
-  consume, `null` no es `float`/`int` y `RiskConfig.__post_init__` compararía
-  `null` → `TypeError` o valores inválidos.
-- impacto: configuración de producción aparentemente sin límites de riesgo; sin
-  validación mecánica.
-- evidencia: `config/production/settings.yaml`; `config/loader.py` no toca `risk`.
-- test existente: `test_config.py` (no valida `risk`).
-- test necesario: validar que producción exige métricas de riesgo no nulas.
-- recomendación: validación explícita del bloque `risk` por entorno.
+- severidad: **HIGH** (reclasificada: el vector real es plantilla, no runtime)
+- archivo: `config/production/settings.yaml`, `config/loader.py`
+- **estado: REQUIRES DECISION** — NO implementado.
+- **Reclasificación (Opción B)**: `config/production/settings.yaml` **NO es
+  configuración ejecutable** en ningún runtime. Es una **plantilla/placeholder**.
+- **Qué significa "production"**: `EnvName.PRODUCTION` existe solo en el loader;
+  `load_config`/`load_environment` **no tienen ningún consumidor de runtime**
+  (0 callers fuera de `config/` y `tests/test_config.py`).
+- **Path exacto**:
+  - `config/<env>/settings.yaml → config.loader.load_config → dict` (sin modelo
+    ni validación de `risk`) → **ningún consumidor de ejecución**.
+  - La config real de ejecución proviene del **`config.yaml` de experimento**
+    (`research/pipeline.build_engine: RiskConfig(**cfg["risk"])`) y de
+    `config/paper/settings.yaml` + frozen `config/final_oos/config.yaml`
+    (`forward_runner`). **Nunca** de `production/settings.yaml`.
+  - `docker-compose` fija `ATLAS_ENV=development` y el CMD es `pytest`.
+- **Inventario `risk.*` de production**: `max_open_positions`, `risk_per_trade`,
+  `max_daily_loss`, `max_drawdown` = `null` (placeholders). `portfolio`,
+  `execution`, `database`, `logging` con valores.
+- **Semántica de los `null`**: **placeholders intencionales** de plantilla, no
+  "desactivado". No hay sustitución documentada ni default aplicado.
+- **Validación existente antes del fix**: `load_config` valida solo que el YAML
+  sea un `dict` y exista; **no** toca `risk`. `RiskConfig.__post_init__` validaría
+  rango, pero **nunca recibe** estos `null` (ningún camino los conecta).
+- **¿Ya existe fail-closed?**: **No aplicable al runtime** — no hay camino que
+  cargue production/settings en ejecución, así que los `null` **no pueden**
+  producir un arranque inseguro hoy.
+- **Causa raíz**: discrepancia entre la **promesa del loader** ("ningún valor por
+  defecto silencioso para métricas de riesgo en producción... detiene el
+  arranque") y la realidad (el loader no valida `risk`, y no tiene caller de
+  runtime). Es un **gap de contrato de configuración**, no un bug explotable.
+- **Por qué NO implementar ahora**:
+  - El archivo no participa en ningún startup path; añadir un fail-closed "de
+    producción" sin caller inventaría contrato.
+  - Rellenar los `null` con valores sería inventar parámetros de riesgo
+    (prohibido).
+  - Hacer que `load_config("production")` valide el bloque `risk` rompería
+    `test_config::test_load_string_env` (que hoy espera éxito) y cambiaría la
+    semántica del loader sin decisión.
+- **Decisión humana necesaria**: elegir política de configuración de producción:
+  1. **plantilla documental** → marcar el archivo como no-ejecutable (p. ej.
+     cabecera/renombrado) y no validar; o
+  2. **config ejecutable** → completar los `risk.*` con valores reales (humano) y
+     endurecer `load_config` a fail-closed en `production` (reutilizando la
+     validación de `RiskConfig`, sin defaults).
+- **Hallazgo incidental (NO corregido)**: `load_config`/`load_environment` sin
+  integración en el arranque real (posible dead code o pendiente de wiring).
+- **no cerrado** hasta la decisión.
+- **No se modificó F-04** ni ningún otro hallazgo.
 
 ## Suspected Findings
 
