@@ -211,23 +211,42 @@ Cobertura por módulo crítico (term-missing):
 - recomendación: integrar `portfolio`/exposición en el veto o marcar explícito
   como no implementado (MVP).
 
-### F-04 — `PaperTradingEngine._risk_state()` fija kill_switch/account_active/strategy_active
+### F-04 — `PaperTradingEngine._risk_state()` fija kill_switch/account_active/strategy_active — **REFUTED (separación contractual)**
 - ID: F-04
-- severidad: **MEDIUM**
+- severidad: **LOW** (reclasificada de MEDIUM)
 - archivo: `papertrading/engine.py` (`_risk_state`)
-- descripción: siempre pasa `kill_switch=False`, `account_active=True`,
-  `strategy_active=True`. El kill switch se consulta **aparte** en
-  `_execute_pending` (`self.kill_switch.status().can_trade`), por lo que B5 sí
-  bloquea la entrada; pero el RiskEngine **nunca** puede vetar por kill switch ni
-  por cuenta/estrategia inactiva en este camino.
-- impacto: doble fuente de decisión; el `checks` del RiskEngine es incompleto en
-  paper. No es un bypass (B5 sigue aplicando), es una divergencia de contrato.
-- evidencia: código `_risk_state`.
-- test existente: `test_paper_trading.py`, `test_kill_switches.py`.
-- test necesario: garantizar que el veto efectivo (B5 en `_execute_pending`) no
-  puede saltarse y documentar la separación.
-- recomendación: pasar el estado real de B5/cuenta al `AccountRiskState` o
-  documentar que el veto de kill switch vive exclusivamente en B5.
+- **estado: REFUTED** — no es un bug; es separación de responsabilidades.
+- **Investigación**: `RiskEngine.validate` comprueba `strategy_active`,
+  `account_active` y `kill_switch`. `_risk_state()` pasa `kill_switch=False`,
+  `account_active=True`, `strategy_active=True`, y el kill switch se aplica en
+  su **propio gate** en `_execute_pending` (`self.kill_switch.status().can_trade`).
+
+| Campo | Valor actual | Fuente real disponible | ¿Hardcode correcto? | ¿Debe cambiar? |
+|---|---|---|---|---|
+| kill_switch | `False` | `self.kill_switch.status().can_trade` | **Sí (separación B5)** | **No** |
+| account_active | `True` | ninguna (no hay lifecycle de cuenta) | Sí (contractual) | No |
+| strategy_active | `True` | ninguna (1 estrategia siempre activa) | Sí (contractual) | No |
+
+- **kill_switch**: B5 es una **capa de autorización separada** (`06 §36-37`,
+  `03 §36-37`: "el monitor detecta, B5 decide"), con un único punto de
+  enforcement (`_execute_pending`). Duplicarla dentro de `RiskEngine` sería un
+  **segundo punto de decisión** sobre la misma condición (el propio `06` describe
+  kill switches como capa aparte del risk sizing). Los tests existentes
+  (`test_active_kill_switch_never_reaches_broker`,
+  `test_fail_then_recover_then_trade_again`) **codifican** que el bloqueo se
+  registra como `ENTRY_SKIPPED_KILL_SWITCH` (gate de ejecución), **no** como
+  `RISK_REJECTED`.
+- **Verificación empírica**: al cablear `kill_switch` en `_risk_state()` (probado
+  y revertido), el veto se movía al RiskEngine (`RISK_REJECTED`) y **rompía 2
+  tests** que documentan el diseño de un solo gate. Eso confirma que el `False`
+  es **deliberado**, no una desincronización.
+- **account_active**: no existe estado de cuenta/suspensión (ni en
+  `PaperBrokerAdapter`, ni config, ni método). En paper la cuenta está siempre
+  abierta → constante contractual.
+- **strategy_active**: no existe enable/disable/halt por estrategia; el engine
+  opera una única estrategia siempre activa → constante contractual.
+- **Conclusión**: no hay divergencia de contrato. No se modifica.
+- **No se tocó** F-02/F-03/F-06/F-07.
 
 ### F-05 — `PaperBrokerAdapter.get_account_state()` equity de SHORT — **RESOLVED — pending full regression validation**
 - ID: F-05
