@@ -789,12 +789,22 @@ class PaperTradingEngine:
             if pos is not None
             else ()
         )
-        account = None
-        try:
-            acct = self.broker.get_account_state()
-            account = AccountSnapshot(acct.account_id, acct.cash, acct.equity)
-        except BrokerError:
-            account = None
+        # F-06C: la cuenta ESPERADA (expected) procede del ledger interno
+        # (autoridad contable), NO del broker. El broker alimenta únicamente el
+        # lado OBSERVED/actual (`broker_state_from_adapter`); así ACCOUNT deja de
+        # ser tautológico y una divergencia real ledger vs broker se detecta.
+        # Mark: el mismo del runtime (`_marks()`, fijado por `_mark()`), sin
+        # persistirlo ni cachearlo aparte. Si la valoración no es completa
+        # (posición abierta sin mark válido) -> `account=None` (UNKNOWN), sin
+        # fabricar equity ni consultar al broker.
+        val = self._ledger.valuation(self._marks())
+        account = (
+            None
+            if val is None
+            else AccountSnapshot(
+                self.config.account_id, self._ledger.cash, val.equity
+            )
+        )
         return InternalSnapshot(
             orders=tuple(orders), fills=tuple(fills), positions=positions, account=account
         )

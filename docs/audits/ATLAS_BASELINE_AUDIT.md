@@ -263,16 +263,18 @@ Cobertura por módulo crítico (term-missing):
 - **no cerrado del todo** hasta la validación de regresión completa (suite
   entera verde + revisión).
 
-### F-06 — ledger interno autoritativo + ACCOUNT reconciliation — **IN PROGRESS — F-06A ✅ / F-06B ✅ / F-06C-RESTART ✅ (PENDING REVIEW) / F-06C ACCOUNT ⏳**
+### F-06 — ledger interno autoritativo + ACCOUNT reconciliation — **RESOLVED**
 - ID: F-06
 - severidad: **MEDIUM**
 - archivo: `papertrading/ledger.py`, `papertrading/engine.py`, `brokers/paper.py`, `reconciliation/orchestrator.py`
-- **estado: IN PROGRESS — F-06A ✅ / F-06B ✅ / F-06C-RESTART ✅ (IMPLEMENTED, PENDING REVIEW) / F-06C ACCOUNT esperado ⏳** (no `RESOLVED` todavía).
-- **Hallazgo original: CONFIRMADO (ACCOUNT tautológico).** `_internal_snapshot().account`
-  todavía obtiene la cuenta del broker (`self.broker.get_account_state()`,
-  `papertrading/engine.py:793`), igual que `broker_state_from_adapter()`
-  (`orchestrator.py`); por tanto la reconciliación ACCOUNT **sigue siendo
-  tautológica** (siempre MATCH, salvo mutación síncrona inexistente).
+- **estado: RESOLVED — F-06A ✅ / F-06B ✅ / F-06C-RESTART ✅ / F-06C ACCOUNT ✅.**
+- **Hallazgo original: CONFIRMADO y CORREGIDO (ACCOUNT tautológico).**
+  `_internal_snapshot().account` obtenía la cuenta del broker
+  (`self.broker.get_account_state()`), igual que `broker_state_from_adapter()`
+  (`orchestrator.py`); la reconciliación ACCOUNT era **tautológica** (siempre
+  MATCH). Ahora `expected.account` procede del **ledger** y `actual.account` del
+  **broker** (fuentes independientes): una divergencia real produce ACCOUNT
+  MISMATCH → RECONCILIATION_BLOCKED.
 - **F-06A — IMPLEMENTED, cerrado en commit `4bb66c2`**:
   - `AccountLedger` (`papertrading/ledger.py`) = **autoridad interna única** de
     `cash`, `positions` (quantity dirigida + avg_entry) y `realized_pnl`.
@@ -295,7 +297,7 @@ Cobertura por módulo crítico (term-missing):
     abierta → `valuation()=None` (fail-closed); sin posiciones → `equity=cash`.
   - `PaperTradingEngine._mark()` deriva de `ledger.cash` + `ledger.valuation()`
     en lugar de `broker.get_account_state()`; salud de broker/monitoring intactos.
-- **F-06C-RESTART — IMPLEMENTED, PENDING REVIEW (sin commit)**: al derivar
+- **F-06C-RESTART — IMPLEMENTED, cerrado en commit `c722896`**: al derivar
   `expected_account` del ledger, el restart revela que el `PaperBrokerAdapter`
   **no rehidrataba** su estado observed (broker fresco → ACCOUNT MISMATCH →
   kill switch). Se implementó persistencia **independiente** del broker:
@@ -317,10 +319,16 @@ Cobertura por módulo crítico (term-missing):
     `validate_snapshot`/`AccountLedger.probe_snapshot` permiten al engine
     prevalidar ledger+broker+metadata ANTES de aplicar, de modo que un snapshot
     invalido deja el engine intacto (ISS-1/ISS-2 de la review, corregidos).
-- **F-06C ACCOUNT esperado — ⏳ PENDING (no implementado)**: conectará
-  `expected_account` al **ledger** (`{cash, equity}`) rompiendo la tautología de
-  ACCOUNT. Requiere cambiar `_internal_snapshot()`; se hará **después** de
-  F-06C-RESTART. `ReconciliationEngine`/`broker_state_from_adapter` **no** tocados.
+- **F-06C ACCOUNT esperado — IMPLEMENTED (sin commit)**: `_internal_snapshot()`
+  ahora construye `expected_account` desde el **ledger**:
+  `cash = ledger.cash`, `equity = ledger.valuation(current_marks).equity` (mark
+  del runtime `_marks()`, mismo que el broker, fijado por `_mark()`).
+  `actual_account` sigue procediendo del broker (`broker_state_from_adapter`).
+  Si `valuation()` es `None` (posición abierta sin mark válido) →
+  `account=None` (UNKNOWN), sin fabricar equity ni consultar al broker.
+  No hay ruta `broker → expected`. `ReconciliationEngine`/tolerancia 1e-9 y
+  `broker_state_from_adapter` **no** tocados; POSITION/ORDER/FILL intactos.
+  Tests: `tests/test_account_reconciliation.py` (17) + `TestRestart` adaptado.
 - **ORDER/FILL/POSITION** ya eran independientes (OrderManager/`_position` vs
   broker); no afectados.
 - **Fuera de F-06 (deuda F-06A/B)**: **I2** reversión LONG↔SHORT (semántica
@@ -332,8 +340,11 @@ Cobertura por módulo crítico (term-missing):
   exige `finite && >0` (supuesto razonable para el modelo spot de Fase 1).
 - **Evidencia**: `papertrading/ledger.py`, `papertrading/engine.py`,
   `brokers/paper.py`, `tests/test_broker_restart.py`,
-  `reconciliation/orchestrator.py`. Suite **921 passed**; `ledger.py` 100%.
-- **NO cerrado** hasta F-06C ACCOUNT.
+  `tests/test_account_reconciliation.py`, `reconciliation/orchestrator.py`.
+  Suite **938 passed**; `ledger.py` 100%. ACCOUNT match/mismatch, tolerancia,
+  valuation-unavailable, independencia (broker→expected prohibido) y restart
+  (consistente→MATCH / divergente→MISMATCH) cubiertos por tests.
+- **RESOLVED.** Deuda I2/I3/I4/I5/I6 sigue **fuera** de F-06 (no bloqueante).
 
 ### F-07 — `OrderManager` admite transiciones de estado inválidas — **RESOLVED — pending commit**
 - ID: F-07
