@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: pytest (${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Version representativa alineada con `requires-python = ">=3.12"`.
+        # Una matriz multi-version puede anadirse como mejora futura.
+        python-version: ["3.12"]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install (editable + dev extras)
+        # Instalacion contractual desde pyproject.toml; no se duplica la lista
+        # de dependencias.
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+
+      - name: Test (pytest)
+        run: python -m pytest
+
+      - name: Coverage (pytest-cov)
+        # Reporta cobertura; sin threshold obligatorio (el repo no define uno).
+        run: python -m pytest --cov=. --cov-report=term-missing
