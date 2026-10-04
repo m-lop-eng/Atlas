@@ -229,6 +229,7 @@ def _stack(
         kill_switch,
         monitoring,
         clock=clock,
+        initial_cash=initial_cash,  # F-06A: bootstrap del ledger (misma config)
         config=PaperEngineConfig(instrument=INSTRUMENT, account_id="PAPER-01"),
     )
     return SimpleNamespace(
@@ -450,7 +451,10 @@ class TestFills:
                     )
                 now = self.clock()
                 bid = f"BRK-{self._broker_seq_num():06d}"
-                fs = tuple(BrokerFill(bid, q, p, now) for q, p in fills)
+                fs = tuple(
+                    BrokerFill(bid, q, p, now, fill_sequence=i)
+                    for i, (q, p) in enumerate(fills)
+                )
                 total = sum(q for q, _ in fills)
                 cost = sum(q * p for q, p in fills)
                 if order.side.value == "BUY":
@@ -502,6 +506,7 @@ class TestFills:
             KillSwitchCoordinator(clock=clock),
             MonitoringEngine(clock=clock),
             clock=clock,
+            initial_cash=broker.initial_cash,  # F-06A: misma config que el broker
             config=PaperEngineConfig(instrument=INSTRUMENT),
         )
         return SimpleNamespace(
@@ -528,6 +533,42 @@ class TestFills:
         expected_vwap = (1.0 * 50_100.0 + 1.5 * 50_130.0) / 2.5
         assert pos.quantity == pytest.approx(2.5)
         assert pos.avg_entry_price == pytest.approx(expected_vwap)
+
+    def test_multi_fill_batch_registers_every_identity(self):
+        """I1: cada fill del lote queda registrado como aplicado (seq 0 y 1)."""
+        env = self._engine_with([(1.0, 50_100.0), (1.5, 50_130.0)])
+        _drive(env, HAPPY[:4])
+        cid = next(iter(env.broker._orders))
+        led = env.engine.ledger
+        assert led.is_applied(cid, 0) is True
+        assert led.is_applied(cid, 1) is True
+
+    def test_multi_fill_batch_reapply_is_idempotent(self):
+        """I1: reaplicar EXACTAMENTE el mismo lote multi-fill es un no-op."""
+        env = self._engine_with([(1.0, 50_100.0), (1.5, 50_130.0)])
+        _drive(env, HAPPY[:4])
+        led = env.engine.ledger
+        cid = next(iter(env.broker._orders))
+        broker_order = env.broker.get_order(cid)
+
+        cash_before = led.cash
+        pos_before = led.position(INSTRUMENT)
+        pnl_before = led.realized_pnl
+
+        # Reaplica el MISMO lote (misma orden, mismos fills/seq).
+        env.engine._apply_fill_to_ledger(
+            next(o for o in env.engine.order_manager.orders.values()
+                 if o.client_order_id == cid),
+            cid,
+            list(broker_order.fills),
+            broker_order.avg_fill_price,
+            broker_order.filled_quantity,
+            broker_order.updated_at,
+        )
+
+        assert led.cash == cash_before
+        assert led.position(INSTRUMENT) == pos_before
+        assert led.realized_pnl == pnl_before
 
 
 class TestRestart:

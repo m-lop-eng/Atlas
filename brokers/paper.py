@@ -132,6 +132,7 @@ class PaperBrokerAdapter(BrokerAdapter):
                 fills=(BrokerFill(
                     broker_order_id=broker_order_id,
                     quantity=qty, price=price, timestamp=now,
+                    fill_sequence=0,
                 ),),
             )
         else:
@@ -268,10 +269,12 @@ class PaperBrokerAdapter(BrokerAdapter):
             self._cash += quantity * price
 
         new_filled = order.filled_quantity + quantity
+        # F-06A: identidad estable y monotona por orden (0,1,2,...).
         new_fills = order.fills + (
             BrokerFill(
                 broker_order_id=order.broker_order_id,
                 quantity=quantity, price=price, timestamp=self.clock(),
+                fill_sequence=len(order.fills),
             ),
         )
         if new_filled >= order.quantity - 1e-9:

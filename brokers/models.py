@@ -73,13 +73,20 @@ class OrderRejectedError(BrokerError):
 
 @dataclass(frozen=True, slots=True)
 class BrokerFill:
-    """Fill (total o parcial) reportado por el broker."""
+    """Fill (total o parcial) reportado por el broker.
+
+    `fill_sequence` es la identidad ESTABLE de la ejecucion dentro de la orden
+    (monotona por `client_order_id`, asignada por el origen de ejecucion). NO se
+    genera al releer/reprocesar; `client_order_id` por si solo NO identifica un
+    fill (una orden puede tener varios fills legitimos). Ver F-06A.
+    """
 
     broker_order_id: str
     quantity: float
     price: float
     timestamp: datetime
     commission: float = 0.0
+    fill_sequence: int = 0
 
 
 @dataclass(frozen=True, slots=True)

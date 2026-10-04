@@ -784,6 +784,7 @@ def build_forward_runner(
         MonitoringEngine(clock=runner_clock),
         clock=runner_clock,
         run_id=run_id,
+        initial_cash=cash,  # F-06A: bootstrap del ledger (config, no broker)
         config=PaperEngineConfig(
             account_id=account_id,
             instrument=instrument,

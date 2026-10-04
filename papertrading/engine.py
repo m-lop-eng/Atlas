@@ -64,6 +64,7 @@ from strategies.base.signal import Action
 from strategies.base.strategy import BaseStrategy
 
 from monitoring import utc_now
+from papertrading.ledger import AccountLedger, LedgerPosition
 from papertrading.models import (
     PendingEntry,
     PaperAuditEntry,
@@ -97,6 +98,8 @@ class PaperTradingEngine:
         clock: Callable[[], datetime] = utc_now,
         run_id: str = "PAPER",
         config: PaperEngineConfig | None = None,
+        initial_cash: float | None = None,
+        ledger: "AccountLedger | None" = None,
     ) -> None:
         if not hasattr(broker, "price_source"):
             raise TypeError(
@@ -115,11 +118,27 @@ class PaperTradingEngine:
         self.run_id = run_id
         self.config = config or PaperEngineConfig()
 
+        # F-06A: AccountLedger = autoridad interna unica de cash/positions/
+        # realized. El bootstrap es EXPLICITO (configuracion), nunca del broker.
+        if ledger is not None:
+            self._ledger = ledger
+        else:
+            if initial_cash is None:
+                raise TypeError(
+                    "B7/F-06A: PaperTradingEngine requiere `initial_cash` "
+                    "(o un `ledger`) explicito; el capital inicial NO se lee "
+                    "del broker."
+                )
+            self._ledger = AccountLedger(initial_cash=initial_cash)
+
         self._bars: list[dict[str, Any]] = []
         self._audit: list[PaperAuditEntry] = []
         self._seq = 0
         self._pending: PendingEntry | None = None
         self._signed: set[str] = set()
+        # F-06A: `_position` es una proyeccion DERIVADA del ledger (metadata
+        # operativa: stop/cid/tiempos) — NO es autoridad contable. La autoridad
+        # de quantity/avg_entry/cash/realized es `self._ledger`.
         self._position: PaperPosition | None = None
         self._pending_resolution: set[str] = set()
         self._order_fills: dict[str, tuple] = {}
@@ -133,7 +152,6 @@ class PaperTradingEngine:
 
         self._last_equity = 0.0
         self._last_cash = 0.0
-        self._realized_pnl = 0.0
         self._peak_equity = 0.0
         self._day_key: date | None = None
         self._day_start_equity: float | None = None
@@ -186,6 +204,16 @@ class PaperTradingEngine:
     @property
     def position(self) -> PaperPosition | None:
         return self._position
+
+    @property
+    def ledger(self) -> AccountLedger:
+        """Autoridad interna contable (F-06A)."""
+        return self._ledger
+
+    @property
+    def realized_pnl(self) -> float:
+        """Realized P&L autoritativo (delegado al ledger)."""
+        return self._ledger.realized_pnl
 
     @property
     def trades(self) -> tuple[PaperTrade, ...]:
@@ -452,83 +480,128 @@ class PaperTradingEngine:
         self._audit_rec(
             PaperEvent.EXIT_FILLED if is_exit else PaperEvent.ENTRY_FILLED, refs
         )
-        self._update_position(order, vwap, qty, fill_ts)
+        self._apply_fill_to_ledger(order, cid, fills, vwap, qty, fill_ts)
 
-    def _update_position(
-        self, order, price: float, qty: float, at: datetime
+    def _apply_fill_to_ledger(
+        self, order, cid: str, fills: list, vwap: float, qty: float, at: datetime
     ) -> None:
-        signed = qty if order.side is OrderSide.BUY else -qty
-        pos = self._position
-        if pos is None:
+        """Aplica el fill al ledger (autoridad) y proyecta `PaperPosition`.
+
+        La contabilidad (cash/posición/realized) la realiza `AccountLedger`. El
+        engine solo mantiene la proyección `PaperPosition` (metadata operativa:
+        stop/cid/tiempos) y los eventos de audit/trades.
+
+        Idempotencia (F-06A): la identidad es `(client_order_id, fill_sequence)`.
+        Se aplica CADA fill del lote individualmente al ledger (fuente unica de
+        idempotencia): todos los `(cid, fill_sequence)` quedan registrados, de
+        modo que reaplicar el mismo lote es completamente idempotente. La
+        proyeccion `PaperPosition`/audit se calcula una vez sobre el neto.
+        Un broker agregado sin detalle de fills usa `(cid, 0)`.
+        """
+        before = self._ledger.position(order.instrument)
+        # `all_applied` = todos los fills del lote ya estaban registrados.
+        all_applied = True
+        for i, f in enumerate(fills):
+            seq = int(getattr(f, "fill_sequence", i))
+            if not self._ledger.is_applied(cid, seq):
+                all_applied = False
+                self._ledger.apply_fill(
+                    instrument=order.instrument,
+                    side=order.side.value,
+                    quantity=float(f.quantity),
+                    price=float(f.price),
+                    client_order_id=cid,
+                    fill_sequence=seq,
+                    commission=0.0,
+                )
+        already = all_applied
+        after = self._ledger.position(order.instrument)
+
+        # --- proyeccion PaperPosition (metadata operativa) ---
+        if after is None:
+            # cierre completo
+            if before is not None:
+                self._trades.append(
+                    PaperTrade(
+                        cid=before and self._position.cid if self._position else cid,
+                        strategy_id=str(order.strategy_id or ""),
+                        instrument=order.instrument,
+                        side="LONG" if before.is_long else "SHORT",
+                        quantity=abs(before.quantity),
+                        entry_price=before.avg_entry_price,
+                        entry_time=self._position.opened_at if self._position else at,
+                        entry_open_time=(
+                            self._position.entry_open_time if self._position else 0
+                        ),
+                        exit_price=vwap,
+                        exit_time=at,
+                        exit_open_time=int(self._last_open_time or 0),
+                        exit_reason=self._last_exit_reason or "EXIT",
+                        pnl=(
+                            (vwap - before.avg_entry_price) * abs(before.quantity)
+                            if before.is_long
+                            else (before.avg_entry_price - vwap) * abs(before.quantity)
+                        ),
+                        stop_price=(
+                            self._position.stop_price if self._position else None
+                        ),
+                    )
+                )
+                cid_meta = self._position.cid if self._position else cid
+                self._last_exit_reason = None
+                self._position = None
+                self._audit_rec(
+                    PaperEvent.POSITION_CLOSED, {"position_id": cid_meta, "exit": vwap}
+                )
+            if already:
+                return
+            return
+
+        if self._position is None:
             self._position = PaperPosition(
                 cid=order.signal_id,
                 instrument=order.instrument,
-                quantity=signed,
-                avg_entry_price=price,
+                quantity=after.quantity,
+                avg_entry_price=after.avg_entry_price,
                 stop_price=order.stop_price,
                 opened_at=at,
                 entry_open_time=int(self._last_open_time or 0),
                 entry_bar_index=len(self._bars) - 1,
             )
-            self._audit_rec(
-                PaperEvent.POSITION_OPENED,
-                {"position_id": self._position.cid, "quantity": signed, "entry": price},
-            )
-            return
-        new_qty = pos.quantity + signed
-        if abs(new_qty) <= _EPS:  # cierre completo
-            closed_qty = abs(pos.quantity)
-            pnl = self._realize(pos, closed_qty, price)
-            self._trades.append(
-                PaperTrade(
-                    cid=pos.cid,
-                    strategy_id=str(order.strategy_id or ""),
-                    instrument=pos.instrument,
-                    side="LONG" if pos.is_long else "SHORT",
-                    quantity=closed_qty,
-                    entry_price=pos.avg_entry_price,
-                    entry_time=pos.opened_at,
-                    entry_open_time=pos.entry_open_time,
-                    exit_price=price,
-                    exit_time=at,
-                    exit_open_time=int(self._last_open_time or 0),
-                    exit_reason=self._last_exit_reason or "EXIT",
-                    pnl=pnl,
-                    stop_price=pos.stop_price,
+            if not already:
+                self._audit_rec(
+                    PaperEvent.POSITION_OPENED,
+                    {"position_id": self._position.cid, "quantity": after.quantity,
+                     "entry": after.avg_entry_price},
                 )
-            )
-            self._last_exit_reason = None
-            self._position = None
-            self._audit_rec(
-                PaperEvent.POSITION_CLOSED,
-                {"position_id": pos.cid, "exit": price, "pnl": pnl},
-            )
             return
-        # Mismo sentido (entrada adicional) o reducción parcial.
-        if (pos.is_long and new_qty > 0) or (not pos.is_long and new_qty < 0):
-            added = abs(signed)
-            avg = (
-                pos.quantity * pos.avg_entry_price + signed * price
-            ) / new_qty
-            self._position = replace(
-                pos, quantity=round(new_qty, 12), avg_entry_price=avg
-            )
-        else:
-            pnl = self._realize(pos, abs(signed), price)
-            self._realized_pnl += pnl
-            self._position = replace(pos, quantity=round(new_qty, 12))
-            self._audit_rec(
-                PaperEvent.POSITION_UPDATED,
-                {"position_id": pos.cid, "quantity": new_qty, "pnl": pnl},
-            )
+
+        # actualiza metadata de la proyeccion (quantity/avg del ledger)
+        prev_qty = self._position.quantity
+        self._position = replace(
+            self._position,
+            quantity=after.quantity,
+            avg_entry_price=after.avg_entry_price,
+        )
+        if not already:
+            reduced = abs(after.quantity) < abs(prev_qty)
+            if reduced:
+                self._audit_rec(
+                    PaperEvent.POSITION_UPDATED,
+                    {"position_id": self._position.cid, "quantity": after.quantity},
+                )
 
     def _realize(self, pos: PaperPosition, qty: float, price: float) -> float:
-        if pos.is_long:
-            pnl = (price - pos.avg_entry_price) * qty * self.config.point_value
-        else:
-            pnl = (pos.avg_entry_price - price) * qty * self.config.point_value
-        self._realized_pnl += pnl
-        return pnl
+        """Compatibilidad: el P&L realizado vive en el ledger (F-06A)."""
+        return self._ledger._realize(
+            LedgerPosition(
+                instrument=pos.instrument,
+                quantity=pos.quantity,
+                avg_entry_price=pos.avg_entry_price,
+            ),
+            qty,
+            price,
+        )
 
     # ---------------------------------------------------------- señales/riesgo
 
@@ -793,7 +866,8 @@ class PaperTradingEngine:
             "last_open_time": self._last_open_time,
             "signed_signals": sorted(self._signed),
             "position": position,
-            "realized_pnl": self._realized_pnl,
+            "ledger": self._ledger.snapshot(),
+            "realized_pnl": self._ledger.realized_pnl,
             "peak_equity": self._peak_equity,
             "day_key": self._day_key.isoformat() if self._day_key else None,
             "day_start_equity": self._day_start_equity,
@@ -837,7 +911,29 @@ class PaperTradingEngine:
             )
         else:
             self._position = None
-        self._realized_pnl = snap.get("realized_pnl", 0.0)
+        # F-06A: restaura la autoridad contable. Snapshot legacy (sin `ledger`)
+        # se reconstruye desde `realized_pnl`/posicion preservando el contrato.
+        if "ledger" in snap:
+            self._ledger.load_snapshot(snap["ledger"])
+        else:
+            self._ledger.load_snapshot(
+                {
+                    "cash": self._ledger.cash,
+                    "realized_pnl": snap.get("realized_pnl", 0.0),
+                    "positions": (
+                        [
+                            {
+                                "instrument": p.instrument,
+                                "quantity": p.quantity,
+                                "avg_entry_price": p.avg_entry_price,
+                            }
+                        ]
+                        if p is not None
+                        else []
+                    ),
+                    "applied_fills": [],
+                }
+            )
         self._peak_equity = snap.get("peak_equity", 0.0)
         dk = snap.get("day_key")
         self._day_key = date.fromisoformat(dk) if dk else None
