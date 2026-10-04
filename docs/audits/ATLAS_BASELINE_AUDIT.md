@@ -263,11 +263,11 @@ Cobertura por módulo crítico (term-missing):
 - **no cerrado del todo** hasta la validación de regresión completa (suite
   entera verde + revisión).
 
-### F-06 — ledger interno autoritativo + ACCOUNT reconciliation — **IN PROGRESS — F-06A/F-06B IMPLEMENTED; F-06C PENDING**
+### F-06 — ledger interno autoritativo + ACCOUNT reconciliation — **IN PROGRESS — F-06A ✅ / F-06B ✅ / F-06C-RESTART ✅ (PENDING REVIEW) / F-06C ACCOUNT ⏳**
 - ID: F-06
 - severidad: **MEDIUM**
-- archivo: `papertrading/ledger.py`, `papertrading/engine.py`, `reconciliation/orchestrator.py`
-- **estado: IN PROGRESS — F-06A/F-06B IMPLEMENTED; F-06C PENDING** (no `RESOLVED` todavía).
+- archivo: `papertrading/ledger.py`, `papertrading/engine.py`, `brokers/paper.py`, `reconciliation/orchestrator.py`
+- **estado: IN PROGRESS — F-06A ✅ / F-06B ✅ / F-06C-RESTART ✅ (IMPLEMENTED, PENDING REVIEW) / F-06C ACCOUNT esperado ⏳** (no `RESOLVED` todavía).
 - **Hallazgo original: CONFIRMADO (ACCOUNT tautológico).** `_internal_snapshot().account`
   todavía obtiene la cuenta del broker (`self.broker.get_account_state()`,
   `papertrading/engine.py:793`), igual que `broker_state_from_adapter()`
@@ -283,7 +283,7 @@ Cobertura por módulo crítico (term-missing):
     individual **y** de lote multi-fill.
   - Accounting spot/`point_value=1`/USD: BUY `cash-=q·p`, SELL `cash+=q·p`;
     LONG/SHORT/reducción/cierre preservados.
-- **F-06B — IMPLEMENTED, pendiente de commit**:
+- **F-06B — IMPLEMENTED, cerrado en commit `eeac54d`**:
   - Derivaciones internas (estado **derivado**, no primario) en
     `AccountLedger.valuation(marks) -> ValuationSnapshot`:
     `equity = cash + Σ quantity·mark` (sin `abs`; conserva F-05),
@@ -295,9 +295,32 @@ Cobertura por módulo crítico (term-missing):
     abierta → `valuation()=None` (fail-closed); sin posiciones → `equity=cash`.
   - `PaperTradingEngine._mark()` deriva de `ledger.cash` + `ledger.valuation()`
     en lugar de `broker.get_account_state()`; salud de broker/monitoring intactos.
-- **F-06C — PENDING**: conectará `expected_account` al **ledger** (romperá la
-  tautología de ACCOUNT). Requiere cambiar `_internal_snapshot()` para usar
-  `{cash, equity}` del ledger con el mark compartido. NO implementado.
+- **F-06C-RESTART — IMPLEMENTED, PENDING REVIEW (sin commit)**: al derivar
+  `expected_account` del ledger, el restart revela que el `PaperBrokerAdapter`
+  **no rehidrataba** su estado observed (broker fresco → ACCOUNT MISMATCH →
+  kill switch). Se implementó persistencia **independiente** del broker:
+  - `PaperBrokerAdapter.snapshot(checkpoint_id)` / `load_snapshot(snap,
+    checkpoint_id)`: persiste/restaura `cash`, `_broker_seq` (contador de IDs),
+    `_orders` (con `fills`, estados y `fill_sequence` estable) y `_lossy`.
+    **NO** persiste marks/`price_source` (datos de mercado). **NO** usa el ledger.
+  - `PaperTradingEngine.snapshot()` añade `checkpoint_id` común y bloque
+    `broker` (además de `ledger`); `load_snapshot()` restaura **primero** el
+    ledger y **después** el broker, verificando `ledger.checkpoint ==
+    broker.checkpoint`. Restart con `ledger` sin bloque `broker` (legacy),
+    checkpoint mismatch o bloque corrupto → `BrokerSnapshotError` (**fail-closed**;
+    nunca broker fresco en silencio).
+  - New run (sin snapshot) sigue bootstrapping desde configuración; A4/
+    `ForwardRunner` intacto (reconstruye ambos por replay de `bars.jsonl`).
+  - Tests: `tests/test_broker_restart.py` (25) + `TestRestart` adaptado.
+  - **Restore ATOMICO**: `PaperBrokerAdapter.load_snapshot` parsea todo el
+    estado temporal y solo hace swap al final (nunca mutacion parcial);
+    `validate_snapshot`/`AccountLedger.probe_snapshot` permiten al engine
+    prevalidar ledger+broker+metadata ANTES de aplicar, de modo que un snapshot
+    invalido deja el engine intacto (ISS-1/ISS-2 de la review, corregidos).
+- **F-06C ACCOUNT esperado — ⏳ PENDING (no implementado)**: conectará
+  `expected_account` al **ledger** (`{cash, equity}`) rompiendo la tautología de
+  ACCOUNT. Requiere cambiar `_internal_snapshot()`; se hará **después** de
+  F-06C-RESTART. `ReconciliationEngine`/`broker_state_from_adapter` **no** tocados.
 - **ORDER/FILL/POSITION** ya eran independientes (OrderManager/`_position` vs
   broker); no afectados.
 - **Fuera de F-06 (deuda F-06A/B)**: **I2** reversión LONG↔SHORT (semántica
@@ -308,8 +331,9 @@ Cobertura por módulo crítico (term-missing):
   degraded; no existe taxonomía equivalente, no se inventa). **I6** `_valid_mark`
   exige `finite && >0` (supuesto razonable para el modelo spot de Fase 1).
 - **Evidencia**: `papertrading/ledger.py`, `papertrading/engine.py`,
-  `reconciliation/orchestrator.py`. Suite **896 passed**; `ledger.py` 100%.
-- **NO cerrado** hasta F-06C.
+  `brokers/paper.py`, `tests/test_broker_restart.py`,
+  `reconciliation/orchestrator.py`. Suite **921 passed**; `ledger.py` 100%.
+- **NO cerrado** hasta F-06C ACCOUNT.
 
 ### F-07 — `OrderManager` admite transiciones de estado inválidas — **RESOLVED — pending commit**
 - ID: F-07

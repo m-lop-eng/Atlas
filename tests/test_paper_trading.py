@@ -581,9 +581,13 @@ class TestRestart:
 
         env2 = _stack(strategy=_LevelLong(level=LEVEL))
         env2.engine.load_snapshot(snap)
+        # F-06C-restart: el broker se rehidrata desde su PROPIO estado (no se
+        # crea fresco). Debe conservar exactamente las órdenes históricas.
+        assert set(env2.broker._orders) == set(env1.broker._orders)
+        assert env2.broker._cash == env1.broker._cash
         # Reprocesar exactamente las mismas barras: todas se ignoran.
         _drive(env2, HAPPY)
-        assert env2.broker._orders == {}          # sin órdenes nuevas
+        assert set(env2.broker._orders) == set(env1.broker._orders)  # sin nuevas
         assert env2.engine.trades == env1.engine.trades
         assert PaperEvent.RESTART_SKIP.value in _audit_events(env2)
 
@@ -597,7 +601,7 @@ class TestRestart:
         start = START + 6 * 3600
         _drive(env2, future, start=start, interval=3600)
         new_cid = f"TEST-LONG:{INSTRUMENT}:{start}"
-        assert set(env2.broker._orders) == {new_cid}
+        assert set(env2.broker._orders) == set(env1.broker._orders) | {new_cid}
         assert env2.engine.position is not None
         assert len(env2.engine.trades) == 1  # solo la operación histórica
 
@@ -613,9 +617,11 @@ class TestRestart:
         assert env2.engine.position.quantity == (
             env1.engine.position.quantity
         )
+        # F-06C-restart: el broker restaura su propia orden abierta.
+        assert set(env2.broker._orders) == set(env1.broker._orders)
         # Una barra nueva mientras se mantiene la posición: sin nueva entrada.
         _drive(env2, HAPPY[3:4], start=START + 3 * 3600)
-        assert env2.broker._orders == {}
+        assert set(env2.broker._orders) == set(env1.broker._orders)
 
 
 class TestDataFeedGuards:

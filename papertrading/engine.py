@@ -29,6 +29,7 @@ from typing import Any, Callable
 
 from brokers.base import BrokerAdapter
 from brokers.models import BrokerError, BrokerFill, BrokerOrderState, SubmitStatus
+from brokers.paper import BrokerSnapshotError
 from execution.order import Fill, OrderSide, OrderStatus, OrderType
 from execution.order_manager import OrderManager, OrderStateError
 from killswitches.coordinator import KillSwitchCoordinator
@@ -863,7 +864,14 @@ class PaperTradingEngine:
     # ------------------------------------------------------- snapshot/restore
 
     def snapshot(self) -> dict:
-        """Estado serializable JSON para restart sin duplicar exposición."""
+        """Estado serializable JSON para restart sin duplicar exposición.
+
+        F-06C-restart: el snapshot es un envelope con un `checkpoint_id` comun a
+        los bloques `ledger` (expected, estado interno) y `broker` (observed,
+        estado del broker). Ambos bloques siguen siendo semanticamente
+        independientes; el `checkpoint_id` solo garantiza que pertenecen al mismo
+        instante logico (nunca `ledger @ N` con `broker @ N-1`).
+        """
         pos = self._position
         position = None
         if pos is not None:
@@ -877,15 +885,23 @@ class PaperTradingEngine:
                 "entry_open_time": pos.entry_open_time,
                 "entry_bar_index": pos.entry_bar_index,
             }
+        # Checkpoint logico: reutiliza la secuencia de auditoria (unica y
+        # monotona en el run) en lugar de inventar un nuevo contador.
+        checkpoint_id = f"{self.run_id}:{self._seq}"
+        ledger_block = self._ledger.snapshot()
+        ledger_block["checkpoint_id"] = checkpoint_id
+        broker_block = self.broker.snapshot(checkpoint_id=checkpoint_id)
         return {
             "version": 1,
+            "checkpoint_id": checkpoint_id,
             "run_id": self.run_id,
             "instrument": self.config.instrument,
             "account_id": self.config.account_id,
             "last_open_time": self._last_open_time,
             "signed_signals": sorted(self._signed),
             "position": position,
-            "ledger": self._ledger.snapshot(),
+            "ledger": ledger_block,
+            "broker": broker_block,
             "realized_pnl": self._ledger.realized_pnl,
             "peak_equity": self._peak_equity,
             "day_key": self._day_key.isoformat() if self._day_key else None,
@@ -914,11 +930,15 @@ class PaperTradingEngine:
         }
 
     def load_snapshot(self, snap: dict) -> None:
-        self._last_open_time = snap.get("last_open_time")
-        self._signed = set(snap.get("signed_signals", ()))
+        # ---------------------------------------------------------- PREVALIDAR
+        # F-06C-restart: TODO se valida/parsea en locales ANTES de mutar el
+        # engine. Si algo falla, el engine queda EXACTAMENTE como estaba
+        # (ledger, `_position`, broker y metadata intactos). Al final se aplica
+        # el restore con operaciones ya deterministicamente no-fallables.
         p = snap.get("position")
+        new_position = None
         if p is not None:
-            self._position = PaperPosition(
+            new_position = PaperPosition(
                 cid=p["cid"],
                 instrument=p["instrument"],
                 quantity=p["quantity"],
@@ -928,38 +948,62 @@ class PaperTradingEngine:
                 entry_open_time=p["entry_open_time"],
                 entry_bar_index=p["entry_bar_index"],
             )
-        else:
-            self._position = None
-        # F-06A: restaura la autoridad contable. Snapshot legacy (sin `ledger`)
-        # se reconstruye desde `realized_pnl`/posicion preservando el contrato.
-        if "ledger" in snap:
-            self._ledger.load_snapshot(snap["ledger"])
-        else:
-            self._ledger.load_snapshot(
-                {
-                    "cash": self._ledger.cash,
-                    "realized_pnl": snap.get("realized_pnl", 0.0),
-                    "positions": (
-                        [
-                            {
-                                "instrument": p.instrument,
-                                "quantity": p.quantity,
-                                "avg_entry_price": p.avg_entry_price,
-                            }
-                        ]
-                        if p is not None
-                        else []
-                    ),
-                    "applied_fills": [],
-                }
+        # F-06A: snapshot legacy (sin `ledger`) se reconstruye desde
+        # `realized_pnl`/posicion preservando el contrato.
+        has_ledger = "ledger" in snap
+        checkpoint_id = None
+        if has_ledger:
+            ledger_block = snap["ledger"]
+            # F-06C-restart: rehidrata el estado OBSERVED del broker desde su
+            # propio bloque (nunca desde el ledger). Un restart sin bloque
+            # `broker` NO crea un broker fresco en silencio: fail-closed.
+            checkpoint_id = snap.get("checkpoint_id")
+            if checkpoint_id is None:
+                raise BrokerSnapshotError(
+                    "restart sin checkpoint_id: snapshot no broker-restore-capable"
+                )
+            ledger_cp = ledger_block.get("checkpoint_id")
+            if ledger_cp != checkpoint_id:
+                raise BrokerSnapshotError(
+                    f"checkpoint mismatch: ledger={ledger_cp!r} "
+                    f"!= engine={checkpoint_id!r}"
+                )
+            if "broker" not in snap:
+                raise BrokerSnapshotError(
+                    "restart con ledger pero sin bloque broker: legacy no "
+                    "broker-restore-capable (F-06C-restart); no se inventa un "
+                    "broker desde el ledger."
+                )
+            # Prevalida el bloque broker SIN mutar (parseo puro).
+            self.broker.validate_snapshot(
+                snap["broker"], checkpoint_id=checkpoint_id
             )
-        self._peak_equity = snap.get("peak_equity", 0.0)
+        else:
+            ledger_block = {
+                "cash": self._ledger.cash,
+                "realized_pnl": snap.get("realized_pnl", 0.0),
+                "positions": (
+                    [
+                        {
+                            "instrument": p.instrument,
+                            "quantity": p.quantity,
+                            "avg_entry_price": p.avg_entry_price,
+                        }
+                    ]
+                    if p is not None
+                    else []
+                ),
+                "applied_fills": [],
+            }
+        # Prevalida el bloque ledger en una instancia TEMPORAL: si el bloque
+        # esta corrupto, falla aqui sin haber tocado el ledger real.
+        self._ledger.probe_snapshot(ledger_block)
+        # Prevalida la metadata restante parseandola en locales (day_key,
+        # equity_curve, trades): un dataclass invalido falla aqui, sin mutar.
         dk = snap.get("day_key")
-        self._day_key = date.fromisoformat(dk) if dk else None
-        self._day_start_equity = snap.get("day_start_equity")
-        self._day_pnl = snap.get("day_pnl", 0.0)
-        self._equity_curve = [list(p) for p in snap.get("equity_curve", [])]
-        self._trades = [
+        new_day_key = date.fromisoformat(dk) if dk else None
+        new_equity_curve = [list(pt) for pt in snap.get("equity_curve", [])]
+        new_trades = [
             PaperTrade(
                 cid=t["cid"],
                 strategy_id=t["strategy_id"],
@@ -978,4 +1022,22 @@ class PaperTradingEngine:
             )
             for t in snap.get("trades", [])
         ]
+
+        # ------------------------------------------------------------ APLICAR
+        # A partir de aqui, con todo prevalidado, las operaciones son
+        # deterministicamente no-fallables (mismo input que la prevalidacion).
+        self._position = new_position
+        self._ledger.load_snapshot(ledger_block)
+        if has_ledger:
+            self.broker.load_snapshot(
+                snap["broker"], checkpoint_id=checkpoint_id
+            )
+        self._last_open_time = snap.get("last_open_time")
+        self._signed = set(snap.get("signed_signals", ()))
+        self._peak_equity = snap.get("peak_equity", 0.0)
+        self._day_key = new_day_key
+        self._day_start_equity = snap.get("day_start_equity")
+        self._day_pnl = snap.get("day_pnl", 0.0)
+        self._equity_curve = new_equity_curve
+        self._trades = new_trades
         self._audit_rec(PaperEvent.READY, {"run_id": self.run_id, "restored": True})

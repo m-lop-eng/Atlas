@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from itertools import count
 
-from execution.order import Order, OrderType
+from execution.order import Order, OrderSide, OrderType
 
 from brokers.base import BrokerAdapter
 from brokers.models import (
@@ -36,6 +36,10 @@ from brokers.models import (
     Position,
     SubmitStatus,
 )
+
+
+class BrokerSnapshotError(ValueError):
+    """Snapshot de PaperBroker invalido/corrupto o checkpoint inconsistente."""
 
 
 def _default_clock() -> datetime:
@@ -69,6 +73,7 @@ class PaperBrokerAdapter(BrokerAdapter):
         self._orders: dict[str, BrokerOrder] = {}
         self._lossy: set[str] = set()  # client_order_ids con respuesta perdida
         self._broker_seq = count(1)
+        self._broker_seq_last = 0  # ultimo ID emitido (para snapshot sin consumir)
         self._cash = self.initial_cash
 
     # ------------------------------------------------------------ lifecycle
@@ -103,7 +108,8 @@ class PaperBrokerAdapter(BrokerAdapter):
             )
 
         now = self.clock()
-        broker_order_id = f"BRK-{next(self._broker_seq):06d}"
+        self._broker_seq_last = next(self._broker_seq)
+        broker_order_id = f"BRK-{self._broker_seq_last:06d}"
         fills: tuple[BrokerFill, ...] = ()
 
         if order.order_type == OrderType.MARKET:
@@ -310,6 +316,160 @@ class PaperBrokerAdapter(BrokerAdapter):
         """Marca una orden para que `submit_order` devuelva UNKNOWN."""
         self._lossy.add(client_order_id)
 
+    # ------------------------------------------------------- snapshot/restore
+
+    def snapshot(self, *, checkpoint_id: str) -> dict:
+        """Estado observed propio del broker (F-06C-restart).
+
+        Persiste SOLO el estado observado/de ejecucion del broker: `cash`, el
+        contador de IDs `_broker_seq`, las ordenes (con sus fills, estado y
+        `fill_sequence`) y las ordenes con respuesta perdida. NO persiste marks
+        ni `price_source` (datos de mercado que se reinyectan tras el restart).
+        NO se apoya en `AccountLedger`: el broker es dueño de su propio estado.
+
+        `checkpoint_id` etiqueta el checkpoint logico del engine al que pertenece
+        este bloque; `load_snapshot` exige que coincida con el del ledger.
+        """
+        return {
+            "checkpoint_id": checkpoint_id,
+            "account_id": self.account_id,
+            "initial_cash": self.initial_cash,
+            "currency": self.currency,
+            "cash": self._cash,
+            "broker_seq": self._broker_seq_last,
+            "lossy": sorted(self._lossy),
+            "orders": [self._order_to_dict(o) for o in self._orders.values()],
+        }
+
+    def load_snapshot(self, snap: dict, *, checkpoint_id: str) -> None:
+        """Rehidrata el estado observed desde su propio snapshot.
+
+        NO usa el `AccountLedger` ni llama a ninguna fuente contable: reconstruye
+        `cash`/`orders`/`fills`/`fill_sequence`/`_broker_seq` exclusivamente desde
+        el bloque del broker, preservando la independencia expected vs observed.
+
+        Raises:
+            BrokerSnapshotError: snapshot ausente/corrupto, o `checkpoint_id`
+                distinto al esperado (ledger y broker de momentos distintos).
+        """
+        new_cash, new_orders, new_seq, new_lossy = self._parse_snapshot(
+            snap, checkpoint_id
+        )
+        # F-06C-restart: restore ATOMICO. El parseo completo (cash/orders/fills/
+        # seq/lossy) se hizo sin tocar el estado real; solo aqui, con todo
+        # validado, se sustituye el estado de una vez (swap no-fallable).
+        self._cash = new_cash
+        self._orders = new_orders
+        self._broker_seq = count(new_seq + 1)
+        self._broker_seq_last = new_seq
+        self._lossy = new_lossy
+
+    def validate_snapshot(self, snap: dict, *, checkpoint_id: str) -> None:
+        """Prevalida un snapshot SIN mutar el estado del broker.
+
+        Mismo parseo que `load_snapshot`; usable para garantizar atomicidad
+        cuando el llamante (p. ej. el engine) necesita validar antes de aplicar.
+        """
+        self._parse_snapshot(snap, checkpoint_id)
+
+    def _parse_snapshot(
+        self, snap: dict, checkpoint_id: str
+    ) -> tuple[float, dict, int, set]:
+        """Parsea/valida el snapshot y devuelve el estado temporal.
+
+        NO muta `self`. Construye cash/orders/fills/seq/lossy en locales; si
+        cualquier parte es invalida lanza `BrokerSnapshotError` sin efectos.
+        """
+        if snap is None:
+            raise BrokerSnapshotError(
+                "broker snapshot ausente: restart sin estado observed; no se "
+                "crea un broker fresco en silencio (F-06C-restart)."
+            )
+        if not isinstance(snap, dict):
+            raise BrokerSnapshotError("broker snapshot corrupto: no es un dict.")
+        cid = snap.get("checkpoint_id")
+        if cid != checkpoint_id:
+            raise BrokerSnapshotError(
+                f"checkpoint mismatch: broker={cid!r} != esperado {checkpoint_id!r}"
+            )
+        try:
+            new_cash = float(snap["cash"])
+            new_orders = {
+                d["client_order_id"]: self._order_from_dict(d)
+                for d in snap["orders"]
+            }
+            new_seq = int(snap.get("broker_seq", 0))
+            new_lossy = set(snap.get("lossy", ()))
+        except (KeyError, TypeError, ValueError) as exc:
+            raise BrokerSnapshotError(
+                f"broker snapshot corrupto: {exc}"
+            ) from exc
+        return new_cash, new_orders, new_seq, new_lossy
+
+    def _order_to_dict(self, o: BrokerOrder) -> dict:
+        return {
+            "client_order_id": o.client_order_id,
+            "broker_order_id": o.broker_order_id,
+            "instrument": o.instrument,
+            "side": o.side.value,
+            "order_type": o.order_type.value,
+            "quantity": o.quantity,
+            "state": o.state.value,
+            "filled_quantity": o.filled_quantity,
+            "avg_fill_price": o.avg_fill_price,
+            "limit_price": o.limit_price,
+            "stop_price": o.stop_price,
+            "reject_reason": o.reject_reason,
+            "submitted_at": o.submitted_at.isoformat() if o.submitted_at else None,
+            "updated_at": o.updated_at.isoformat() if o.updated_at else None,
+            "fills": [
+                {
+                    "broker_order_id": f.broker_order_id,
+                    "quantity": f.quantity,
+                    "price": f.price,
+                    "timestamp": f.timestamp.isoformat(),
+                    "commission": f.commission,
+                    "fill_sequence": f.fill_sequence,
+                }
+                for f in o.fills
+            ],
+        }
+
+    def _order_from_dict(self, d: dict) -> BrokerOrder:
+        return BrokerOrder(
+            client_order_id=d["client_order_id"],
+            broker_order_id=d["broker_order_id"],
+            instrument=d["instrument"],
+            side=OrderSide(d["side"]),
+            order_type=OrderType(d["order_type"]),
+            quantity=float(d["quantity"]),
+            state=BrokerOrderState(d["state"]),
+            filled_quantity=float(d.get("filled_quantity", 0.0)),
+            avg_fill_price=d.get("avg_fill_price"),
+            limit_price=d.get("limit_price"),
+            stop_price=d.get("stop_price"),
+            fills=tuple(
+                BrokerFill(
+                    broker_order_id=f["broker_order_id"],
+                    quantity=float(f["quantity"]),
+                    price=float(f["price"]),
+                    timestamp=datetime.fromisoformat(f["timestamp"]),
+                    commission=float(f.get("commission", 0.0)),
+                    fill_sequence=int(f["fill_sequence"]),
+                )
+                for f in d.get("fills", ())
+            ),
+            reject_reason=d.get("reject_reason"),
+            submitted_at=(
+                datetime.fromisoformat(d["submitted_at"])
+                if d.get("submitted_at") else None
+            ),
+            updated_at=(
+                datetime.fromisoformat(d["updated_at"])
+                if d.get("updated_at") else None
+            ),
+        )
+
     # -------------------------------------------------------------- helpers
 
     def _price(self, instrument: str) -> float:
@@ -407,4 +567,4 @@ class PaperBrokerAdapter(BrokerAdapter):
         )
 
 
-__all__ = ["PaperBrokerAdapter"]
+__all__ = ["BrokerSnapshotError", "PaperBrokerAdapter"]

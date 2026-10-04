@@ -279,6 +279,31 @@ class AccountLedger:
             "applied_fills": sorted(self._applied_fills),
         }
 
+    def probe_snapshot(self, snap: dict) -> None:
+        """Prevalida un snapshot de ledger SIN mutar el estado.
+
+        Parsea la misma estructura que `load_snapshot` en locales; si el bloque
+        es invalido lanza `LedgerError` sin efectos. Permite al llamante
+        (p. ej. `PaperTradingEngine.load_snapshot`) garantizar atomicidad:
+        prevalidar aqui y aplicar despues `load_snapshot` (no-fallable para el
+        mismo input ya validado).
+        """
+        if not isinstance(snap, dict):
+            raise LedgerError(f"ledger snapshot corrupto: {snap!r}")
+        try:
+            float(snap.get("cash", self.initial_cash))
+            float(snap.get("realized_pnl", 0.0))
+            for p in snap.get("positions", []):
+                LedgerPosition(
+                    instrument=p["instrument"],
+                    quantity=p["quantity"],
+                    avg_entry_price=p["avg_entry_price"],
+                )
+            for cid, seq in snap.get("applied_fills", []):
+                (str(cid), int(seq))
+        except (KeyError, TypeError, ValueError) as exc:
+            raise LedgerError(f"ledger snapshot corrupto: {exc}") from exc
+
     def load_snapshot(self, snap: dict) -> None:
         self._cash = snap.get("cash", self.initial_cash)
         self._realized_pnl = snap.get("realized_pnl", 0.0)
