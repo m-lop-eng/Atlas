@@ -176,6 +176,9 @@ Cobertura por módulo crítico (term-missing):
 - severidad: **HIGH**
 - archivo: `risk/engine.py`, `risk/types.py`, `portfolio/engine.py`
 - **estado: REQUIRES MINI-SPEC / INFRASTRUCTURE GAP** — NO corregido.
+- **Hallazgo original**: el veto de riesgo no incluye exposición (gross/net),
+  leverage, margin, correlación ni concentración; `AccountRiskState` expone
+  `gross_exposure/net_exposure/margin_usage` sin que `validate` los compruebe.
 - Los campos existentes **no** constituyen un contrato operacional completo:
   faltan límites configurables y/o datos runtime/modelos necesarios. **No** se
   implementan gates para no introducir política de riesgo no especificada.
@@ -194,22 +197,6 @@ Cobertura por módulo crítico (term-missing):
 - Margin/leverage/correlation/concentration requieren **definición/modelado**
   adicional (límites, ventanas, datos de margen por instrumento).
 - **NO implementar gates** sin contrato.
-
-### F-03 — El veto de riesgo NO incluye exposición/leverage/margin/correlación/concentración
-- ID: F-03
-- severidad: **HIGH**
-- archivo: `risk/engine.py` + `risk/types.py` (`gross_exposure`, `net_exposure`, `margin_usage` definidos pero no usados en `validate`)
-- función: `RiskEngine.validate`
-- descripción: `AccountRiskState` expone `gross_exposure/net_exposure/margin_usage`
-  pero `validate` no los comprueba; `portfolio.compute_portfolio_risk` es
-  descriptivo. No hay veto por concentración/correlación/apalancamiento.
-- impacto: el sistema puede aprobar órdenes que, agregadas, excedan límites de
-  portafolio; incoherente con `03_RISK_MANAGEMENT.md §10/§12`.
-- evidencia: `risk/engine.py` no referencia esos campos (búsqueda 0 hits).
-- test existente: `test_portfolio.py` (solo cálculo).
-- test necesario: veto por exposición agregada.
-- recomendación: integrar `portfolio`/exposición en el veto o marcar explícito
-  como no implementado (MVP).
 
 ### F-04 — `PaperTradingEngine._risk_state()` fija kill_switch/account_active/strategy_active — **REFUTED (separación contractual)**
 - ID: F-04
@@ -454,20 +441,6 @@ Cobertura por módulo crítico (term-missing):
 - **evidencia**: el loader ya no oculta el desorden; la etapa de calidad lo
   detecta.
 - **no cerrado del todo** hasta el commit.
-
-### F-10 — `read_ohlc_csv()` reordena silenciosamente
-- ID: F-10
-- severidad: **MEDIUM**
-- archivo: `data/loader.py` (`bars.sort(key=lambda b: b["ts"])`)
-- descripción: el loader ordena siempre por `ts`, ocultando un CSV mal ordenado.
-  El enunciado exige que el orden sea obligatorio, no auto-corregido.
-- impacto: un dataset con orden incorrecto se "arregla" sin que nadie lo sepa;
-  no se audita el orden original.
-- evidencia: `data/loader.py: last line`.
-- test existente: `test_loader.py`.
-- test necesario: CSV desordenado → error o registro del hallazgo.
-- recomendación: validar orden y fallar (o registrar issue) en vez de reordenar
-  silenciosamente.
 
 ### F-11 — `config/production/settings.yaml`: `null` en métricas de riesgo — **REQUIRES DECISION (config no ejecutable)**
 - ID: F-11
