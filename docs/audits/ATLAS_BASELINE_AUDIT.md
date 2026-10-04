@@ -350,19 +350,41 @@ Cobertura por módulo crítico (term-missing):
   pero §8 lo describe como estado a **resolver** con `get_order`; al ser terminal,
   no hay arista para salir de él. Fuera del alcance de F-07.
 
-### F-08 — Position sizing produce cantidades fraccionarias sin soporte de enteros
+### F-08 — Position sizing sin `quantity_step`/contratos enteros — **REQUIRES DECISION**
 - ID: F-08
 - severidad: **MEDIUM**
-- archivo: `risk/position_sizing.py` (`position_size_from_stop`), `risk/engine.py:154-173`
-- descripción: la cantidad es `risk_cap / loss_per_unit`, continua
-  (`float`). No hay redondeo a contratos enteros ni `quantity_step`, pese a que
-  instrumentos como NQ/ES exigen enteros. Los defaults (`min_size=0.001` en
-  `config/final_oos`) asumen fraccionario (cripto).
-- impacto: para mercados de contrato entero, el sizing no es operable tal cual.
-- evidencia: `position_sizing.py:70`.
-- test existente: `test_position_sizing.py`, `test_units.py`.
-- test necesario: caso entero (round/step) o documentar que el MVP es fraccional.
-- recomendación: añadir `quantity_step`/`integer_contracts` como configuración.
+- archivo: `risk/position_sizing.py` (`position_size_from_stop`), `risk/engine.py` (`_size_fixed_fractional`)
+- **estado: REQUIRES DECISION** — NO implementado.
+- **Hallazgo: AMBIGUO/REFUTADO en el alcance actual.** La premisa "NQ/ES exigen
+  enteros" **no está respaldada por ningún instrumento configurado**.
+- **Evidencia de contrato**:
+  - No existe `quantity_step`, `lot_size`, `contract_size` ni `min_quantity` en
+    código, configs ni docs (solo `min_size`, que es un **umbral mínimo**, no un
+    step).
+  - Instrumentos realmente configurados/operados: `BTCUSDT`, `XXBTZUSD` (crypto,
+    **fraccionables**) y `SAMPLE` (sintético). Ningún futuro de contrato entero.
+  - `Order.quantity: int | float`, broker `quantity: float` → el contrato
+    vigente **admite fracciones**.
+  - `point_value` (p.ej. NQ=50) existe para mercados futuros, pero **ningún**
+    config lo usa.
+  - `03 §6` menciona "Minimum contract size / Lot size" como cosas que el cálculo
+    *debería* considerar (aspiracional), sin definir el contrato operativo.
+- **Opción respaldada por el repo**: **C — fraccionalidad permitida** en el
+  alcance actual (cripto). No hay base para A (enteros) ni B (step por instrumento)
+  sin inventar un contrato (instrumento/step/moneda).
+- **Por qué NO implementar**: introducir `quantity_step` ahora sería inventar
+  contrato no respaldado (step por instrumento, política de redondeo, fuente de
+  metadata). El usuario lo prohíbe explícitamente ("no introduzcas `quantity_step`
+  solo porque el hallazgo lo menciona").
+- **Ambigüedad a resolver (decisión humana)**: política de cuantización si en el
+  futuro se añade un instrumento entero: `floor` (preserva el límite de riesgo),
+  `round`, `ceil` (puede superarlo) o `reject`; y **dónde** vive la metadata
+  (step/lot) por instrumento. Para sizing risk-based, `floor` es la única que
+  garantiza `riesgo_final ≤ riesgo_objetivo`, pero debe ratificarse.
+- **Alcance actual**: el sizing es correcto para los instrumentos fraccionables
+  operados; no hay bug observable hoy.
+- **No cerrar F-08 como RESOLVED**; queda `REQUIRES DECISION` para el día en que
+  se incorpore un instrumento de contrato entero/step (p.ej. NQ/ES).
 
 ### F-09 — `summarize_quality()` NO ejecuta todos los checks — **RESOLVED — pending commit**
 - ID: F-09
