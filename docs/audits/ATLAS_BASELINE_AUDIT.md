@@ -257,22 +257,52 @@ Cobertura por módulo crítico (term-missing):
 - **no cerrado del todo** hasta la validación de regresión completa (suite
   entera verde + revisión).
 
-### F-06 — `_internal_snapshot()` toma la cuenta del propio broker
+### F-06 — `_internal_snapshot()` toma la cuenta del propio broker — **REQUIRES MINI-SPEC / INFRASTRUCTURE GAP**
 - ID: F-06
 - severidad: **MEDIUM**
-- archivo: `papertrading/engine.py` (`_internal_snapshot`)
-- descripción: `account = self.broker.get_account_state()`; el "interno" usa al
-  broker como fuente para la cuenta, por lo que la reconciliación contable
-  (`ACCOUNT`) compara broker contra broker → siempre MATCH, no detecta
-  divergencias contables internas.
-- impacto: la reconciliación de cuenta es tautológica; solo órdenes/fills/posiciones
-  aportan contraste real.
-- evidencia: código; `reconciliation/engine.py` compara `internal.account` vs
-  broker.
-- test existente: `test_reconciliation.py`, `test_paper_trading.py`.
-- test necesario: inyectar un estado interno contable independiente y detectar
-  mismatch.
-- recomendación: mantener un ledger interno (cash/equity propios) y reconciliarlo.
+- archivo: `papertrading/engine.py` (`_internal_snapshot`), `reconciliation/orchestrator.py`
+- **estado: REQUIRES MINI-SPEC / INFRASTRUCTURE GAP** — NO corregido.
+- **Hallazgo: CONFIRMADO (ACCOUNT tautológico).**
+- **Flujo actual**:
+  - `_internal_snapshot()` → `account = AccountSnapshot(acct...)` desde
+    `self.broker.get_account_state()` (`papertrading/engine.py:701-702`).
+  - `broker_state_from_adapter()` → `account` desde el **mismo**
+    `adapter.get_account_state()` (`orchestrator.py:91-96`).
+  - `_reconcile_account` compara `internal.account` vs `broker.account` → ambas
+    derivan del broker → **siempre MATCH** (salvo mutación síncrona inexistente).
+- **Qué NO puede detectarse**: cualquier divergencia real entre el cash/equity
+  que Atlas *debería* tener (por sus propios fills/P&L) y el que el broker
+  declara. La reconciliación ACCOUNT no aporta contraste.
+- **Independencia de fuentes**:
+
+| Fuente | Representa | Independiente del broker | Integrada runtime | Adecuada expected |
+|---|---|---:|---:|---:|
+| Portfolio (`portfolio/`) | exposición agregada (descriptiva) | Sí | **No** (0 importadores) | No |
+| OrderManager (`execution/`) | ciclo de órdenes | Sí | Sí | Solo ORDER/FILL |
+| Database (`database/`) | ORM | Sí | **No** (0 importadores) | No |
+| Backtest state | realized P&L interno | Sí | Sí | No (no reconcilia) |
+| `_last_cash/_last_equity` | caché del broker | **No** | Sí | No |
+| Broker account | cash/equity del broker | **No** | Sí | No (para expected) |
+
+- **No existe** hoy un ledger interno de cash/equity independiente. `PaperBrokerAdapter`
+  es fuente observada + ejecutora + única poseedora de cash/positions.
+- **ORDER/FILL/POSITION** sí comparan `OrderManager`/`_position` (interno) vs broker
+  → independientes; **no afectados** por F-06.
+- **Por qué NO se hace un pseudo-fix**: copiar el estado del broker a otro objeto
+  sería una segunda referencia, no independencia semántica; no detectaría nada.
+- **Mini-spec necesaria (fuera de una corrección puntual)**:
+  - componente que **posea** el ledger interno (candidato: un `AccountLedger`);
+  - **eventos** que lo actualicen (fills adoptados, P&L realizado/no realizado,
+    costes) — el `PaperTradingEngine` ya tiene `_realized_pnl`/fills, pero no un
+    cash/equity interno **autoritativo e independiente**;
+  - **qué compara ACCOUNT**: cash y equity internos vs `broker.get_account_state()`;
+  - integrar el ledger en el lifecycle de paper (hoy el cash/equity se leen del
+    broker en `_mark`);
+  - decidir el alcance (paper primero; backtest no reconcilia).
+- **Evidencia**: inspección de `reconciliation/`, `papertrading/engine.py`,
+  `portfolio/`, `database/` (0 integración).
+- **no se implementa gate ni ledger ad hoc.**
+- **no cerrado** hasta su mini-spec.
 
 ### F-07 — `OrderManager` admite transiciones de estado inválidas — **RESOLVED — pending commit**
 - ID: F-07
