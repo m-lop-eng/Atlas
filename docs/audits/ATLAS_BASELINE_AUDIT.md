@@ -283,13 +283,118 @@ Cobertura por módulo crítico (term-missing):
 | Margin | §20 | ninguna | ninguna | — | — | INFRASTRUCTURE GAP |
 | Correlation | §11-12 | ninguna | ninguna | — | — | INFRASTRUCTURE GAP |
 
-- **Limitación documentada (sin inventar semántica)**: el gate evalúa la
-  exposición **autoritativa actual** del estado de cuenta (pre-trade). El
-  contrato congelado no define "exposición proyectada post-trade", por lo que
-  **no** se modela. Con el motor actual (máx. 1 posición, sin señal si ya hay
-  posición) la exposición en el momento de la señal es la vigente.
-- **Pendiente para cerrar F-03**: margin/correlation (infraestructura) y
-  extender a **backtest** (requiere `AccountLedger`/fuente equivalente).
+- **Limitación de la fase 1 (sin inventar semántica)**: `a185cf7` implementa el
+  gate sobre la exposición **autoritativa actual** (pre-trade). En el motor
+  mono-instrumento (máx. 1 posición, sin señal si ya hay posición) esa exposición
+  es 0 al decidir, por lo que los 4 gates **no vinculan** la orden que los
+  dispara. El **contrato de exposición proyectada** (post-trade) queda **congelado
+  y listo para implementar** en la subsección «F-03 projected exposure
+  (post-trade) — CONTRATO CONGELADO».
+- **Pendiente para cerrar F-03**: implementar el gate proyectado (ver subsección),
+  margin/correlation (infraestructura) y extender a **backtest** (requiere
+  `AccountLedger`/fuente equivalente).
+
+---
+
+#### F-03 projected exposure (post-trade) — CONTRATO CONGELADO
+
+**A. Current-state gap.** Auditoría posterior a `a185cf7`:
+**`CURRENT-STATE GATE IS CORRECT BUT POST-TRADE GAP EXISTS`**. El gate evalúa la
+exposición **actual**; en el motor mono-instrumento (sin pyramiding, `validate`
+solo en flat) esa exposición es 0, así que los 4 gates no vinculan la orden que
+los dispara. Ejemplo: `equity=1_000_000`, `max_gross_exposure=100_000`, orden
+nueva notional `125_375`: `validate` ve `gross=0` (aprueba) y el fill crea
+`gross=125_375` (límite superado).
+
+**B. Projected exposure contract.**
+`projected_state = current_state + proposed_order_effect`, determinista y sin
+segunda fuente de posiciones:
+- `order_signed_qty = +qty` (BUY) / `-qty` (SELL); `qty =
+  decision.approved_quantity` (sizing ya aplicado).
+- `projected_qty[i] = current_qty[i] + order_signed_qty` (solo el instrumento de
+  la orden; el resto sin cambio). `current_qty` proviene de
+  `AccountLedger.valuation(marks)` (estado actual); **no** del broker.
+- El instrumento propuesto se **crea** en `projected_exposure_by_instrument`
+  aunque hoy no tenga posición.
+
+**C. Execution-time enforcement (decisión clave).**
+- Una evaluación **anticipada** (en la señal) puede usar el reference mark
+  actual y es **orientativa**, no el enforcement.
+- El **gate bloqueante** se ejecuta en el **último punto pre-fill**, con el
+  **precio de ejecución disponible en ese momento**. En paper MARKET ese precio
+  es el **`open` de `t+1`**, inmediatamente antes de aplicar el fill
+  (`_execute_pending` → `_set_price(open)`).
+- Objetivo: garantizar que la orden aceptada **no** produzca exposición superior
+  al límite **al precio efectivo de ejecución conocido**.
+- **Un gap respecto al `close` puede invalidar una aprobación anticipada**: el
+  check final pre-fill es el **enforcement efectivo**. No se modela slippage
+  adicional ni mercado adverso más allá del precio de ejecución realmente
+  disponible.
+- `None` (valuation incompleta) + gate activo ⇒ fail-closed también aquí.
+
+**D. Fórmulas.** Con `P_i` = precio de ejecución (ver C):
+`projected_notional[i] = projected_qty[i] × P_i`;
+`projected_exposure_by_instrument = {i: projected_notional[i]}`;
+`projected_gross = Σ|projected_notional[i]|`;
+`projected_net = Σ projected_notional[i]` (signed);
+`projected_leverage = projected_gross / current_equity` (ver F);
+`projected_concentration = max_i(|projected_notional[i]| / current_equity)`.
+Comparación: `projected_gross <= max_gross_exposure`,
+`abs(projected_net) <= max_net_exposure`,
+`projected_leverage <= max_leverage`,
+`projected_concentration <= max_instrument_concentration`.
+
+**E. Operaciones.** Mismo mecanismo de signed quantity para todas.
+
+| Operación | Estado proyectado | ¿Evalúa gross/net/leverage/concentration? | Regla |
+|---|---|---|---|
+| Apertura desde flat | `q_proj = order_signed_qty` | Sí (los 4) | Crear instrumento y comparar proyectado; rechazar si algún gate activo se viola |
+| Aumento | `q_proj = q_cur + order_signed_qty` (mismo signo) | Sí (los 4) | Sumar al notional existente (no bypass) |
+| Reducción | `q_proj = q_cur - \|q\|` (mismo signo, menor magnitud) | Sí (los 4) | Proyectado ≤ actual ⇒ no puede empeorar; sin regla especial |
+| Cierre | `q_proj = 0` | Sí (los 4) | Proyectado = 0 ⇒ pasa; mismo camino que las demás |
+| Reversal | `q_proj = q_cur + order_signed_qty` (p. ej. `+10` y `-15` ⇒ `-5`) | Sí (los 4) | Usar `q_proj` resultante; **nunca** sumar magnitudes LONG/SHORT |
+
+- **Caso contractual de apertura**: `equity=1_000_000`, `gross actual=0`, orden
+  `125_375` notional, `max_gross=100_000` ⇒ **REJECT antes del fill**.
+
+**F. Equity de referencia.** Denominador de los límites relativos (leverage,
+concentración) = **`current_equity`** (equity de referencia **pre-trade**, de
+`AccountLedger.valuation(marks)`). No implica que el equity post-fill real sea
+idéntico; **no** incorpora todavía fees/commission ni P&L no modelado. En el
+modelo spot/`point_value=1` ejecutar al mark es equity-neutral (`equity = cash +
+Σ q·mark`; `cash − q·P` y `+q·P` se cancelan), pero el fill real puede diferir
+del mark. `equity <= 0` con gate relativo activo ⇒ fail-closed.
+
+**G. Pending/partial/fees (deferred).**
+- **Órdenes pendientes**: fase actual = **una** pendiente, **sin** reserva de
+  exposición de múltiples órdenes; el check final pre-fill reevalúa con el estado
+  actual y el precio efectivo. Múltiples pendientes/pyramiding = **extensión
+  futura**.
+- **Parciales/multi-fill**: fuera de alcance (entrada MARKET de paper atómica).
+  Enforcement por fill parcial = **extensión futura**.
+- **Fees/commission**: `AccountLedger.apply_fill` **no** modela coste
+  (`BrokerFill.commission` default `0.0`; I4). La exposición proyectada **no**
+  incorpora costes y **no** se afirma que el límite sea neto de costes.
+  Incorporarlos requiere **ampliación contractual posterior**.
+
+**H. Current-state vs projected gate.** Para una **nueva orden**, el control
+material de F-03 es el **estado proyectado**. **No** se mantiene un segundo veto
+independiente sobre la exposición actual si solo duplica el mismo control sin
+protección adicional. Pueden conservarse funciones auxiliares actuales, pero
+semánticamente F-03 tiene **una sola decisión de riesgo por orden**, basada en el
+estado proyectado. El projected **subsume** al current-state (sin orden,
+proyectado = actual; reducción/cierre no empeoran).
+
+**I. Decisiones futuras/deferred.**
+1. Reserva de exposición para múltiples órdenes pendientes / pyramiding.
+2. Enforcement durante fills parciales / revalidación por fill.
+3. Modelado de fees/commission/slippage (hoy fuera; I4).
+4. Extensión a **backtest** (requiere `AccountLedger`/fuente equivalente).
+5. margin/correlation (`INFRASTRUCTURE GAP`, sin cambios).
+6. Semánticas ratificadas que **no** cambian: gross abs, net signed, leverage,
+   concentración por instrumento, `None=disabled`, fail-closed, paper phase 1.
+
+**Estado del contrato projected: `CONTRACT FROZEN — READY FOR PROJECTED-GATE IMPLEMENTATION` (no implementado).**
 
 ### F-04 — `PaperTradingEngine._risk_state()` fija kill_switch/account_active/strategy_active — **REFUTED (separación contractual)**
 - ID: F-04
