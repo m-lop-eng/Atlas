@@ -91,7 +91,10 @@ en `HEAD = 53625fb`; se conservan como referencia de auditoría):
   (A/B/C-RESTART/C ACCOUNT), F-07, F-09/F-10. **REFUTED**: F-04. **CI**: cerrado
   (`.github/workflows/ci.yml`).
 - Siguen **abiertos/deferred**:
-  - **F-08** — `CONTRACT GAP` (sizing entero/`quantity_step` para contratos).
+  - **F-08** — `CONTRACT GAP — NOT APPLICABLE TO CURRENT INSTRUMENT CONTRACT`
+  (preventivo para instrumentos integer-only; sin bug en el alcance actual).
+  Subfindings: **F-08-a** (quantity NaN/Inf, `CONTRACT GAP / NEEDS ORIGIN
+  AUDIT`) y **F-08-b** (instrument quantity metadata, `INFRASTRUCTURE GAP`).
   - **F-11** — `CONTRACT GAP` / decisión documentada (config de producción con
     `null`, no ejecutable; ver F-11).
   - **margin / correlation** — `INFRASTRUCTURE GAP` (F-03 fase 1 no los modela).
@@ -622,41 +625,65 @@ pre-fill con precio de ejecución (`open(t+1)`); projected state desde
   pero §8 lo describe como estado a **resolver** con `get_order`; al ser terminal,
   no hay arista para salir de él. Fuera del alcance de F-07.
 
-### F-08 — Position sizing sin `quantity_step`/contratos enteros — **REQUIRES DECISION**
+### F-08 — Position sizing sin `quantity_step`/contratos enteros — **CONTRACT GAP — NOT APPLICABLE TO CURRENT INSTRUMENT CONTRACT**
 - ID: F-08
-- severidad: **MEDIUM**
+- severidad: **MEDIUM** (histórica; sin bug observable en el alcance actual)
 - archivo: `risk/position_sizing.py` (`position_size_from_stop`), `risk/engine.py` (`_size_fixed_fractional`)
-- **estado: REQUIRES DECISION** — NO implementado.
-- **Hallazgo: AMBIGUO/REFUTADO en el alcance actual.** La premisa "NQ/ES exigen
-  enteros" **no está respaldada por ningún instrumento configurado**.
-- **Evidencia de contrato**:
-  - No existe `quantity_step`, `lot_size`, `contract_size` ni `min_quantity` en
-    código, configs ni docs (solo `min_size`, que es un **umbral mínimo**, no un
-    step).
-  - Instrumentos realmente configurados/operados: `BTCUSDT`, `XXBTZUSD` (crypto,
-    **fraccionables**) y `SAMPLE` (sintético). Ningún futuro de contrato entero.
-  - `Order.quantity: int | float`, broker `quantity: float` → el contrato
-    vigente **admite fracciones**.
-  - `point_value` (p.ej. NQ=50) existe para mercados futuros, pero **ningún**
-    config lo usa.
-  - `03 §6` menciona "Minimum contract size / Lot size" como cosas que el cálculo
-    *debería* considerar (aspiracional), sin definir el contrato operativo.
-- **Opción respaldada por el repo**: **C — fraccionalidad permitida** en el
-  alcance actual (cripto). No hay base para A (enteros) ni B (step por instrumento)
-  sin inventar un contrato (instrumento/step/moneda).
-- **Por qué NO implementar**: introducir `quantity_step` ahora sería inventar
-  contrato no respaldado (step por instrumento, política de redondeo, fuente de
-  metadata). El usuario lo prohíbe explícitamente ("no introduzcas `quantity_step`
-  solo porque el hallazgo lo menciona").
-- **Ambigüedad a resolver (decisión humana)**: política de cuantización si en el
-  futuro se añade un instrumento entero: `floor` (preserva el límite de riesgo),
-  `round`, `ceil` (puede superarlo) o `reject`; y **dónde** vive la metadata
-  (step/lot) por instrumento. Para sizing risk-based, `floor` es la única que
-  garantiza `riesgo_final ≤ riesgo_objetivo`, pero debe ratificarse.
-- **Alcance actual**: el sizing es correcto para los instrumentos fraccionables
-  operados; no hay bug observable hoy.
-- **No cerrar F-08 como RESOLVED**; queda `REQUIRES DECISION` para el día en que
-  se incorpore un instrumento de contrato entero/step (p.ej. NQ/ES).
+- **estado: `CONTRACT GAP — NOT APPLICABLE TO CURRENT INSTRUMENT CONTRACT`**
+  (NO implementado; preventivo para instrumentos futuros).
+- **Hallazgo original**: position sizing sin `quantity_step`/contratos enteros;
+  premisa "NQ/ES exigen enteros" **no respaldada** por ningún instrumento
+  configurado.
+- **Re-auditoría (HEAD `e38a624`)**:
+  - El contrato vigente **permite cantidades fraccionarias**: `Order.quantity:
+    int | float`, `BrokerOrder.quantity: float`, `BrokerFill.quantity: float`,
+    `AccountLedger` opera con floats.
+  - Instrumentos realmente configurados/operados: **`BTCUSDT`**, **`XXBTZUSD`**
+    (crypto, fraccionables) y **`SAMPLE`** (sintético); `point_value=1.0`,
+    `min_size=0.001`. **No hay evidencia de instrumentos integer-only.**
+  - **No existen** `quantity_step`, `lot_size`, `contract_size` ni `min_quantity`
+    en producción (código/config/docs).
+  - **`min_size` es un umbral mínimo, NO un múltiplo/step** (`approved_quantity <
+    min_size` → rechazo; engine.py:685, backtesting/engine.py:417).
+  - La cantidad se **preserva sin transformación** a lo largo de la ruta:
+    `approved_quantity` → `ProjectedExposure` (signed delta) → `Order.quantity` →
+    `BrokerFill.quantity` → `AccountLedger.apply_fill`. `OrderManager()` en
+    producción sin `_max_quantity`/clamp.
+  - **No existe `round`/`floor`/`ceil`/`quantize` posterior al projected gate.**
+- **Conclusión**: **no hay bug observable en el alcance actual** (fracciones).
+  La premisa original queda **resuelta/no aplicable** al contrato de instrumentos
+  vigente; F-08 permanece como `CONTRACT GAP` **preventivo** para el día en que se
+  incorpore un instrumento de contrato entero/step.
+
+#### F-08-a — quantity NaN/Inf validation
+- ID: F-08-a (subfinding separado de F-08).
+- archivo: `execution/order.py` (`Order.__post_init__`), `brokers/paper.py`
+  (`submit_order`).
+- **estado: `CONTRACT GAP / NEEDS ORIGIN AUDIT`** — NO implementado.
+- `Order.__post_init__` valida `quantity <= 0` y `PaperBrokerAdapter.submit_order`
+  valida `not quantity or quantity <= 0`; **ninguna** de esas comparaciones
+  rechaza `NaN`/`Inf` (`NaN <= 0` y `Inf <= 0` son `False`).
+- **No se ha demostrado** que una señal válida de producción pueda generar esas
+  cantidades; el siguiente análisis, si se aborda, debe determinar **de dónde
+  puede originarse `NaN/Inf` en `approved_quantity`** (p.ej. precios de señal
+  `NaN`/`Inf` que atraviesan `distance`/`unit_risk`) y si existe una barrera
+  upstream (data quality F-09/F-10).
+- **No** reclasificar como `IMPLEMENTATION BUG` sin esa evidencia de origen; **no**
+  añadir validación nueva todavía.
+
+#### F-08-b — instrument quantity metadata
+- ID: F-08-b (subfinding separado de F-08).
+- archivo: `database/models.py::Instrument`.
+- **estado: `INFRASTRUCTURE GAP`** — NO implementado.
+- `Instrument` define `tick_size`/`point_value` pero **no** `quantity_step`/
+  `lot_size`; la DB **no está cableada** al runtime relevante (ver S-05).
+- Si en el futuro se incorporan instrumentos integer-only, habrá que definir la
+  **fuente de metadata** de cantidad y la **política de cuantización**.
+
+- **Decisiones futuras (deferred; no inventar ahora)**:
+  `quantity_step` por instrumento; fuente de metadata; punto de cuantización
+  (pre-gate); `floor`/`round`/`ceil`/`reject`; y la relación entre cantidad
+  cuantizada y el projected risk gate (`approved == projected delta`).
 
 ### F-09 — `summarize_quality()` NO ejecuta todos los checks — **RESOLVED — pending commit**
 - ID: F-09
@@ -840,8 +867,8 @@ pre-fill con precio de ejecución (`open(t+1)`); projected state desde
    (ver F-09/F-10).
 6. **F-11 production config con `null`** — **ABIERTO** (`CONTRACT GAP` /
    decisión documentada; ver F-11).
-7. **F-08 sizing entero/`quantity_step`** — **ABIERTO** (`CONTRACT GAP`; ver
-   F-08).
+7. **F-08 sizing entero/`quantity_step`** — **`CONTRACT GAP — NOT APPLICABLE TO
+   CURRENT INSTRUMENT CONTRACT`** (preventivo; sin bug actual; ver F-08).
 8. **margin / correlation (F-03)** — **ABIERTO** (`INFRASTRUCTURE GAP`).
 9. **UNKNOWN/restart recovery gap** — **ABIERTO** (recovery de submissions
    pendientes; ver F-06/F-03).
@@ -878,7 +905,10 @@ pre-fill con precio de ejecución (`open(t+1)`); projected state desde
 5. **F-07** (tabla de transiciones de `OrderManager`) — **DONE**.
 6. **F-06** (ledger interno real para reconciliación contable) — **DONE**
    (`4bb66c2`/`eeac54d`/`c722896`/`fbb0236`).
-7. **F-08** (sizing entero/step para contratos) — **PENDIENTE** (`CONTRACT GAP`).
+7. **F-08** (sizing entero/step para contratos) — **`CONTRACT GAP — NOT
+   APPLICABLE TO CURRENT INSTRUMENT CONTRACT`** (preventivo; sin bug actual);
+   subfindings **F-08-a** (`CONTRACT GAP / NEEDS ORIGIN AUDIT`) y **F-08-b**
+   (`INFRASTRUCTURE GAP`).
 8. **F-11** (validación del bloque `risk` de producción) — **PENDIENTE**
    (`CONTRACT GAP` / decisión documentada).
 9. **F-04** (contrato de estado de riesgo en paper) — **REFUTED** (no es bug).
@@ -887,9 +917,11 @@ pre-fill con precio de ejecución (`open(t+1)`); projected state desde
     S-04 (UNKNOWN en reconciliación) — **`CLOSED — REFUTED`**.
 11. Añadir CI (pytest + coverage) — **DONE** (`.github/workflows/ci.yml`).
 
-Pendientes vigentes: **F-08**, **F-11**, **margin/correlation (F-03)**,
-**backtest fuera de alcance (F-03)**, **UNKNOWN/restart recovery gap**, y deuda
-no bloqueante **I2/I3/I4/I5/I6** (ver F-06).
+Pendientes vigentes: **F-08** (`CONTRACT GAP` preventivo, no aplicable al
+contrato de instrumentos actual; subfindings **F-08-a**/**F-08-b**), **F-11**,
+**margin/correlation (F-03)**, **backtest fuera de alcance (F-03)**,
+**UNKNOWN/restart recovery gap**, y deuda no bloqueante **I2/I3/I4/I5/I6**
+(ver F-06).
 
 ---
 
@@ -904,8 +936,10 @@ no bloqueante **I2/I3/I4/I5/I6** (ver F-06).
 - **Correctness**: **sí** para los hallazgos de correctness del baseline — F-05
   (equity SHORT) y F-01 (TZ) **cerrados**.
 - **Operational readiness**: paper/forward operativo con **F-02/F-03/F-06
-  cerrados**; permanecen **F-08/F-11 (`CONTRACT GAP`)** y **margin/correlation
-  (`INFRASTRUCTURE GAP`)**; **UNKNOWN/restart recovery gap** abierto.
+  cerrados**; permanecen **F-08** (`CONTRACT GAP` preventivo, no aplicable al
+  contrato de instrumentos actual) y **F-11 (`CONTRACT GAP`)** y
+  **margin/correlation (`INFRASTRUCTURE GAP`)**; **UNKNOWN/restart recovery gap**
+  abierto.
 - **Production readiness**: **NO** — sin broker real (por diseño), sin
   margin/correlation, sin validación de config de producción (F-11). **Ningún
   estado de "production ready"** se declara.
