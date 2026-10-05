@@ -20,7 +20,9 @@ python -m compileall -q <paquetes>
 - Repositorio git; rama `main`; `HEAD = 53625fb`
   (`feat: M4 hypothesis lifecycle, selection and validation gates`).
 - `git status --short` = ` M README.md` (cambio preexistente, fuera de alcance).
-- Sin CI: no existe `.github/`, `.gitlab-ci.yml` ni `azure-pipelines.yml`.
+- Sin CI en el baseline: no existía `.github/`, `.gitlab-ci.yml` ni
+  `azure-pipelines.yml`. **Resuelto**: existe `.github/workflows/ci.yml`
+  (commit `ffb5942`).
 - `__pycache__` / `*.pyc` / `*.pyo` / `egg-info`: **no versionados**
   (gitignored). `atlas.egg-info` y `.pytest_cache` existen en disco, no en git.
 - Datasets: CSVs **no** versionados (`*.csv` ignorado); solo se versionan
@@ -78,6 +80,29 @@ Cobertura por módulo crítico (term-missing):
 | `monitoring/checks.py` | 82% | múltiples |
 | `killswitches/coordinator.py` | 100% | — |
 | `config/loader.py` | 86% | 58,61,65-66,69 |
+
+## Current Status (post-remediation) — `HEAD = 3fb3203`
+
+Estado verificable actual (los conteos de arriba son el **baseline histórico**
+en `HEAD = 53625fb`; se conservan como referencia de auditoría):
+
+- Suite: **976 passed**; `compileall` exit 0; coverage global **86%**.
+- Findings **CLOSED**: F-01, F-02, F-03 (paper projected pre-fill), F-05, F-06
+  (A/B/C-RESTART/C ACCOUNT), F-07, F-09/F-10. **REFUTED**: F-04. **CI**: cerrado
+  (`.github/workflows/ci.yml`).
+- Siguen **abiertos/deferred**:
+  - **F-08** — `CONTRACT GAP` (sizing entero/`quantity_step` para contratos).
+  - **F-11** — `CONTRACT GAP` / decisión documentada (config de producción con
+    `null`, no ejecutable; ver F-11).
+  - **margin / correlation** — `INFRASTRUCTURE GAP` (F-03 fase 1 no los modela).
+  - **backtest** — fuera de alcance de F-03 (requiere `AccountLedger`/fuente
+    equivalente).
+  - **UNKNOWN/restart recovery gap** — identificado en F-06/F-03: submissions
+    UNKNOWN en vuelo no se adoptan tras restart (divergencia detectable por
+    reconciliación, no bypass del gate).
+- Nota: la sección «Test Baseline» y las líneas de evidencia por-finding
+  (`798/807/817/833/845 passed`) son **históricas** y documentan cuándo se cerró
+  cada hallazgo; no describen el estado actual.
 
 ## Architecture Inventory
 
@@ -757,22 +782,33 @@ pre-fill con precio de ejecución (`open(t+1)`); projected state desde
 - severidad: LOW — `database/` sin importadores externos; `portfolio/` sin
   conexión al veto (consecuencia de F-03). Documentarlo como MVP.
 
-## Production Blockers
+## Production Blockers (estado actual)
+
+> Los ítems marcados **CLOSED** fueron blockers en el baseline inicial; se
+> conservan aquí con su resolución para trazabilidad. La lista vigente de
+> blockers es la de los ítems sin resolver.
 
 1. **No existe ejecución real / broker real** (solo `PaperBrokerAdapter`), por
    diseño. No hay credenciales ni endpoints de órdenes (verificado: sin `ccxt`,
    `ib_insync`, MT5 al cual no). Sin embargo, esto **no es un blocker de
    *ejecución live* todavía** (fase no autorizada), sí lo es de *producción*.
-2. **F-05 equity SHORT incorrecta** — un backtest/paper con shorts produce P&L y
-   drawdown erróneos. Blockea cualquier validación de estrategia corta.
-3. **F-02 `max_strategy_risk` inerte** — un límite de riesgo declarado no protege
-   en el pipeline con `point_value`.
-4. **F-03 sin veto de exposición/leverage/correlación** — no apto para operar
-   múltiples posiciones/instrumentos con control de portafolio.
-5. **F-09/F-10 data quality incompleta + reordenamiento silencioso** — la puerta
-   de datos no garantiza integridad antes de backtest/producción.
-6. **F-11 production config con `null`** — configuración de producción sin
-   validación.
+   — **ABIERTO (por diseño)**.
+2. **F-05 equity SHORT incorrecta** — **CLOSED** (formula `cash + Σ q·mark` con
+   signo; ver F-05).
+3. **F-02 `max_strategy_risk` inerte** — **CLOSED** (contrato `risk_per_trade <=
+   max_strategy_risk`; ver F-02).
+4. **F-03 sin veto de exposición/leverage/correlación** — **CLOSED (paper
+   projected pre-fill)** para gross/net/leverage/concentration; **margin y
+   correlation siguen `INFRASTRUCTURE GAP`** y backtest fuera de alcance.
+5. **F-09/F-10 data quality incompleta + reordenamiento silencioso** — **CLOSED**
+   (ver F-09/F-10).
+6. **F-11 production config con `null`** — **ABIERTO** (`CONTRACT GAP` /
+   decisión documentada; ver F-11).
+7. **F-08 sizing entero/`quantity_step`** — **ABIERTO** (`CONTRACT GAP`; ver
+   F-08).
+8. **margin / correlation (F-03)** — **ABIERTO** (`INFRASTRUCTURE GAP`).
+9. **UNKNOWN/restart recovery gap** — **ABIERTO** (recovery de submissions
+   pendientes; ver F-06/F-03).
 
 ## Research Status
 
@@ -787,32 +823,51 @@ pre-fill con precio de ejecución (`open(t+1)`); projected state desde
 - Datasets: `experiments/data/market_BTCUSDT_60min.csv` (67.141 barras,
   2019-01→2026-08), `market_XXBTZUSD_60min.csv` (Kraken ~30d), `sample_1h.csv`.
   CSVs gitignored; manifests versionados.
-- `data/quality.py` presente pero incompleto en su resumen (F-09); loader
-  reordena (F-10).
+- `data/quality.py` / loader: en el baseline, resumen incompleto (F-09) y
+  reordenamiento silencioso (F-10). **Resuelto** (F-09/F-10 `CLOSED`; ver F-09 y
+  F-10).
 - `data/raw/` gitignored (caché de adquisición FINAL_OOS).
 
 ## Recommended Remediation Order
 
-1. **F-05** (equity SHORT) — correctness de P&L; base de todo lo demás.
-2. **F-01** (`_day_key` UTC) — reproducibilidad del reset diario.
-3. **F-09 + F-10** (data quality completa + orden obligatorio) — puerta de datos.
-4. **F-02 + F-03** (veto de riesgo real: `max_strategy_risk` + exposición).
-5. **F-07** (tabla de transiciones de `OrderManager`).
-6. **F-06** (ledger interno real para reconciliación contable).
-7. **F-08** (sizing entero/step para contratos).
-8. **F-11** (validación del bloque `risk` de producción).
-9. **F-04** (contrato de estado de riesgo en paper).
-10. S-02/S-04 (cobertura de ramas de posición y estados UNKNOWN).
-11. Añadir CI (pytest + coverage) — no existe pipeline.
+> Orden histórico del baseline, **anotado con el estado actual**. Lo ya
+> completado se conserva para trazabilidad; el orden vigente es el de los ítems
+> pendientes.
+
+1. **F-05** (equity SHORT) — **DONE**.
+2. **F-01** (`_day_key` UTC) — **DONE**.
+3. **F-09 + F-10** (data quality + orden obligatorio) — **DONE**.
+4. **F-02 + F-03** (veto de riesgo real + exposición) — **F-02 DONE**; **F-03
+   DONE (paper projected pre-fill)**; margin/correlation y backtest pendientes.
+5. **F-07** (tabla de transiciones de `OrderManager`) — **DONE**.
+6. **F-06** (ledger interno real para reconciliación contable) — **DONE**
+   (`4bb66c2`/`eeac54d`/`c722896`/`fbb0236`).
+7. **F-08** (sizing entero/step para contratos) — **PENDIENTE** (`CONTRACT GAP`).
+8. **F-11** (validación del bloque `risk` de producción) — **PENDIENTE**
+   (`CONTRACT GAP` / decisión documentada).
+9. **F-04** (contrato de estado de riesgo en paper) — **REFUTED** (no es bug).
+10. S-02/S-04 (cobertura de ramas de posición y estados UNKNOWN) — **parcial**.
+11. Añadir CI (pytest + coverage) — **DONE** (`.github/workflows/ci.yml`).
+
+Pendientes vigentes: **F-08**, **F-11**, **margin/correlation (F-03)**,
+**backtest fuera de alcance (F-03)**, **UNKNOWN/restart recovery gap**, y deuda
+no bloqueante **I2/I3/I4/I5/I6** (ver F-06).
 
 ---
 
-## Distinción explícita de estados
+## Distinción explícita de estados (estado actual)
 
-- **Tests passed**: sí — 798 passed, `compileall` limpio.
-- **Correctness**: **NO** — F-05 (equity SHORT), F-01 (TZ) afectan resultados.
-- **Operational readiness**: parcial — paper/forward operativo, pero con F-02/F-03
-  (veto incompleto) y F-06 (reconciliación contable tautológica).
-- **Production readiness**: **NO** — sin broker real (por diseño), sin veto de
-  portafolio, sin validación de config de producción, sin CI. **Ningún estado de
-  "production ready"** se declara.
+> Valores actuales en `HEAD = 3fb3203`. Los valores del baseline inicial
+> (`798 passed`, F-05/F-01 afectando correctness, F-02/F-03/F-06 abiertos) se
+> conservan en las secciones por-finding como evidencia histórica.
+
+- **Tests passed**: sí — **976 passed**, `compileall` limpio, coverage global
+  **86%**.
+- **Correctness**: **sí** para los hallazgos de correctness del baseline — F-05
+  (equity SHORT) y F-01 (TZ) **cerrados**.
+- **Operational readiness**: paper/forward operativo con **F-02/F-03/F-06
+  cerrados**; permanecen **F-08/F-11 (`CONTRACT GAP`)** y **margin/correlation
+  (`INFRASTRUCTURE GAP`)**; **UNKNOWN/restart recovery gap** abierto.
+- **Production readiness**: **NO** — sin broker real (por diseño), sin
+  margin/correlation, sin validación de config de producción (F-11). **Ningún
+  estado de "production ready"** se declara.
