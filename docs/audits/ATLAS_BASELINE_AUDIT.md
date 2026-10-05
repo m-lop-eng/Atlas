@@ -171,32 +171,106 @@ Cobertura por módulo crítico (term-missing):
 - **Evidencia**: `pytest` → 833 passed; `compileall` OK; `risk/engine.py` 98%.
 - **no cerrado del todo** hasta el commit.
 
-### F-03 — exposure/leverage/margin/correlation/concentration — **REQUIRES MINI-SPEC / INFRASTRUCTURE GAP**
+### F-03 — exposure/leverage/margin/correlation/concentration — **CONTRACT FROZEN (READY FOR IMPLEMENTATION, paper phase 1)**
 - ID: F-03
 - severidad: **HIGH**
-- archivo: `risk/engine.py`, `risk/types.py`, `portfolio/engine.py`
-- **estado: REQUIRES MINI-SPEC / INFRASTRUCTURE GAP** — NO corregido.
+- archivo: `risk/engine.py`, `risk/types.py` (`RiskConfig`/`AccountRiskState`), `papertrading/engine.py` (wiring futuro), `portfolio/engine.py`
+- **estado: CONTRACT FROZEN — READY FOR IMPLEMENTATION (paper phase 1)** — NO implementado todavía.
 - **Hallazgo original**: el veto de riesgo no incluye exposición (gross/net),
   leverage, margin, correlación ni concentración; `AccountRiskState` expone
   `gross_exposure/net_exposure/margin_usage` sin que `validate` los compruebe.
-- Los campos existentes **no** constituyen un contrato operacional completo:
-  faltan límites configurables y/o datos runtime/modelos necesarios. **No** se
-  implementan gates para no introducir política de riesgo no especificada.
+- **Fuente autoritativa única (F-06B)**: `AccountLedger.valuation(marks) ->
+  ValuationSnapshot` (commit `eeac54d`): `gross_exposure = Σ|q·mark|`,
+  `net_exposure = Σ q·mark` (**signed**), `equity`, `unrealized_pnl`,
+  `exposure_by_instrument` (notional firmado). `point_value=1`, USD, spot.
+- **Contrato congelado (decisiones cerradas; sin ambigüedad residual):**
 
-| Gate | Definición | Límite config | Dato runtime | Modelo | Tests | Clasificación |
+#### 1. Gross exposure
+- Definición: `gross_exposure = Σ |quantity × mark|` (USD).
+- Fuente: `ValuationSnapshot.gross_exposure`.
+- Gate fase 1: `gross_exposure <= max_gross_exposure` (**absoluto**, USD).
+- `max_gross_exposure = None` ⇒ gate deshabilitado. **No** existe `max_gross_ratio`
+  (el control relativo a equity lo cubre leverage).
+
+#### 2. Net exposure
+- Definición: `net_exposure = Σ quantity × mark` (**signed**: LONG `+`, SHORT `−`).
+- Fuente: `ValuationSnapshot.net_exposure`.
+- Gate fase 1: `abs(net_exposure) <= max_net_exposure` (**absoluto**, USD).
+- `max_net_exposure = None` ⇒ gate deshabilitado. **No** hay límites net-long/net-short
+  separados en fase 1.
+- **Prohibido** usar `abs(long_exposure − short_exposure)` ni la semántica de
+  `portfolio.compute_portfolio_risk()`.
+
+#### 3. Leverage
+- Definición: `leverage = gross_exposure / equity`.
+- Gate: `leverage <= max_leverage` (`max_leverage` configurable; alcance inicial
+  = **account**). `None` ⇒ deshabilitado. Sin lógica broker-specific.
+- `equity <= 0` con gate activo ⇒ leverage **no evaluable → fail-closed**.
+
+#### 4. Concentration
+- Fase 1 **solo instrumento**:
+  `instrument_concentration_i = abs(exposure_by_instrument[i]) / equity`.
+- Gate: `max_i(instrument_concentration_i) <= max_instrument_concentration`
+  (fracción de equity). `None` ⇒ deshabilitado. Numerador en **magnitud absoluta**.
+- `equity <= 0` con gate activo ⇒ **fail-closed**.
+- **Deferred**: concentración por strategy/market/currency/economic factor (sin
+  fuente autoritativa en F-06).
+
+#### 5. `None` y cero (ratificado)
+- Límite `None`/ausente = gate deshabilitado.
+- Métrica `0.0` = cero real.
+- Métrica no disponible = `None`, **nunca** `0.0`.
+- **Los defaults `0.0` actuales de `AccountRiskState.gross_exposure/net_exposure`
+  son ambiguos y deberán eliminarse** en la implementación de F-03.
+
+#### 6. Valuation incompleta
+- `valuation() = None` (posición abierta sin mark válido): si el gate está
+  deshabilitado (`limit=None`) no se evalúa; si el gate está activo ⇒ **no
+  evaluable → fail-closed**. Nunca sustituir por `0.0`; nunca usar el broker como
+  fallback del expected risk state.
+
+#### 7. `AccountRiskState` (requisito de implementación futura)
+- `gross_exposure: float | None`, `net_exposure: float | None` (y análogo para
+  cualquier métrica realmente no disponible). **No** cambiar ahora.
+
+#### 8. Alcance
+- F-03 fase 1 = **paper trading** (`PaperTradingEngine` obtiene las métricas de
+  `AccountLedger.valuation()`). **Backtest fuera** hasta disponer de
+  `AccountLedger` equivalente o fuente semánticamente equivalente. **No** crear
+  una segunda implementación de gross/net para simetría.
+
+#### 9. Margin — **INFRASTRUCTURE GAP**
+- No implementar. Requiere: initial/maintenance margin por instrumento, available
+  margin, projected margin after order y política contractual de rechazo (§20).
+
+#### 10. Correlation — **INFRASTRUCTURE GAP**
+- No implementar. Requiere: series de precios, ventanas, matriz y definición de
+  exposición efectiva correlacionada (§11-12).
+
+#### 11. `portfolio.compute_portfolio_risk()`
+- **No** es fuente de verdad para F-03; **no** conectarlo a `RiskEngine`.
+- Su `total_net_exposure = abs(long − short)` **no** sustituye el signed net de
+  `AccountLedger`. **Legacy/no-wired** (marcado para limpieza posterior).
+
+#### 12. Ubicación de configuración (futuro)
+- Los límites pertenecen a `RiskConfig` cuando se implemente F-03:
+  `max_gross_exposure`, `max_net_exposure`, `max_leverage`,
+  `max_instrument_concentration`. **No** añadirlos ahora al modelo ni a YAML.
+- Coherencia con F-11: ausencia / `None` = gate disabled; **no** inventar defaults.
+
+| Gate | Fórmula | Fuente | Límite/config | `equity <= 0` | valuation incompleta | Estado |
 |---|---|---|---|---|---|---|
-| Gross exposure | `portfolio/engine.py`; campo muerto `AccountRiskState.gross_exposure` | No | No poblado | Parcial | Solo cálculo | Requiere mini-spec |
-| Net exposure | idem | No | No | Parcial | Solo cálculo | Requiere mini-spec |
-| Margin | §20 (texto) | No | No | No | No | Gap de infraestructura |
-| Leverage | §19 fórmula `gross/equity` | No (`max_leverage` inexistente) | No | Doc sin impl | No | Gap de infraestructura |
-| Correlation | §11-12 | No | No | No | No | Gap de infraestructura |
-| Concentration | §18 | No | No | No | No | Gap de infraestructura |
+| Gross | `Σ\|q·mark\|` | `ValuationSnapshot.gross_exposure` | `max_gross_exposure` (USD, abs) | n/a (absoluto) | fail-closed si activo | CONTRACT FROZEN |
+| Net | `Σ q·mark` (signed) | `ValuationSnapshot.net_exposure` | `max_net_exposure` (USD, abs) | n/a (absoluto) | fail-closed si activo | CONTRACT FROZEN |
+| Leverage | `gross / equity` | `ValuationSnapshot` | `max_leverage` (account) | fail-closed | fail-closed | CONTRACT FROZEN |
+| Concentration | `max_i(\|exposure_i\|/equity)` | `ValuationSnapshot.exposure_by_instrument` | `max_instrument_concentration` | fail-closed | fail-closed | CONTRACT FROZEN (solo instrumento) |
+| Margin | §20 | ninguna | ninguna | — | — | INFRASTRUCTURE GAP |
+| Correlation | §11-12 | ninguna | ninguna | — | — | INFRASTRUCTURE GAP |
 
-- Gross/net requieren además **integrar** `portfolio.compute_portfolio_risk`
-  (hoy no wired) con el risk path y poblar `AccountRiskState`.
-- Margin/leverage/correlation/concentration requieren **definición/modelado**
-  adicional (límites, ventanas, datos de margen por instrumento).
-- **NO implementar gates** sin contrato.
+- **Siguiente paso**: implementación F-03 (paper phase 1) — poblar
+  `AccountRiskState.gross/net` desde `AccountLedger.valuation()`, añadir los
+  límites a `RiskConfig` y los gates a `RiskEngine`. Sin decisiones semánticas
+  pendientes.
 
 ### F-04 — `PaperTradingEngine._risk_state()` fija kill_switch/account_active/strategy_active — **REFUTED (separación contractual)**
 - ID: F-04
