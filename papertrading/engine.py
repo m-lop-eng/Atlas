@@ -23,6 +23,7 @@ sesión CLOSED (solo stop/time). Reiniciable sin duplicar exposición
 
 from __future__ import annotations
 
+import math
 from dataclasses import replace
 from datetime import date, datetime, timezone
 from typing import Any, Callable
@@ -59,7 +60,7 @@ from reconciliation.orchestrator import (
     reconcile_with_broker,
     resolve_unknown_orders,
 )
-from risk.types import AccountRiskState
+from risk.types import AccountRiskState, ProjectedExposure
 from sessions.manager import MarketSessionManager
 from strategies.base.signal import Action
 from strategies.base.strategy import BaseStrategy
@@ -80,6 +81,14 @@ _EPS = 1e-9
 
 def _dt_from_open(open_time: int) -> datetime:
     return datetime.fromtimestamp(open_time, tz=timezone.utc)
+
+
+def _valid_price(price: object) -> bool:
+    """Precio de ejecucion/mark valido: numero finito y > 0."""
+    if not isinstance(price, (int, float)):
+        return False
+    p = float(price)
+    return math.isfinite(p) and p > 0.0
 
 
 class PaperTradingEngine:
@@ -290,6 +299,32 @@ class PaperTradingEngine:
         if not self._broker_healthy():
             self._audit_rec(
                 PaperEvent.ENTRY_SKIPPED_BROKER, {"signal_id": pe.cid}
+            )
+            self._pending = None
+            return
+        # F-03: enforcement PROJECTED pre-fill. Ultimo punto antes del fill, con
+        # el precio de ejecucion disponible (open de t+1 en paper MARKET). Si
+        # algun gate projected activo se viola (o la metrica no esta disponible
+        # => fail-closed), la orden NO llega al broker ni al ledger.
+        execution_price = float(bar["open"])
+        signed_qty = (
+            pe.decision.approved_quantity
+            if pe.signal.action is Action.LONG
+            else -pe.decision.approved_quantity
+        )
+        projected = self._projected_exposure(
+            instrument=pe.signal.instrument,
+            signed_qty=signed_qty,
+            execution_price=execution_price,
+        )
+        projected_decision = self.risk_engine.validate_projected_exposure(
+            projected
+        )
+        if not projected_decision.approved:
+            self._audit_rec(
+                PaperEvent.RISK_REJECTED,
+                {"signal_id": pe.cid, "reason": projected_decision.reason,
+                 "stage": "projected_pre_fill"},
             )
             self._pending = None
             return
@@ -668,33 +703,60 @@ class PaperTradingEngine:
     def _risk_state(self) -> AccountRiskState:
         peak = self._peak_equity or 1.0
         dd = 0.0 if peak <= 0 else max(0.0, 1.0 - self._last_equity / peak)
-        # F-03: metricas de exposicion desde la fuente autoritativa unica
-        # (AccountLedger.valuation + marks del runtime). NUNCA del broker.
-        # Valuacion incompleta -> metricas None (no se convierten en 0.0);
-        # `equity` conserva la semantica existente de ultimo valor conocido.
-        val = self._ledger.valuation(self._marks())
-        if val is None:
-            equity = self._last_equity
-            gross: float | None = None
-            net: float | None = None
-            by_instrument: dict[str, float] | None = None
-        else:
-            equity = val.equity
-            gross = val.gross_exposure
-            net = val.net_exposure
-            by_instrument = dict(val.exposure_by_instrument)
         return AccountRiskState(
-            equity=equity,
+            equity=self._last_equity,
             balance=self._last_cash,
             open_positions=0 if self._position is None else 1,
             current_daily_pnl=self._day_pnl,
             current_drawdown=dd,
-            gross_exposure=gross,
-            net_exposure=net,
-            exposure_by_instrument=by_instrument,
             kill_switch=False,
             account_active=True,
             strategy_active=True,
+        )
+
+    def _projected_exposure(
+        self, *, instrument: str, signed_qty: float, execution_price: float
+    ) -> ProjectedExposure:
+        """Metricas de exposicion PROYECTADA (post-trade) para el gate pre-fill.
+
+        Deriva del ledger (autoridad) + la orden propuesta + el precio de
+        ejecucion. Value object efimero; NO se persiste ni crea una segunda
+        autoridad. Para el instrumento de la orden usa `execution_price`; para
+        posiciones existentes, los marks del runtime (`_marks`). Si falta un
+        mark/precio valido => metricas `None` (fail-closed si el gate esta
+        activo). `equity` = equity de referencia pre-trade del ledger.
+        """
+        marks = self._marks()
+        current_val = self._ledger.valuation(marks)
+        equity = (
+            current_val.equity if current_val is not None else self._ledger.cash
+        )
+        projected_qty: dict[str, float] = {
+            p.instrument: p.quantity for p in self._ledger.positions()
+        }
+        projected_qty[instrument] = (
+            projected_qty.get(instrument, 0.0) + signed_qty
+        )
+        by_instrument: dict[str, float] = {}
+        for i, q in projected_qty.items():
+            if abs(q) <= _EPS:
+                continue
+            price = execution_price if i == instrument else marks.get(i)
+            if not _valid_price(price):
+                return ProjectedExposure(
+                    equity=equity,
+                    gross_exposure=None,
+                    net_exposure=None,
+                    exposure_by_instrument=None,
+                )
+            by_instrument[i] = q * float(price)
+        gross = sum(abs(v) for v in by_instrument.values())
+        net = sum(by_instrument.values())
+        return ProjectedExposure(
+            equity=equity,
+            gross_exposure=gross,
+            net_exposure=net,
+            exposure_by_instrument=by_instrument,
         )
 
     # ---------------------------------------------------------- mark / equity

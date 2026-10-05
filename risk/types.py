@@ -111,18 +111,32 @@ class AccountRiskState:
     open_positions: int = 0
     current_daily_pnl: float = 0.0
     current_drawdown: float = 0.0
-    # F-03: metricas autoritativas del ledger. `None` = NO DISPONIBLE (nunca se
-    # usa `0.0` para representar ausencia de dato; `0.0` = exposicion real cero).
-    gross_exposure: float | None = None
-    net_exposure: float | None = None
-    # Notional firmado por instrumento (magnitud y direccion), del ledger.
-    exposure_by_instrument: dict[str, float] | None = None
     # margin: INFRASTRUCTURE GAP (F-03 fase 1 no lo implementa); se conserva el
     # campo existente sin usarlo como metrica de gate.
     margin_usage: float = 0.0
     kill_switch: bool = False
     account_active: bool = True
     strategy_active: bool = True
+
+
+@dataclass(frozen=True, slots=True)
+class ProjectedExposure:
+    """Metricas de exposicion PROYECTADA (post-trade) para el gate F-03 pre-fill.
+
+    Value object EFIMERO e inmutable: se deriva exclusivamente de
+    `AccountLedger.valuation(marks)` + la orden propuesta + el precio de
+    ejecucion. NO es una autoridad de estado (no persiste, no guarda
+    posiciones); el `RiskEngine` solo lo consume para comparar con los limites.
+
+    `None` = metrica NO DISPONIBLE (valuacion incompleta / precio de ejecucion
+    invalido) -> fail-closed si el gate correspondiente esta activo. Nunca se usa
+    `0.0` para representar ausencia de dato.
+    """
+
+    equity: float
+    gross_exposure: float | None
+    net_exposure: float | None
+    exposure_by_instrument: dict[str, float] | None = None
 
 
 @dataclass(frozen=True, slots=True)
