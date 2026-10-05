@@ -106,6 +106,11 @@ class RiskEngine:
             "Se alcanzó el máximo de posiciones abiertas",
         )
 
+        # F-03 (paper phase 1): limites de exposicion/leverage/concentracion.
+        # Solo se evaluan si el limite esta configurado (None = deshabilitado).
+        # Metrica no disponible (None) con gate activo => fail-closed.
+        self._check_exposure_gates(state, _check)
+
         risk_cap = maximum_monetary_risk(state.equity, self.config.risk_per_trade)
         approved_quantity = 0.0
 
@@ -170,6 +175,79 @@ class RiskEngine:
             )
 
         return self._reject(" | ".join(reasons), checks)
+
+    def _check_exposure_gates(
+        self, state: AccountRiskState, _check: Callable[[str, bool, str], None]
+    ) -> None:
+        """Gates F-03 (paper phase 1) sobre metricas autoritativas del ledger.
+
+        `None` en el limite = gate deshabilitado (no se evalua). Una metrica
+        `None` (valuation incompleta) con el gate activo es fail-closed: nunca
+        se sustituye por cero. `equity <= 0` con gate relativo es fail-closed.
+        NO usa `portfolio.compute_portfolio_risk` ni recalcula exposicion.
+        """
+        cfg = self.config
+
+        if cfg.max_gross_exposure is not None:
+            if state.gross_exposure is None:
+                _check(
+                    "max_gross_exposure", False,
+                    "Exposición bruta no disponible (valuation incompleta)",
+                )
+            else:
+                _check(
+                    "max_gross_exposure",
+                    state.gross_exposure <= cfg.max_gross_exposure,
+                    "Límite de exposición bruta alcanzado",
+                )
+
+        if cfg.max_net_exposure is not None:
+            if state.net_exposure is None:
+                _check(
+                    "max_net_exposure", False,
+                    "Exposición neta no disponible (valuation incompleta)",
+                )
+            else:
+                # Net es SIGNED (LONG +/SHORT -): el limite aplica a la magnitud.
+                _check(
+                    "max_net_exposure",
+                    abs(state.net_exposure) <= cfg.max_net_exposure,
+                    "Límite de exposición neta alcanzado",
+                )
+
+        if cfg.max_leverage is not None:
+            if state.equity <= 0 or state.gross_exposure is None:
+                _check(
+                    "max_leverage", False,
+                    "Leverage no evaluable (equity<=0 o exposición no disponible)",
+                )
+            else:
+                _check(
+                    "max_leverage",
+                    state.gross_exposure / state.equity <= cfg.max_leverage,
+                    "Límite de leverage alcanzado",
+                )
+
+        if cfg.max_instrument_concentration is not None:
+            if state.equity <= 0 or state.exposure_by_instrument is None:
+                _check(
+                    "max_instrument_concentration", False,
+                    "Concentración no evaluable (equity<=0 o exposición no "
+                    "disponible)",
+                )
+            else:
+                # Concentracion por instrumento = |notional_i| / equity; el gate
+                # usa el MAXIMO entre instrumentos. Sin posiciones = 0.0 real.
+                concentration = max(
+                    (abs(v) / state.equity
+                     for v in state.exposure_by_instrument.values()),
+                    default=0.0,
+                )
+                _check(
+                    "max_instrument_concentration",
+                    concentration <= cfg.max_instrument_concentration,
+                    "Límite de concentración por instrumento alcanzado",
+                )
 
     def _size_fixed_fractional(
         self,

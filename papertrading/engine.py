@@ -668,12 +668,30 @@ class PaperTradingEngine:
     def _risk_state(self) -> AccountRiskState:
         peak = self._peak_equity or 1.0
         dd = 0.0 if peak <= 0 else max(0.0, 1.0 - self._last_equity / peak)
+        # F-03: metricas de exposicion desde la fuente autoritativa unica
+        # (AccountLedger.valuation + marks del runtime). NUNCA del broker.
+        # Valuacion incompleta -> metricas None (no se convierten en 0.0);
+        # `equity` conserva la semantica existente de ultimo valor conocido.
+        val = self._ledger.valuation(self._marks())
+        if val is None:
+            equity = self._last_equity
+            gross: float | None = None
+            net: float | None = None
+            by_instrument: dict[str, float] | None = None
+        else:
+            equity = val.equity
+            gross = val.gross_exposure
+            net = val.net_exposure
+            by_instrument = dict(val.exposure_by_instrument)
         return AccountRiskState(
-            equity=self._last_equity,
+            equity=equity,
             balance=self._last_cash,
             open_positions=0 if self._position is None else 1,
             current_daily_pnl=self._day_pnl,
             current_drawdown=dd,
+            gross_exposure=gross,
+            net_exposure=net,
+            exposure_by_instrument=by_instrument,
             kill_switch=False,
             account_active=True,
             strategy_active=True,

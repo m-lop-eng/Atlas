@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
@@ -61,6 +62,14 @@ class RiskConfig:
     max_drawdown: float = 0.05
     warning_level: float = 0.5
     soft_limit_level: float = 0.75
+    # F-03 (paper phase 1): limites de exposicion/leverage/concentracion.
+    # `None` = gate DESHABILITADO (no se evalua). Sin valores por defecto:
+    # un limite `0.0` NO significa "deshabilitado". Unidades: gross/net = USD;
+    # leverage = ratio; concentration = fraccion de equity.
+    max_gross_exposure: float | None = None
+    max_net_exposure: float | None = None
+    max_leverage: float | None = None
+    max_instrument_concentration: float | None = None
 
     def __post_init__(self) -> None:
         for name in (
@@ -72,6 +81,21 @@ class RiskConfig:
             value = getattr(self, name)
             if not 0.0 < value < 1.0:
                 raise ValueError(f"{name} debe estar en (0, 1), recibido {value}")
+        for name in (
+            "max_gross_exposure",
+            "max_net_exposure",
+            "max_leverage",
+            "max_instrument_concentration",
+        ):
+            value = getattr(self, name)
+            if value is None:
+                continue
+            if not (isinstance(value, (int, float)) and math.isfinite(value)
+                    and value > 0.0):
+                raise ValueError(
+                    f"{name} debe ser > 0 (o None para deshabilitar), "
+                    f"recibido {value!r}"
+                )
 
 
 @dataclass(slots=True)
@@ -87,8 +111,14 @@ class AccountRiskState:
     open_positions: int = 0
     current_daily_pnl: float = 0.0
     current_drawdown: float = 0.0
-    gross_exposure: float = 0.0
-    net_exposure: float = 0.0
+    # F-03: metricas autoritativas del ledger. `None` = NO DISPONIBLE (nunca se
+    # usa `0.0` para representar ausencia de dato; `0.0` = exposicion real cero).
+    gross_exposure: float | None = None
+    net_exposure: float | None = None
+    # Notional firmado por instrumento (magnitud y direccion), del ledger.
+    exposure_by_instrument: dict[str, float] | None = None
+    # margin: INFRASTRUCTURE GAP (F-03 fase 1 no lo implementa); se conserva el
+    # campo existente sin usarlo como metrica de gate.
     margin_usage: float = 0.0
     kill_switch: bool = False
     account_active: bool = True
