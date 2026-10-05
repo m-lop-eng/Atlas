@@ -93,8 +93,8 @@ en `HEAD = 53625fb`; se conservan como referencia de auditoría):
 - Siguen **abiertos/deferred**:
   - **F-08** — `CONTRACT GAP — NOT APPLICABLE TO CURRENT INSTRUMENT CONTRACT`
   (preventivo para instrumentos integer-only; sin bug en el alcance actual).
-  Subfindings: **F-08-a** (quantity NaN/Inf, `CONTRACT GAP / NEEDS ORIGIN
-  AUDIT`) y **F-08-b** (instrument quantity metadata, `INFRASTRUCTURE GAP`).
+  Subfindings: **F-08-a** (quantity NaN/Inf, **`CLOSED — REFUTED`**: sin ruta
+  productiva) y **F-08-b** (instrument quantity metadata, `INFRASTRUCTURE GAP`).
   - **F-11** — `CONTRACT GAP` / decisión documentada (config de producción con
     `null`, no ejecutable; ver F-11).
   - **margin / correlation** — `INFRASTRUCTURE GAP` (F-03 fase 1 no los modela).
@@ -655,21 +655,61 @@ pre-fill con precio de ejecución (`open(t+1)`); projected state desde
   vigente; F-08 permanece como `CONTRACT GAP` **preventivo** para el día en que se
   incorpore un instrumento de contrato entero/step.
 
-#### F-08-a — quantity NaN/Inf validation
+#### F-08-a — quantity NaN/Inf validation — **CLOSED — REFUTED**
 - ID: F-08-a (subfinding separado de F-08).
 - archivo: `execution/order.py` (`Order.__post_init__`), `brokers/paper.py`
-  (`submit_order`).
-- **estado: `CONTRACT GAP / NEEDS ORIGIN AUDIT`** — NO implementado.
-- `Order.__post_init__` valida `quantity <= 0` y `PaperBrokerAdapter.submit_order`
-  valida `not quantity or quantity <= 0`; **ninguna** de esas comparaciones
-  rechaza `NaN`/`Inf` (`NaN <= 0` y `Inf <= 0` son `False`).
-- **No se ha demostrado** que una señal válida de producción pueda generar esas
-  cantidades; el siguiente análisis, si se aborda, debe determinar **de dónde
-  puede originarse `NaN/Inf` en `approved_quantity`** (p.ej. precios de señal
-  `NaN`/`Inf` que atraviesan `distance`/`unit_risk`) y si existe una barrera
-  upstream (data quality F-09/F-10).
-- **No** reclasificar como `IMPLEMENTATION BUG` sin esa evidencia de origen; **no**
-  añadir validación nueva todavía.
+  (`submit_order`), `risk/position_sizing.py`, `risk/engine.py`.
+- **estado: `CLOSED — REFUTED`** (origin audit completado en `HEAD 3b473a7`).
+- **Hallazgo original**: `Order.__post_init__` (`quantity <= 0`) y
+  `PaperBrokerAdapter.submit_order` (`not quantity or quantity <= 0`) **no**
+  rechazan `NaN`/`Inf` (`NaN <= 0`/`Inf <= 0` son `False`).
+- **Origin graph de `approved_quantity`**:
+  `ClosedBarEvent` → `on_closed_bar` → `strategy.generate_signal` →
+  `Signal(reference_price, stop_price)` → `RiskEngine.validate` →
+  `risk_cap = maximum_monetary_risk(equity, risk_per_trade)`;
+  `distance = |reference_price − stop_price|`;
+  `unit_risk = distance × point_value`; `quantity = risk_cap / unit_risk`.
+  Orígenes capaces de inyectar `NaN/Inf`: `equity`, `reference_price`/`stop_price`,
+  `point_value`, `risk_per_trade`.
+- **Tabla de orígenes / alcanzabilidad**:
+
+  | Origen | ¿Produce NaN/Inf? | Barrera upstream | ¿Llega a `approved_quantity`? | Evidencia |
+  |---|---|---|---|---|
+  | `risk_per_trade` | Sí (matemáticamente) | `RiskConfig.__post_init__` exige `0 < v < 1` → NaN/Inf `ValueError` | **No** (`UNREACHABLE BY INVARIANT`) | `risk/types.py:65-74` |
+  | `equity` | Sí | `_valid_mark` (NaN/Inf/≤0) + cash finito; `_last_equity` no se actualiza con `valuation()=None` | **No** (`UNREACHABLE BY INVARIANT`) | `papertrading/ledger.py:37-42` |
+  | `reference_price`/`stop_price` | Sí | `LiveDataEngine._is_valid_ohlc` (`v != v`, `abs(v)==inf`) antes de emitir `ClosedBarEvent` | **No** (`BLOCKED UPSTREAM`) | `live/engine.py:504-512, 240-244, 177-180` |
+  | `point_value` | Sí | Sin validación de finitud; proviene de config congelada, sin input runtime externo | **No** (`BLOCKED UPSTREAM`, contrato de config) | `papertrading/models.py:110`; `forward_runner.py:791` |
+  | API directa (`RiskEngine.validate`/`Order`/`PaperBrokerAdapter`) con NaN | Sí | Ninguna | **No productivo** (`TEST/LOWER-LEVEL ONLY`) | `brokers/paper.py:97`; `execution/order.py:106` |
+
+- **Comportamiento IEEE**: `distance <= 0`, `point_value <= 0`, `quantity <= 0`,
+  `not q or q <= 0` y `approved_quantity < min_size` son **todas `False`** para
+  `NaN`/`Inf` (no rechazan). `AccountLedger.apply_fill` **sí** rechaza `NaN`
+  (`q != q`) — barrera defensiva **final** (post-broker).
+- **Interacción F-03**: `_projected_exposure` propaga `signed_qty` a `notional`;
+  con un gate **activo**, `NaN <= límite` es `False` → fail-closed; con gates
+  **deshabilitados** (default) no hay comparación. F-03 **no** crea una vía nueva
+  de aceptación, pero tampoco cierra F-08-a por sí solo.
+- **Conclusión (origin audit)**: **no existe ruta productiva de paper trading que
+  permita que `NaN`/`Inf` llegue a `approved_quantity`**:
+  - OHLC de producción bloqueado por `LiveDataEngine._is_valid_ohlc` (streaming
+    S1–S8/B1 y A4); el replay de A4 confía en `bars.jsonl` ya validado +
+    `input_fingerprint` (sha256);
+  - equity/marks protegidos por las invariantes del ledger;
+  - `risk_per_trade` validado por `RiskConfig`;
+  - `point_value` proviene de config congelada (sin ruta runtime externa);
+  - inyecciones directas a `RiskEngine`/`Order`/`PaperBrokerAdapter` son
+    lower-level/test-only;
+  - `AccountLedger.apply_fill` mantiene una barrera defensiva final.
+- **Residual de hardening (LOW / optional; NO implementado ahora)**:
+  - validación defensiva de finitud en `Signal`;
+  - validación defensiva de finitud en `Order`;
+  - validación defensiva en `PaperBrokerAdapter`;
+  - validación de finitud de `PaperEngineConfig.point_value`;
+  - tests directos para `NaN`/`Inf` en `_is_valid_ohlc` (hoy
+    `test_invalid_ohlc_rejected` solo cubre inconsistencia OHLC).
+  No existe evidencia de bug productivo actual. **Reevaluar** si en el futuro se
+  incorpora una ruta de ingesta que pueda bypassar `LiveDataEngine`, o si se
+  relaja el contrato de configuración.
 
 #### F-08-b — instrument quantity metadata
 - ID: F-08-b (subfinding separado de F-08).
@@ -907,7 +947,7 @@ pre-fill con precio de ejecución (`open(t+1)`); projected state desde
    (`4bb66c2`/`eeac54d`/`c722896`/`fbb0236`).
 7. **F-08** (sizing entero/step para contratos) — **`CONTRACT GAP — NOT
    APPLICABLE TO CURRENT INSTRUMENT CONTRACT`** (preventivo; sin bug actual);
-   subfindings **F-08-a** (`CONTRACT GAP / NEEDS ORIGIN AUDIT`) y **F-08-b**
+   subfindings **F-08-a** (**`CLOSED — REFUTED`**) y **F-08-b**
    (`INFRASTRUCTURE GAP`).
 8. **F-11** (validación del bloque `risk` de producción) — **PENDIENTE**
    (`CONTRACT GAP` / decisión documentada).
@@ -918,7 +958,8 @@ pre-fill con precio de ejecución (`open(t+1)`); projected state desde
 11. Añadir CI (pytest + coverage) — **DONE** (`.github/workflows/ci.yml`).
 
 Pendientes vigentes: **F-08** (`CONTRACT GAP` preventivo, no aplicable al
-contrato de instrumentos actual; subfindings **F-08-a**/**F-08-b**), **F-11**,
+contrato de instrumentos actual) y **F-08-b** (`INFRASTRUCTURE GAP`); **F-08-a**
+queda **`CLOSED — REFUTED`** (sin ruta productiva), **F-11**,
 **margin/correlation (F-03)**, **backtest fuera de alcance (F-03)**,
 **UNKNOWN/restart recovery gap**, y deuda no bloqueante **I2/I3/I4/I5/I6**
 (ver F-06).
