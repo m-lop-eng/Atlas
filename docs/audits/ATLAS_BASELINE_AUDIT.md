@@ -767,16 +767,52 @@ pre-fill con precio de ejecución (`open(t+1)`); projected state desde
   duplicado de lógica. (Cobertura parcial.)
 
 ### S-02 — `papertrading/engine.py:508-520` ramas de posición poco cubiertas
-- severidad: MEDIUM — las ramas de entrada adicional/reducción parcial
-  (pyramiding) tienen baja cobertura (508-520 sin cubrir); comportamiento no
-  ejercido.
+- severidad histórica: **MEDIUM** (Suspected Finding, orientado a cobertura).
+- **Hallazgo original**: las ramas de **entrada adicional / reducción parcial
+  (pyramiding)** en `PaperTradingEngine` tenían baja cobertura (508-520 sin
+  cubrir); comportamiento no ejercido.
+- **Re-auditoría (HEAD `e126e58`)**:
+  - El engine es **mono-instrumento, sin pyramiding** (`_on_signal` retorna si ya
+    hay posición) y las salidas son **cierres totales `reduce_only`**
+    (`quantity = abs(pos.quantity)`); por tanto las ramas de entrada adicional /
+    reducción parcial del engine son **inalcanzables** bajo el contrato vigente.
+  - La **contabilidad** de reducción parcial / realización de P&L reside en
+    `AccountLedger.apply_fill()` (`papertrading/ledger.py`), **cubierta por
+    tests** (`tests/test_account_ledger.py::test_partial_reduction_realizes_pnl`);
+    el engine solo mantiene la **proyección** `PaperPosition` (metadata).
+  - **No es `IMPLEMENTATION BUG`**: no hay defecto funcional; el código es
+    inalcanzable por contrato.
+- **Clasificación: `CONTRACT GAP — NOT APPLICABLE TO CURRENT ENGINE CONTRACT`.**
+  No requiere implementación ahora; **solo debe reabrirse si se contrata
+  pyramiding / reducción parcial**, extensión futura ya indicada en
+  «F-03 projected exposure (post-trade) — I. Decisiones futuras/deferred».
 
 ### S-03 — `Redis`/`Celery`/`Flask` en el entorno global
 - severidad: LOW — dependencias del entorno ajenas al proyecto; no declaradas en
   `pyproject`. Riesgo de confusión, no de código.
 
 ### S-04 — `reconciliation/engine.py` UNKNOWN terminal (ver F-07/F-15)
-- severidad: MEDIUM — el estado observado (UNKNOWN) depende del `OrderStatus`.
+- severidad histórica: **MEDIUM**.
+- **Hallazgo original**: el estado observado (UNKNOWN) parecía depender del
+  `OrderStatus` (referencia colgante a "F-15", inexistente).
+- **Re-auditoría (HEAD `e126e58`)**: **`CLOSED — REFUTED`.**
+  - La reconciliación maneja `UNKNOWN` **explícitamente** y **antes** de la
+    lógica terminal: si el broker no la tiene (engine.py:120-134) o si cualquiera
+    de los dos lados es `UNKNOWN` (161-173) → `DiscrepancyClass.UNKNOWN`
+    (bloquea, "resolver con `get_order`").
+  - `_order_terminal()` (487-494) es una **definición local** que **excluye
+    `UNKNOWN`** (`FILLED/CANCELLED/REJECTED/EXPIRED/FAILED`); **no** usa
+    `OrderStatus.terminal`.
+  - Por tanto la reconciliación **no depende de `OrderStatus.terminal`**; el
+    comportamiento problemático implicado no existe.
+  - **Tests explícitos**: `test_unknown_order_blocks_and_is_unknown`,
+    `test_unknown_resolved_to_filled_then_match`,
+    `test_unknown_internal_order_missing_fill_still_unknown`,
+    `test_terminal_order_absent_from_broker_is_match` y
+    `test_resolve_unknown_live_order_to_filled` (orquestador).
+- **Subfinding separado (no es S-04)**: la tensión `OrderStatus.terminal` incluye
+  `UNKNOWN` (execution/order.py:58-67) mientras §8 lo describe como estado a
+  resolver — incidental de **F-07**, `CONTRACT GAP`, fuera del claim de S-04.
 
 ### S-05 — `db`/`portfolio` definidos pero no integrados
 - severidad: LOW — `database/` sin importadores externos; `portfolio/` sin
@@ -846,7 +882,9 @@ pre-fill con precio de ejecución (`open(t+1)`); projected state desde
 8. **F-11** (validación del bloque `risk` de producción) — **PENDIENTE**
    (`CONTRACT GAP` / decisión documentada).
 9. **F-04** (contrato de estado de riesgo en paper) — **REFUTED** (no es bug).
-10. S-02/S-04 (cobertura de ramas de posición y estados UNKNOWN) — **parcial**.
+10. S-02 (ramas de posición/pyramiding) — **`CONTRACT GAP` (no aplicable al
+    contrato actual; reabrir solo si se contrata pyramiding/reducción parcial)**;
+    S-04 (UNKNOWN en reconciliación) — **`CLOSED — REFUTED`**.
 11. Añadir CI (pytest + coverage) — **DONE** (`.github/workflows/ci.yml`).
 
 Pendientes vigentes: **F-08**, **F-11**, **margin/correlation (F-03)**,
