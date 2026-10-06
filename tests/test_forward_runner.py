@@ -713,3 +713,131 @@ class TestInputFingerprint:
         _drive(runner, _scenario())
         runner.checkpoint()
         assert self._manifest(tmp_path, run_id)["created_at"] == created
+
+
+# ---------------------------------------------------------------------------
+# F-11-a: superficie de configuracion de limites F-03 en paper/forward
+# ---------------------------------------------------------------------------
+
+
+def _paper_base(**risk_overrides) -> dict:
+    risk = {
+        "max_open_positions": 3,
+        "risk_per_trade": 0.0025,
+        "max_daily_loss": 0.01,
+        "max_drawdown": 0.05,
+    }
+    risk.update(risk_overrides)
+    return {
+        "environment": "paper",
+        "risk": risk,
+        "paper_account": {"initial_equity": 100_000},
+    }
+
+
+def _build_with_paper(tmp_path, paper: dict, *, run_id: str = "F11A"):
+    cfg = tmp_path / "settings.yaml"
+    cfg.write_text(yaml.safe_dump(paper), encoding="utf-8")
+    return build_forward_runner(
+        run_id=run_id,
+        output_dir=str(tmp_path / run_id),
+        paper_config_path=cfg,
+    )
+
+
+class TestRiskLimitConfigSurface:
+    FIELDS = (
+        "max_gross_exposure",
+        "max_net_exposure",
+        "max_leverage",
+        "max_instrument_concentration",
+    )
+
+    def test_default_paper_config_f03_none(self, tmp_path):
+        runner = build_forward_runner(
+            run_id="F11A-DEF", output_dir=str(tmp_path)
+        )
+        cfg = runner.engine.risk_engine.config
+        for field in self.FIELDS:
+            assert getattr(cfg, field) is None
+
+    def test_absent_fields_become_none(self, tmp_path):
+        runner = _build_with_paper(tmp_path, _paper_base())
+        cfg = runner.engine.risk_engine.config
+        for field in self.FIELDS:
+            assert getattr(cfg, field) is None
+
+    def test_null_becomes_none(self, tmp_path):
+        paper = _paper_base(**{f: None for f in self.FIELDS})
+        runner = _build_with_paper(tmp_path, paper)
+        cfg = runner.engine.risk_engine.config
+        for field in self.FIELDS:
+            assert getattr(cfg, field) is None
+
+    def test_explicit_values_reach_riskconfig(self, tmp_path):
+        paper = _paper_base(
+            max_gross_exposure=100_000.0,
+            max_net_exposure=50_000.0,
+            max_leverage=2.5,
+            max_instrument_concentration=0.3,
+        )
+        runner = _build_with_paper(tmp_path, paper)
+        cfg = runner.engine.risk_engine.config
+        assert cfg.max_gross_exposure == 100_000.0
+        assert cfg.max_net_exposure == 50_000.0
+        assert cfg.max_leverage == 2.5
+        assert cfg.max_instrument_concentration == 0.3
+
+    def test_legacy_fields_unchanged(self, tmp_path):
+        runner = _build_with_paper(tmp_path, _paper_base())
+        cfg = runner.engine.risk_engine.config
+        assert cfg.risk_per_trade == pytest.approx(0.0025)
+        assert cfg.max_open_positions == 3
+        assert cfg.max_daily_loss == pytest.approx(0.01)
+        assert cfg.max_drawdown == pytest.approx(0.05)
+
+    @pytest.mark.parametrize("bad", [0.0, -1.0, float("nan"), float("inf")])
+    def test_invalid_numeric_rejected_by_riskconfig(self, tmp_path, bad):
+        paper = _paper_base(max_gross_exposure=bad)
+        with pytest.raises(ValueError):
+            _build_with_paper(tmp_path, paper)
+
+    def test_wrong_type_rejected(self, tmp_path):
+        paper = _paper_base(max_gross_exposure="abc")
+        with pytest.raises(ValueError):
+            _build_with_paper(tmp_path, paper)
+
+    def test_missing_risk_section_fails_loud(self, tmp_path):
+        paper = {
+            "environment": "paper",
+            "paper_account": {"initial_equity": 100_000},
+        }
+        with pytest.raises(KeyError):
+            _build_with_paper(tmp_path, paper)
+
+    def test_unknown_field_ignored(self, tmp_path):
+        paper = _paper_base(unknown_limit=123)
+        runner = _build_with_paper(tmp_path, paper)
+        cfg = runner.engine.risk_engine.config
+        assert not hasattr(cfg, "unknown_limit")
+        for field in self.FIELDS:
+            assert getattr(cfg, field) is None
+
+    def test_yaml_max_gross_exposure_rejects_pre_fill(self, tmp_path):
+        runner = _build_with_paper(
+            tmp_path, _paper_base(max_gross_exposure=1.0), run_id="F11A-REJ"
+        )
+        runner.start()
+        _drive(runner, _scenario())
+        assert runner.engine.position is None
+        assert runner.engine.broker._orders == {}
+
+    def test_yaml_max_gross_exposure_allows_when_high(self, tmp_path):
+        runner = _build_with_paper(
+            tmp_path,
+            _paper_base(max_gross_exposure=10_000_000.0),
+            run_id="F11A-OK",
+        )
+        runner.start()
+        _drive(runner, _scenario())
+        assert len(runner.engine.broker._orders) >= 1

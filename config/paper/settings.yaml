@@ -9,6 +9,11 @@ risk:
   risk_per_trade: 0.0025
   max_daily_loss: 0.01
   max_drawdown: 0.05
+  # F-11-a: limites F-03 (None = gate disabled). Sin valores por defecto.
+  max_gross_exposure: null
+  max_net_exposure: null
+  max_leverage: null
+  max_instrument_concentration: null
 portfolio:
   max_strategies: 5
 execution:

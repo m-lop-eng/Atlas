@@ -743,6 +743,15 @@ def build_forward_runner(
         max_open_positions=int(paper_risk["max_open_positions"]),
         max_daily_loss=float(paper_risk["max_daily_loss"]),
         max_drawdown=float(paper_risk["max_drawdown"]),
+        # F-11-a: limites F-03 desde config/paper/settings.yaml (runtime
+        # paper/forward). Ausente/null -> None = gate disabled; se pasan SIN
+        # transformar (RiskConfig es la autoridad semantica y rechaza invalidos).
+        max_gross_exposure=paper_risk.get("max_gross_exposure"),
+        max_net_exposure=paper_risk.get("max_net_exposure"),
+        max_leverage=paper_risk.get("max_leverage"),
+        max_instrument_concentration=paper_risk.get(
+            "max_instrument_concentration"
+        ),
     )
     if risk_cfg.risk_per_trade > FROZEN_MAX_STRATEGY_RISK:
         raise ForwardConfigError(

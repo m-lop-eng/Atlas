@@ -98,9 +98,9 @@ en `HEAD = 53625fb`; se conservan como referencia de auditoría):
   - **F-11** — `CONTRACT GAP` (config de producción con `null` **no ejecutable /
   plantilla sin runtime**; el riesgo de arranque inseguro queda refutado en el
   estado actual). Subfindings: **F-11-a** (superficie de config F-03,
-  **`CONTRACT FROZEN — READY FOR IMPLEMENTATION`**), **F-11-b** (validación
-  estructural del bloque `risk`, `CONTRACT GAP`), **F-11-c** (cotas superiores
-  F-03, `CONTRACT GAP — LOW`).
+  **`IMPLEMENTED`**: los 4 límites configurables vía `config/paper/settings.yaml`),
+  **F-11-b** (validación estructural del bloque `risk`, `CONTRACT GAP`),
+  **F-11-c** (cotas superiores F-03, `CONTRACT GAP — LOW`).
   - **margin / correlation** — `INFRASTRUCTURE GAP` (F-03 fase 1 no los modela).
   - **backtest** — fuera de alcance de F-03 (requiere `AccountLedger`/fuente
     equivalente).
@@ -911,9 +911,12 @@ pre-fill con precio de ejecución (`open(t+1)`); projected state desde
   (`config/paper/settings.yaml`) pero **no contiene** los cuatro límites F-03;
   por tanto la superficie de configuración de F-03 es todavía **programática**.
 
-#### F-11-a — F-03 risk-limit configuration surface — **CONTRACT FROZEN — READY FOR IMPLEMENTATION**
+#### F-11-a — F-03 risk-limit configuration surface — **IMPLEMENTED**
 - ID: F-11-a (subfinding separado de F-11).
-- **estado: `CONTRACT FROZEN — READY FOR IMPLEMENTATION`** — NO implementado.
+- **estado: `IMPLEMENTED`** (contrato congelado en `932d8d6`). Los cuatro límites
+  ya son configurables en paper/forward vía `config/paper/settings.yaml` →
+  `build_forward_runner` → `RiskConfig` → `RiskEngine`. **No implementado**:
+  backtest, production YAML.
 - **Alcance**: superficie de configuración de los cuatro límites F-03 para el
   runtime real de paper/forward: `max_gross_exposure`, `max_net_exposure`,
   `max_leverage`, `max_instrument_concentration`.
@@ -991,8 +994,8 @@ pre-fill con precio de ejecución (`open(t+1)`); projected state desde
 1. `config/production/settings.yaml`: **template no ejecutable** vs convertirlo en
    **runtime real**.
 2. Si se decide runtime real: **endurecer el loader** y definir **fail-closed**.
-3. **Wiring de los límites F-03** a paper/forward (F-11-a): **contrato congelado**
-   (`CONTRACT FROZEN — READY FOR IMPLEMENTATION`); pendiente solo su implementación.
+3. **Wiring de los límites F-03** a paper/forward (F-11-a): **`IMPLEMENTED`**
+   (configurable vía `config/paper/settings.yaml`).
 4. **Contrato de límites superiores**, especialmente `concentration` (F-11-c).
 5. **Política exacta de validación estructural** del bloque `risk` (F-11-b).
 
