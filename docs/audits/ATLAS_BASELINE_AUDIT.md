@@ -946,7 +946,66 @@ pre-fill con precio de ejecución (`open(t+1)`); projected state desde
     `test_resolve_unknown_live_order_to_filled` (orquestador).
 - **Subfinding separado (no es S-04)**: la tensión `OrderStatus.terminal` incluye
   `UNKNOWN` (execution/order.py:58-67) mientras §8 lo describe como estado a
-  resolver — incidental de **F-07**, `CONTRACT GAP`, fuera del claim de S-04.
+  resolver — incidental de **F-07**, fuera del claim de S-04.
+
+#### S-04-a — `OrderStatus.UNKNOWN` semantics (MODEL B) — **CONTRACT FROZEN — READY FOR IMPLEMENTATION**
+- ID: S-04-a (subfinding separado de S-04).
+- **estado: `CONTRACT FROZEN — READY FOR IMPLEMENTATION`** (HEAD `c6e00a5`;
+  ratificado **MODEL B — UNKNOWN IS TRANSIENT**). NO implementado.
+- **Definición**: `UNKNOWN` = orden cuyo resultado **no pudo determinarse** después
+  del envío (timeout / pérdida de respuesta). **No** significa fallo, cancelación,
+  expiración ni éxito. Por tanto **NO es terminal**; `OrderStatus.terminal` debe
+  **excluir `UNKNOWN`**.
+- **Producers permitidos** (entradas ya presentes en `ALLOWED_TRANSITIONS`):
+  `SUBMITTING → UNKNOWN`, `SUBMITTED → UNKNOWN`, `ACKNOWLEDGED → UNKNOWN`,
+  `PARTIALLY_FILLED → UNKNOWN`. Solo cuando la capa de submit/broker determina
+  disposición desconocida. **No** crear un producer artificial en paper actual.
+- **Resolver**: broker `get_order` / resolución equivalente. **No** resubmit
+  mientras el estado siga desconocido.
+- **`ALLOWED_TRANSITIONS[UNKNOWN]` (congelado para el adapter concreto actual)**:
+  `{SUBMITTED, PARTIALLY_FILLED, FILLED, REJECTED, CANCELLED}`.
+  - **Evidencia**: `PaperBrokerAdapter` (único adapter concreto) produce como
+    resultado de `get_order` esos 5 estados (`brokers/paper.py`: MARKET `FILLED`,
+    caja insuficiente `REJECTED`, LIMIT/STOP `SUBMITTED`, `cancel_order`
+    `CANCELLED`, `simulate_fill` `PARTIALLY_FILLED`/`FILLED`).
+  - **Excluidos** `ACKNOWLEDGED`, `EXPIRED`, `FAILED`: **sin evidencia** de que el
+    adapter actual los produzca (extensión futura para brokers reales, no
+    necesaria hoy). No se inventan.
+- **Self-loop**: `UNKNOWN → UNKNOWN` **NO permitido**. Un lookup que sigue sin
+  resolver (broker devuelve `UNKNOWN`/`None`/error) **no muta el estado**: la orden
+  permanece `UNKNOWN` para la siguiente reconciliación.
+- **`apply_fill` semantics**:
+  - `UNKNOWN → FILLED/PARTIALLY_FILLED` **con fill** se resuelve vía
+    **`apply_fill`**; el estado final deriva del `fill_quantity` real.
+  - `SUBMITTED`/`REJECTED`/`CANCELLED` **sin fills** se resuelven vía
+    **`_transition`** (REJECTED por `reject(reason)` para preservar `reject_reason`;
+    CANCELLED por `cancel`).
+  - `UNKNOWN` aún no resuelto = **ninguna mutación**.
+- **Reconciliation** (sin cambios en este contrato): reconciliation trata `UNKNOWN`
+  **independientemente** de `OrderStatus.terminal`; `DiscrepancyClass.UNKNOWN` **no
+  depende** del enum terminal (`_order_terminal` local ya excluye `UNKNOWN`). No se
+  cambia reconciliation.
+- **Restart / idempotencia**:
+  - `UNKNOWN` persistido puede resolverse mediante broker lookup;
+  - **no** se reenvía por estar `UNKNOWN`;
+  - `client_order_id` impide recrear/reenviar la misma orden activa (con `UNKNOWN`
+    no terminal, una orden `UNKNOWN` cuenta como activa);
+  - la identidad de fill `(client_order_id, fill_sequence)` conserva la
+    idempotencia del ledger;
+  - el gap separado de **adopción ledger/broker tras restart** (F-06/F-03)
+    permanece **fuera** de este contrato.
+- **F-07**: **`F-07 REOPENED CONTRACTUALLY — UNKNOWN ONLY`**. Delta de
+  implementación futuro (mínimo):
+  1. `OrderStatus.terminal` excluye `UNKNOWN`.
+  2. `ALLOWED_TRANSITIONS[UNKNOWN]` toma el conjunto congelado.
+  3. actualizar tests de terminalidad
+     (`test_all_terminal_states_have_no_outgoing`, etc.).
+  4. añadir tests de resolución y de ausencia de self-loop.
+  5. **no** modificar el resto del grafo.
+- **Documentación `06_EXECUTION_OPERATION.md`** (a alinear en la implementación
+  futura; **no** editar ahora): §7 y §8 deben expresar una única semántica —
+  `UNKNOWN` **no terminal**, **requiere reconciliation/broker lookup**, **no
+  resubmit** antes de resolver.
 
 ### S-05 — `db`/`portfolio` definidos pero no integrados
 - severidad: LOW — `database/` sin importadores externos; `portfolio/` sin
@@ -1023,7 +1082,9 @@ pre-fill con precio de ejecución (`open(t+1)`); projected state desde
 9. **F-04** (contrato de estado de riesgo en paper) — **REFUTED** (no es bug).
 10. S-02 (ramas de posición/pyramiding) — **`CONTRACT GAP` (no aplicable al
     contrato actual; reabrir solo si se contrata pyramiding/reducción parcial)**;
-    S-04 (UNKNOWN en reconciliación) — **`CLOSED — REFUTED`**.
+    S-04 (UNKNOWN en reconciliación) — **`CLOSED — REFUTED`**; **S-04-a**
+    (`OrderStatus.UNKNOWN` transitorio, MODEL B) — **`CONTRACT FROZEN — READY FOR
+    IMPLEMENTATION`** (`F-07 REOPENED CONTRACTUALLY — UNKNOWN ONLY`).
 11. Añadir CI (pytest + coverage) — **DONE** (`.github/workflows/ci.yml`).
 
 Pendientes vigentes: **F-08** (`CONTRACT GAP` preventivo, no aplicable al
