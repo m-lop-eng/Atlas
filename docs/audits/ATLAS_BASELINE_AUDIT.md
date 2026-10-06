@@ -128,7 +128,7 @@ en `HEAD = 53625fb`; se conservan como referencia de auditoría):
 | Live (B1–B7) | `live/`, `sessions/`, `reconciliation/`, `killswitches/`, `monitoring/`, `papertrading/`. |
 | Streaming (S1–S8) | `streaming/`, `papertrading/streaming_forward.py`, `data/binance_rest.py`, `experiments/e19_*`. |
 | Portfolio | `portfolio/engine.py` (exposición descriptiva; **no integrado por diseño** — no es la fuente de exposición; ver S-05-portfolio). |
-| Database | `database/models.py`, `database/session.py` (schema-first; **sin rol de runtime definido**; ver S-05-db). |
+| Database | `database/models.py`, `database/session.py` (**SCHEMA-FIRST / PLANNED** — decisión congelada; sin rol runtime; ver S-05-db). |
 | Deployment | `deployment/schedule_a4.py` (tarea Windows A4). |
 | Production/live execution | **NO existe** ejecución real: no hay broker real, credenciales ni endpoints de órdenes. Solo `development`/backtest y paper/forward. |
 
@@ -797,10 +797,13 @@ pre-fill con precio de ejecución (`open(t+1)`); projected state desde
 - archivo: `database/models.py::Instrument`.
 - **estado: `INFRASTRUCTURE GAP`** — NO implementado.
 - `Instrument` define `tick_size`/`point_value` pero **no** `quantity_step`/
-  `lot_size`. La parte de "**DB no cableada**" de este subfinding **depende de
-  S-05-db**; la ausencia de `quantity_step`/`lot_size` es un **gap independiente**.
+  `lot_size`. La parte de "**DB no cableada**" queda resuelta por **S-05-db**
+  (`CLOSED — REFUTED`: `database/` = schema-first/planned); la ausencia de
+  `quantity_step`/`lot_size` es un **gap independiente**.
 - Si en el futuro se incorporan instrumentos integer-only, habrá que definir la
-  **fuente de metadata** de cantidad y la **política de cuantización**.
+  **fuente de metadata** de cantidad y la **política de cuantización**. Bajo la
+  decisión de S-05-db, la fuente natural futura sería **config/YAML**, no DB; ese
+  contrato **no se congela** aquí (pertenece a F-08-b).
 
 - **Decisiones futuras (deferred; no inventar ahora)**:
   `quantity_step` por instrumento; fuente de metadata; punto de cuantización
@@ -1227,33 +1230,44 @@ pre-fill con precio de ejecución (`open(t+1)`); projected state desde
   `UNKNOWN` **no terminal**, **requiere reconciliation/broker lookup**, **no
   resubmit** antes de resolver.
 
-### S-05 — `db`/`portfolio` definidos pero no integrados — **CONTRACT GAP — NO CURRENT FUNCTIONAL IMPACT**
+### S-05 — `db`/`portfolio` definidos pero no integrados — **CLOSED — REFUTED**
 - severidad histórica: **LOW**.
 - **Claim original**: infraestructura definida pero no integrada (`database/` sin
   importadores externos; `portfolio/` sin conexión al veto, consecuencia de F-03).
-- **Re-auditoría (HEAD `b2b1597`)**:
+- **Re-auditoría (HEAD `fa29593`)**:
   - **No existe contrato** que obligue al runtime a consumir `database/`.
   - **No existe impacto funcional actual** (runtime usa config explícita y
     `AccountLedger`; nada se rompe).
   - **No es `IMPLEMENTATION BUG`** (no hay contrato que exija usar la DB).
   - **No es `INFRASTRUCTURE GAP`**: no hay una **capacidad de runtime contratada**
     que requiera la DB.
-- **Clasificación: `CONTRACT GAP — NO CURRENT FUNCTIONAL IMPACT`.** No es
-  production blocker. Subfindings: **S-05-db** y **S-05-portfolio**.
+- **Clasificación: `CLOSED — REFUTED`.** No es production blocker y **no queda
+  ningún subfinding funcional abierto**: **S-05-db = `CLOSED — REFUTED`**
+  (`database/` = schema-first/planned) y **S-05-portfolio = `CLOSED — REFUTED`**
+  (`portfolio/` no cableado por diseño, F-03). No debe reabrirse como defecto de
+  integración.
 
-#### S-05-db — operational role of `database/`
+#### S-05-db — operational role of `database/` — **CLOSED — REFUTED**
 - ID: S-05-db (subfinding separado de S-05).
-- **estado: `CONTRACT GAP`** — NO implementado.
-- `database/models.py::Instrument` existe; **no** hay migraciones, repositorios ni
-  callers de runtime. `database/session.py` solo proporciona infraestructura de
-  conexión **potencial** (sin consumidor).
-- `Instrument.tick_size` / `point_value` **no** son fuente de verdad del runtime;
-  paper/backtest/research usan **configuración explícita**
-  (`PaperEngineConfig.point_value`, `BacktestConfig.point_value`,
-  `ExecutionCosts.tick_size`, `config/final_oos/config.yaml`).
-- **Pendiente decidir** si `database/` será: (1) fuente de verdad de metadata;
-  (2) schema-first / infraestructura planificada; o (3) otra función contractual
-  explícita. **No** se elige la arquitectura ahora.
+- **estado: `CLOSED — REFUTED`** (HEAD `fa29593`).
+- **Decisión congelada**: `database/` = **SCHEMA-FIRST / PLANNED**.
+  - **No** es runtime source of truth; **no** tiene precedencia sobre YAML/config.
+  - paper/forward/backtest/research **no requieren DB**; **no existe caller
+    productivo** de `database/`.
+  - **No** existen migraciones, repositories ni lifecycle de sesión runtime.
+  - `Instrument.tick_size`/`point_value` **no** son fuente de verdad operativa; la
+    **configuración explícita** del repositorio sigue siendo la autoridad
+    (`PaperEngineConfig.point_value`, `BacktestConfig.point_value`,
+    `ExecutionCosts.tick_size`, `config/final_oos/config.yaml`).
+  - Mantener la DB no cableada **no produce impacto funcional** ni production
+    blocker.
+- **Justificación arquitectónica**: introducir DB runtime ahora añadiría
+  migraciones/repositories/sesiones/wiring, introduciría una **nueva autoridad** y
+  complicaría **replay**, `config_hash`, OOS frozen y reproducibilidad, sin un caso
+  de uso actualmente contratado. **No** se adopta DB como solución para F-08-b.
+- **Futuro**: cualquier wiring DB es una **capacidad nueva** y requerirá **contrato
+  separado** (ownership, precedence, versioning, failure policy). **No** queda como
+  gap abierto actual.
 
 #### S-05-portfolio — role of `portfolio/engine.py`
 - ID: S-05-portfolio (subfinding separado de S-05).
