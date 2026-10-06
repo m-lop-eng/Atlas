@@ -99,8 +99,9 @@ en `HEAD = 53625fb`; se conservan como referencia de auditoría):
   plantilla sin runtime**; el riesgo de arranque inseguro queda refutado en el
   estado actual). Subfindings: **F-11-a** (superficie de config F-03,
   **`IMPLEMENTED`**: los 4 límites configurables vía `config/paper/settings.yaml`),
-  **F-11-b** (validación estructural del bloque `risk`, `CONTRACT GAP`),
-  **F-11-c** (cotas superiores F-03, `CONTRACT GAP — LOW`).
+  **F-11-b** (validación estructural del bloque `risk`, **`CONTRACT GAP — NO
+  CURRENT OPERATIONAL IMPACT`**; subfindings **F-11-b-1/-2/-3**), **F-11-c** (cotas
+  superiores F-03, `CONTRACT GAP — LOW`).
   - **margin / correlation** — `INFRASTRUCTURE GAP` (F-03 fase 1 no los modela).
   - **backtest** — fuera de alcance de F-03 (requiere `AccountLedger`/fuente
     equivalente).
@@ -969,17 +970,72 @@ pre-fill con precio de ejecución (`open(t+1)`); projected state desde
 
 - **Cotas superiores**: **fuera** de este contrato; pertenecen a **F-11-c**.
 
-#### F-11-b — risk block structural validation
+#### F-11-b — risk block structural validation — **CONTRACT GAP — NO CURRENT OPERATIONAL IMPACT**
 - ID: F-11-b (subfinding separado de F-11).
-- **estado: `CONTRACT GAP`** — NO implementado.
-- `config.loader` **no valida semánticamente** el bloque `risk`; la validación
-  efectiva está en `RiskConfig` **cuando se instancia**.
-- `null` puede producir un **error de tipo** (`0 < None`) en vez de un error
-  contractual explícito si se mapeara directamente a `RiskConfig`.
-- La ausencia de validación en el loader **no es bug de runtime actual** porque el
-  loader **no tiene caller productivo**.
-- Definir posteriormente si el loader debe ser **fail-closed** cuando se convierta
-  en runtime real.
+- **estado: `CONTRACT GAP — NO CURRENT OPERATIONAL IMPACT`** — NO implementado.
+- `config.loader.py` **no valida semánticamente** el bloque `risk`, pero **no tiene
+  caller productivo**. El runtime real paper/forward usa `build_forward_runner()` y
+  **falla explícitamente** ante estructuras inválidas. **No** existe fallback
+  silencioso a gates disabled. Por tanto **no hay `IMPLEMENTATION BUG` actual**.
+- El gap consiste en que la **validación estructural** y la **semántica de errores**
+  no están formalmente contratadas. Subfindings: **F-11-b-1**, **F-11-b-2**,
+  **F-11-b-3**.
+
+##### F-11-b-1 — generic config loader validation
+- ID: F-11-b-1 (subfinding separado).
+- **estado: `CONTRACT GAP — FUTURE RUNTIME`**.
+- `load_config`/`load_environment` validan YAML/`dict`/`environment`; **no** validan
+  `risk`; **no** tienen caller productivo. Cualquier endurecimiento pertenece al
+  momento en que el loader se convierta en runtime real.
+
+##### F-11-b-2 — paper/forward risk block error semantics
+- ID: F-11-b-2 (subfinding separado).
+- **estado: `CONTRACT GAP`** (semántica de error; sin impacto operativo actual).
+- El builder es actualmente **fail-loud**: `risk` ausente → `KeyError`;
+  `risk: null` / no-dict → `TypeError`; campos inválidos → errores de `RiskConfig`
+  (`ValueError`). Estas excepciones son **incidentales**, no una taxonomía
+  contractual explícita.
+- **Observación (no implementation bug)**: `max_open_positions` actualmente **no**
+  tiene validación de rango/tipo equivalente en `RiskConfig` (`__post_init__` solo
+  valida `risk_per_trade`/`max_strategy_risk`/`max_daily_loss`/`max_drawdown` y los
+  4 límites F-03). Queda como **decisión contractual pendiente**.
+
+##### F-11-b-3 — future production config runtime
+- ID: F-11-b-3 (subfinding separado).
+- **estado: `CONTRACT GAP — FUTURE`**.
+- **No** mezclar con F-11-b. Convertir `config/production/settings.yaml` en runtime
+  es un bloque **F-11 separado**.
+
+##### Tabla de casos (runtime paper/forward)
+
+| Entrada | Builder | RiskConfig | Resultado actual |
+|---|---|---|---|
+| `risk` ausente | `KeyError` | no llega | fail-loud |
+| `risk: null` | `TypeError` | no llega | fail-loud |
+| `risk` no-dict | `TypeError` | no llega | fail-loud |
+| campo legacy ausente | `KeyError` | no llega | fail-loud |
+| F-03 ausente | `.get()` → `None` | disabled | válido |
+| F-03 `null` | `None` | disabled | válido |
+| F-03 `0` | pasa | `ValueError` | fail-loud |
+| F-03 negativo | pasa | `ValueError` | fail-loud |
+| F-03 `NaN`/`Inf` | pasa | `ValueError` | fail-loud |
+| unknown key | ignorado | no llega | según contrato actual |
+
+##### Tests (F-11-b)
+- **Runtime wiring**: `tests/test_forward_runner.py::TestRiskLimitConfigSurface`
+  (F-03 config surface: ausente/null/explícitos/inválidos; `risk` ausente →
+  `KeyError`; unknown key ignorado; integración REJECT/APPROVE pre-fill).
+- **Objeto `RiskConfig`**: `tests/test_risk_engine.py`, `tests/test_risk_sizing.py`,
+  `tests/test_risk_exposure_gates.py::TestConfigLimits`.
+- **Loader genérico**: `tests/test_config.py` (entorno/archivo/dict; **no** valida
+  `risk`).
+
+##### Decisiones futuras (F-11-b; no tomadas ahora)
+1. contrato formal de **validación estructural** de `risk`;
+2. **semántica contractual de errores**;
+3. si `max_open_positions` debe tener validación explícita de **tipo/rango**;
+4. endurecimiento del **loader** si algún día se convierte en runtime;
+5. relación con **F-11 production runtime** (F-11-b-3).
 
 #### F-11-c — upper bounds for F-03 risk limits
 - ID: F-11-c (subfinding separado de F-11).
@@ -997,7 +1053,8 @@ pre-fill con precio de ejecución (`open(t+1)`); projected state desde
 3. **Wiring de los límites F-03** a paper/forward (F-11-a): **`IMPLEMENTED`**
    (configurable vía `config/paper/settings.yaml`).
 4. **Contrato de límites superiores**, especialmente `concentration` (F-11-c).
-5. **Política exacta de validación estructural** del bloque `risk` (F-11-b).
+5. **Política exacta de validación estructural** del bloque `risk` (F-11-b;
+   subfindings **F-11-b-1/-2/-3**).
 
 ## Suspected Findings
 
