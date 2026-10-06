@@ -95,13 +95,14 @@ en `HEAD = 53625fb`; se conservan como referencia de auditoría):
   (preventivo para instrumentos integer-only; sin bug en el alcance actual).
   Subfindings: **F-08-a** (quantity NaN/Inf, **`CLOSED — REFUTED`**: sin ruta
   productiva) y **F-08-b** (instrument quantity metadata, `INFRASTRUCTURE GAP`).
-  - **F-11** — `CONTRACT GAP` (config de producción con `null` **no ejecutable /
-  plantilla sin runtime**; el riesgo de arranque inseguro queda refutado en el
-  estado actual). Subfindings: **F-11-a** (superficie de config F-03,
-  **`IMPLEMENTED`**: los 4 límites configurables vía `config/paper/settings.yaml`),
-  **F-11-b** (validación estructural del bloque `risk`, **`CONTRACT GAP — NO
-  CURRENT OPERATIONAL IMPACT`**; subfindings **F-11-b-1/-2/-3**), **F-11-c** (cotas
-  superiores F-03, **`CLOSED — REFUTED`**).
+  - **F-11** — **`CLOSED — REFUTED`** (claim de riesgo operativo: `config/
+  production/settings.yaml` es **template/placeholder/no-runtime**; el arranque
+  inseguro por `null` queda **refutado**). El rol productivo futuro queda
+  **deliberadamente diferido** (bloque F-11 separado). Subfindings: **F-11-a**
+  (superficie de config F-03, **`IMPLEMENTED`**: los 4 límites configurables vía
+  `config/paper/settings.yaml`), **F-11-b** (validación estructural del bloque
+  `risk`, **`CONTRACT GAP — NO CURRENT OPERATIONAL IMPACT`**; subfindings
+  **F-11-b-1/-2/-3**), **F-11-c** (cotas superiores F-03, **`CLOSED — REFUTED`**).
   - **margin / correlation** — `INFRASTRUCTURE GAP` (F-03 fase 1 no los modela).
   - **backtest** — fuera de alcance de F-03 (requiere `AccountLedger`/fuente
     equivalente).
@@ -838,11 +839,23 @@ pre-fill con precio de ejecución (`open(t+1)`); projected state desde
   detecta.
 - **no cerrado del todo** hasta el commit.
 
-### F-11 — `config/production/settings.yaml`: `null` en métricas de riesgo — **CONTRACT GAP (config no ejecutable; plantilla sin runtime)**
+### F-11 — `config/production/settings.yaml`: `null` en métricas de riesgo — **CLOSED — REFUTED** (claim de riesgo operativo; rol productivo deliberadamente diferido)
 - ID: F-11
 - severidad: **HIGH** (histórica; reclasificada: el vector real es plantilla, no runtime)
 - archivo: `config/production/settings.yaml`, `config/loader.py`
-- **estado: `CONTRACT GAP`** — NO implementado. (Histórico: `REQUIRES DECISION`.)
+- **estado: `CLOSED — REFUTED`** — el claim original de **riesgo operativo**
+  ("arranque inseguro por `null`") queda **refutado**: `config/production/
+  settings.yaml` es **template/placeholder/no-runtime** y no tiene caller. El rol
+  productivo queda **deliberadamente diferido** (nota abajo), no como finding
+  funcional actual.
+- **Decisión ratificada (F-11 principal)**: `config/production/settings.yaml` =
+  **TEMPLATE / PLACEHOLDER / NON-RUNTIME**. No es configuración ejecutable, no es
+  fuente de verdad de producción, no participa en paper/forward, `risk.*: null` no
+  tiene efecto runtime, no se rellena con valores reales y no se conecta vía
+  `config.loader.py` en este ciclo. **Cualquier futura conversión a configuración
+  productiva es un bloque F-11 separado** y requerirá su propio contrato
+  (endurecimiento del loader + fail-closed + valores reales), referido en
+  **F-11-b-3**.
 - **Reclasificación (Opción B)**: `config/production/settings.yaml` **NO es
   configuración ejecutable** en ningún runtime. Es una **plantilla/placeholder**.
 - **Qué significa "production"**: `EnvName.PRODUCTION` existe solo en el loader;
@@ -879,15 +892,15 @@ pre-fill con precio de ejecución (`open(t+1)`); projected state desde
   - Hacer que `load_config("production")` valide el bloque `risk` rompería
     `test_config::test_load_string_env` (que hoy espera éxito) y cambiaría la
     semántica del loader sin decisión.
-- **Decisión humana necesaria**: elegir política de configuración de producción:
-  1. **plantilla documental** → marcar el archivo como no-ejecutable (p. ej.
-     cabecera/renombrado) y no validar; o
-  2. **config ejecutable** → completar los `risk.*` con valores reales (humano) y
-     endurecer `load_config` a fail-closed en `production` (reutilizando la
-     validación de `RiskConfig`, sin defaults).
-- **Hallazgo incidental (NO corregido)**: `load_config`/`load_environment` sin
-  integración en el arranque real (posible dead code o pendiente de wiring).
-- **no cerrado** hasta la decisión.
+- **Decisión humana (RESUELTA)**: se adopta la opción **1 — plantilla
+  documental/no-ejecutable**. No se rellena con valores reales ni se conecta al
+  loader. (La opción 2 "config ejecutable" queda como **bloque F-11 separado**
+  si algún día se decide, ver F-11-b-3.)
+- **Hallazgo incidental**: `load_config`/`load_environment` sin integración en el
+  arranque real → registrado como **F-11-b-1** (loader genérico, `CONTRACT GAP —
+  FUTURE RUNTIME`).
+- **CERRADO (claim de riesgo operativo refutado).** El rol productivo futuro queda
+  como **nota/deferred**, no como finding funcional actual.
 - **No se modificó F-04** ni ningún otro hallazgo.
 
 #### Re-auditoría F-11 (HEAD `72a3544`)
@@ -901,16 +914,18 @@ pre-fill con precio de ejecución (`open(t+1)`); projected state desde
   `config/final_oos/config.yaml` (vía `yaml.safe_load`, **no** vía
   `config.loader`) y construye `RiskConfig` con los campos legacy. **Nunca**
   consume `production/settings.yaml`.
-- **Gap contractual restante**: la documentación/docstring del loader **promete**
-  un comportamiento de producción ("fail-closed") que **no** corresponde al
-  wiring real (loader sin validación semántica de `risk` y sin consumidor). Por
-  eso F-11 **permanece `CONTRACT GAP`** (no `CLOSED`).
+- **Gap contractual restante** (histórico; ver decisión final): la
+  documentación/docstring del loader **promete** un comportamiento de producción
+  ("fail-closed") que **no** corresponde al wiring real (loader sin validación
+  semántica de `risk` y sin consumidor). **Resolución**: el claim de riesgo
+  operativo queda **`CLOSED — REFUTED`**; la falta de validación del loader se
+  registra separada como **F-11-b-1** (`CONTRACT GAP — FUTURE RUNTIME`).
 - **`config/production/settings.yaml`**: template/placeholder; **no runtime**;
   `risk.*: null` **no tiene efecto** actualmente. **No** convertirlo en ejecutable
-  ni renombrarlo en este paso.
-- **Paper/forward**: el archivo operativo de paper **sí** existe
-  (`config/paper/settings.yaml`) pero **no contiene** los cuatro límites F-03;
-  por tanto la superficie de configuración de F-03 es todavía **programática**.
+  ni renombrarlo.
+- **Paper/forward** (histórico): el archivo operativo de paper existe; tras
+  **F-11-a** (`IMPLEMENTED`) **sí** transporta los cuatro límites F-03 vía
+  `build_forward_runner`.
 
 #### F-11-a — F-03 risk-limit configuration surface — **IMPLEMENTED**
 - ID: F-11-a (subfinding separado de F-11).
@@ -1249,10 +1264,11 @@ pre-fill con precio de ejecución (`open(t+1)`); projected state desde
    correlation siguen `INFRASTRUCTURE GAP`** y backtest fuera de alcance.
 5. **F-09/F-10 data quality incompleta + reordenamiento silencioso** — **CLOSED**
    (ver F-09/F-10).
-6. **F-11 production config con `null`** — **ABIERTO** (`CONTRACT GAP`):
-   `config/production/settings.yaml` es **template sin runtime** (riesgo de
-   arranque inseguro refutado hoy); gap contractual restante. Ver F-11 (y
-   subfindings F-11-a/b/c).
+6. **F-11 production config con `null`** — **`CLOSED — REFUTED`**:
+   `config/production/settings.yaml` es **template/placeholder/no-runtime**; el
+   arranque inseguro por `null` queda **refutado**. Rol productivo futuro =
+   bloque separado. Subfindings: **F-11-a `IMPLEMENTED`**, **F-11-b** (contrato
+   futuro), **F-11-c `CLOSED — REFUTED`**.
 7. **F-08 sizing entero/`quantity_step`** — **`CONTRACT GAP — NOT APPLICABLE TO
    CURRENT INSTRUMENT CONTRACT`** (preventivo; sin bug actual; ver F-08).
 8. **margin / correlation (F-03)** — **ABIERTO** (`INFRASTRUCTURE GAP`).
@@ -1296,8 +1312,10 @@ pre-fill con precio de ejecución (`open(t+1)`); projected state desde
    APPLICABLE TO CURRENT INSTRUMENT CONTRACT`** (preventivo; sin bug actual);
    subfindings **F-08-a** (**`CLOSED — REFUTED`**) y **F-08-b**
    (`INFRASTRUCTURE GAP`).
-8. **F-11** (config de producción / validación del bloque `risk`) — **PENDIENTE**
-   (`CONTRACT GAP`; plantilla sin runtime; subfindings F-11-a/b/c).
+8. **F-11** (config de producción / validación del bloque `risk`) — **`CLOSED —
+   REFUTED`** (claim de riesgo operativo; plantilla sin runtime). Subfindings:
+   **F-11-a `IMPLEMENTED`**, **F-11-b** (contrato futuro, `CONTRACT GAP — NO
+   CURRENT OPERATIONAL IMPACT`), **F-11-c `CLOSED — REFUTED`**.
 9. **F-04** (contrato de estado de riesgo en paper) — **REFUTED** (no es bug).
 10. S-02 (ramas de posición/pyramiding) — **`CONTRACT GAP` (no aplicable al
     contrato actual; reabrir solo si se contrata pyramiding/reducción parcial)**;
@@ -1308,11 +1326,12 @@ pre-fill con precio de ejecución (`open(t+1)`); projected state desde
 
 Pendientes vigentes: **F-08** (`CONTRACT GAP` preventivo, no aplicable al
 contrato de instrumentos actual) y **F-08-b** (`INFRASTRUCTURE GAP`); **F-08-a**
-queda **`CLOSED — REFUTED`** (sin ruta productiva), **F-11** (`CONTRACT GAP`,
-plantilla sin runtime; subfindings **F-11-a**/**F-11-b**/**F-11-c**),
-**margin/correlation (F-03)**, **backtest fuera de alcance (F-03)**,
-**F-06-RECOVERY** (`load_snapshot`, `CONTRACT GAP — DEFERRED UNTIL LOAD_SNAPSHOT
-HAS A PRODUCTION ROLE`), y deuda no bloqueante **I2/I3/I4/I5/I6** (ver F-06).
+queda **`CLOSED — REFUTED`** (sin ruta productiva); **F-11** = **`CLOSED —
+REFUTED`** (su subfinding **F-11-b** permanece como `CONTRACT GAP — NO CURRENT
+OPERATIONAL IMPACT` / futuro); **margin/correlation (F-03)**, **backtest fuera de
+alcance (F-03)**, **F-06-RECOVERY** (`load_snapshot`, `CONTRACT GAP — DEFERRED
+UNTIL LOAD_SNAPSHOT HAS A PRODUCTION ROLE`), y deuda no bloqueante
+**I2/I3/I4/I5/I6** (ver F-06).
 
 ---
 
@@ -1327,12 +1346,13 @@ HAS A PRODUCTION ROLE`), y deuda no bloqueante **I2/I3/I4/I5/I6** (ver F-06).
 - **Correctness**: **sí** para los hallazgos de correctness del baseline — F-05
   (equity SHORT) y F-01 (TZ) **cerrados**.
 - **Operational readiness**: paper/forward operativo con **F-02/F-03/F-06
-  cerrados**; permanecen **F-08** (`CONTRACT GAP` preventivo, no aplicable al
-  contrato de instrumentos actual) y **F-11 (`CONTRACT GAP`**: config de
-  producción plantilla/sin runtime, no un bug de runtime) y
-  **margin/correlation (`INFRASTRUCTURE GAP`)**; **F-06-RECOVERY** abierto
-  (`load_snapshot`, `CONTRACT GAP`; sin caller de producción, no production
-  blocker).
+  cerrados**; **F-11 = `CLOSED — REFUTED`** (config de producción
+  template/sin runtime, no un bug de runtime; su **F-11-b** permanece como
+  contrato futuro); permanecen **F-08** (`CONTRACT GAP` preventivo, no aplicable
+  al contrato de instrumentos actual) y **margin/correlation
+  (`INFRASTRUCTURE GAP`)**; **F-06-RECOVERY** abierto (`load_snapshot`,
+  `CONTRACT GAP`; sin caller de producción, no production blocker).
 - **Production readiness**: **NO** — sin broker real (por diseño), sin
-  margin/correlation, sin config de producción ejecutable (F-11, plantilla sin
-  runtime). **Ningún estado de "production ready"** se declara.
+  margin/correlation, sin config de producción ejecutable (por diseño;
+  `config/production/settings.yaml` es template/no-runtime; F-11 = `CLOSED —
+  REFUTED`). **Ningún estado de "production ready"** se declara.
