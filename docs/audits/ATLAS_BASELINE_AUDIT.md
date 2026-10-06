@@ -125,8 +125,8 @@ en `HEAD = 53625fb`; se conservan como referencia de auditoría):
 | Brokers | `brokers/base.py` (ABC), `brokers/paper.py` (`PaperBrokerAdapter`) — **único adapter concreto**. |
 | Live (B1–B7) | `live/`, `sessions/`, `reconciliation/`, `killswitches/`, `monitoring/`, `papertrading/`. |
 | Streaming (S1–S8) | `streaming/`, `papertrading/streaming_forward.py`, `data/binance_rest.py`, `experiments/e19_*`. |
-| Portfolio | `portfolio/engine.py` (solo exposición descriptiva; **no integrado**). |
-| Database | `database/models.py`, `database/session.py` (definidos; **no usados** fuera del paquete). |
+| Portfolio | `portfolio/engine.py` (exposición descriptiva; **no integrado por diseño** — no es la fuente de exposición; ver S-05-portfolio). |
+| Database | `database/models.py`, `database/session.py` (schema-first; **sin rol de runtime definido**; ver S-05-db). |
 | Deployment | `deployment/schedule_a4.py` (tarea Windows A4). |
 | Production/live execution | **NO existe** ejecución real: no hay broker real, credenciales ni endpoints de órdenes. Solo `development`/backtest y paper/forward. |
 
@@ -776,7 +776,8 @@ pre-fill con precio de ejecución (`open(t+1)`); projected state desde
 - archivo: `database/models.py::Instrument`.
 - **estado: `INFRASTRUCTURE GAP`** — NO implementado.
 - `Instrument` define `tick_size`/`point_value` pero **no** `quantity_step`/
-  `lot_size`; la DB **no está cableada** al runtime relevante (ver S-05).
+  `lot_size`. La parte de "**DB no cableada**" de este subfinding **depende de
+  S-05-db**; la ausencia de `quantity_step`/`lot_size` es un **gap independiente**.
 - Si en el futuro se incorporan instrumentos integer-only, habrá que definir la
   **fuente de metadata** de cantidad y la **política de cuantización**.
 
@@ -1067,9 +1068,40 @@ pre-fill con precio de ejecución (`open(t+1)`); projected state desde
   `UNKNOWN` **no terminal**, **requiere reconciliation/broker lookup**, **no
   resubmit** antes de resolver.
 
-### S-05 — `db`/`portfolio` definidos pero no integrados
-- severidad: LOW — `database/` sin importadores externos; `portfolio/` sin
-  conexión al veto (consecuencia de F-03). Documentarlo como MVP.
+### S-05 — `db`/`portfolio` definidos pero no integrados — **CONTRACT GAP — NO CURRENT FUNCTIONAL IMPACT**
+- severidad histórica: **LOW**.
+- **Claim original**: infraestructura definida pero no integrada (`database/` sin
+  importadores externos; `portfolio/` sin conexión al veto, consecuencia de F-03).
+- **Re-auditoría (HEAD `b2b1597`)**:
+  - **No existe contrato** que obligue al runtime a consumir `database/`.
+  - **No existe impacto funcional actual** (runtime usa config explícita y
+    `AccountLedger`; nada se rompe).
+  - **No es `IMPLEMENTATION BUG`** (no hay contrato que exija usar la DB).
+  - **No es `INFRASTRUCTURE GAP`**: no hay una **capacidad de runtime contratada**
+    que requiera la DB.
+- **Clasificación: `CONTRACT GAP — NO CURRENT FUNCTIONAL IMPACT`.** No es
+  production blocker. Subfindings: **S-05-db** y **S-05-portfolio**.
+
+#### S-05-db — operational role of `database/`
+- ID: S-05-db (subfinding separado de S-05).
+- **estado: `CONTRACT GAP`** — NO implementado.
+- `database/models.py::Instrument` existe; **no** hay migraciones, repositorios ni
+  callers de runtime. `database/session.py` solo proporciona infraestructura de
+  conexión **potencial** (sin consumidor).
+- `Instrument.tick_size` / `point_value` **no** son fuente de verdad del runtime;
+  paper/backtest/research usan **configuración explícita**
+  (`PaperEngineConfig.point_value`, `BacktestConfig.point_value`,
+  `ExecutionCosts.tick_size`, `config/final_oos/config.yaml`).
+- **Pendiente decidir** si `database/` será: (1) fuente de verdad de metadata;
+  (2) schema-first / infraestructura planificada; o (3) otra función contractual
+  explícita. **No** se elige la arquitectura ahora.
+
+#### S-05-portfolio — role of `portfolio/engine.py`
+- ID: S-05-portfolio (subfinding separado de S-05).
+- **estado: `CLOSED — REFUTED`.**
+- **Motivo**: F-03 congeló explícitamente `AccountLedger.valuation()` como fuente
+  autoritativa; `portfolio.compute_portfolio_risk()` **no** está cableado **por
+  diseño**. **No** debe volver a presentarse como defecto de integración.
 
 ## Production Blockers (estado actual)
 
