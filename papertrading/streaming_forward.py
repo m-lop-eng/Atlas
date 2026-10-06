@@ -282,8 +282,13 @@ class StreamingForwardRunner:
 
     def _on_closed_bar(self, closed: ClosedBarEvent) -> None:
         """UNICO punto de llegada al runner: ClosedBarEvent de B1."""
+        # LIVE-04 (G-MD-C): propaga el estado REAL de LiveDataEngine (B1) en vez
+        # de hardcodear HEALTHY.
         record = self._forward.on_closed_bar(
-            closed, data_quality="HEALTHY", at=_close_dt(closed)
+            closed,
+            data_quality=self.pipeline.engine.quality.value,
+            data_state=self.pipeline.engine.state.value,
+            at=_close_dt(closed),
         )
         if record is None:
             self._deduped += 1

@@ -179,6 +179,11 @@ class PaperTradingEngine:
         self._last_broker_success: datetime | None = None
         self._broker_errors = 0
         self._last_exit_reason: str | None = None
+        # LIVE-04 (G-MD-C): observacion del feed de market data (B1). Por defecto
+        # paper/test = CONNECTED/HEALTHY; el ForwardRunner/streaming inyecta el
+        # estado REAL de `LiveDataEngine` (no se hardcodea HEALTHY).
+        self._data_feed_state = "CONNECTED"
+        self._data_feed_quality = "HEALTHY"
 
         # Paper: el engine siempre arranca con el broker simulado conectado.
         # Un test de bloqueo desconecta el adapter después del arranque.
@@ -938,6 +943,16 @@ class PaperTradingEngine:
         self._last_broker_success = now
         self._broker_errors = 0
 
+    def note_data_feed(self, state: str, quality: str) -> None:
+        """LIVE-04 (G-MD-C): registra el estado REAL del feed de market data.
+
+        Lo inyecta el ForwardRunner/streaming con el estado de `LiveDataEngine`
+        (`engine.state`/`engine.quality`). Monitoring/kill switch dejan de
+        asumir CONNECTED/HEALTHY cuando el feed esta stale/degraded/failed.
+        """
+        self._data_feed_state = state
+        self._data_feed_quality = quality
+
     def _resolve_pending_submissions(self) -> None:
         """Resuelve submissions UNKNOWN por broker lookup.
 
@@ -1057,9 +1072,13 @@ class PaperTradingEngine:
         """Alimenta Monitoring (B6) y aplica al Kill Switch (B5): detecta, decide."""
         now = now or self._clock()
         data_last = self._last_bar_close_dt
+        # LIVE-04 (G-MD-C): usa el estado REAL del feed (inyectado por el
+        # ForwardRunner/streaming), no un HEALTHY/CONNECTED hardcodeado.
         data_obs = observe_data_feed(
-            "CONNECTED", "HEALTHY", last_event_at=data_last
-        ) if data_last is not None else observe_data_feed("CONNECTED", "HEALTHY", None)
+            self._data_feed_state, self._data_feed_quality, last_event_at=data_last
+        ) if data_last is not None else observe_data_feed(
+            self._data_feed_state, self._data_feed_quality, None
+        )
         broker_obs = observe_broker(
             self.broker,
             last_success=self._last_broker_success,

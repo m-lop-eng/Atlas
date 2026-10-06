@@ -323,9 +323,15 @@ class ForwardRunner:
         closed: ClosedBarEvent,
         *,
         data_quality: str = "HEALTHY",
+        data_state: str = "CONNECTED",
         at: datetime | None = None,
     ) -> ForwardBarRecord | None:
-        """Una barra cerrada (emitida por B1). Idempotente ante duplicados."""
+        """Una barra cerrada (emitida por B1). Idempotente ante duplicados.
+
+        `data_state`/`data_quality` = estado REAL de `LiveDataEngine` (B1),
+        propagado a monitoring/kill switch (LIVE-04/G-MD-C). Defaults CONNECTED/
+        HEALTHY preservan paper/test/A4-batch.
+        """
         if not self._started:
             raise RuntimeError("ForwardRunner.start() antes de procesar barras.")
         if (
@@ -336,6 +342,9 @@ class ForwardRunner:
         self._clock.set(at or _closed_close_dt(closed))
         self._last_open_time = closed.open_time
         self._append_bar(closed, data_quality)
+        # LIVE-04: inyecta el estado real del feed en el engine antes de procesar
+        # (monitoring corre en `_post_bar` al final de la barra).
+        self.engine.note_data_feed(data_state, data_quality)
         return self._process(closed, data_quality)
 
     # ---------------------------------------------------------------- persist

@@ -284,7 +284,8 @@ def run_cycle(args: argparse.Namespace) -> dict:
             counters["emitted"] += 1
             rec = runner.on_closed_bar(
                 closed,
-                data_quality="HEALTHY",
+                data_quality=engine.quality.value,
+                data_state=engine.state.value,
                 at=datetime.fromtimestamp(closed.close_time, tz=timezone.utc),
             )
             if rec is None:
