@@ -254,6 +254,23 @@ class OrderManager:
         self.orders[order_id] = replace(order, status=target)
         return self.orders[order_id]
 
+    def set_broker_order_id(self, order_id: str, broker_order_id: str) -> Order:
+        """Registra el id asignado por el broker (correlacion client<->broker).
+
+        Es **metadata de correlacion**, NO una transicion de estado: no valida el
+        grafo ni exige un estado concreto. Idempotente. Permite mantener la
+        relacion estable `client_order_id <-> broker_order_id` durante toda la
+        vida de la orden (submit confirmado, lookup de UNKNOWN, fills, cancel).
+        """
+        order = self.orders.get(order_id)
+        if order is None:
+            raise KeyError(f"Orden desconocida: {order_id}")
+        if order.broker_order_id == broker_order_id:
+            return order
+        updated = replace(order, broker_order_id=broker_order_id)
+        self.orders[order_id] = updated
+        return updated
+
     def load(self, order: Order) -> None:
         """Recarga una orden persistida (recuperación tras reinicio)."""
         self.orders[order.order_id] = order

@@ -29,7 +29,14 @@ from datetime import date, datetime, timezone
 from typing import Any, Callable
 
 from brokers.base import BrokerAdapter
-from brokers.models import BrokerError, BrokerFill, BrokerOrderState, SubmitStatus
+from brokers.models import (
+    BrokerConnectionError,
+    BrokerError,
+    BrokerFill,
+    BrokerOrderState,
+    OrderNotFoundError,
+    SubmitStatus,
+)
 from brokers.paper import BrokerSnapshotError
 from execution.order import Fill, OrderSide, OrderStatus, OrderType
 from execution.order_manager import OrderManager, OrderStateError
@@ -472,6 +479,22 @@ class PaperTradingEngine:
 
     # ------------------------------------------------------------- fills
 
+    def _record_broker_order_id(self, cid: str, broker_order_id) -> None:
+        """Correlaciona `client_order_id <-> broker_order_id` en la orden interna.
+
+        LIVE-02: la identidad estable interna es `client_order_id`; el
+        `broker_order_id` observado se registra en cuanto el broker lo asigna
+        (submit confirmado o resolucion por lookup). Metadata, no transicion.
+        """
+        if not broker_order_id:
+            return
+        order = next(
+            (o for o in self.order_manager.orders.values() if o.client_order_id == cid),
+            None,
+        )
+        if order is not None:
+            self.order_manager.set_broker_order_id(order.order_id, broker_order_id)
+
     def _apply_fills(self, cid: str, broker_order, now: datetime) -> None:
         order = next(
             (o for o in self.order_manager.orders.values() if o.client_order_id == cid),
@@ -479,6 +502,10 @@ class PaperTradingEngine:
         )
         if order is None:
             return
+        # LIVE-02: registrar el id del broker en cuanto se conoce (correlacion).
+        self._record_broker_order_id(
+            cid, getattr(broker_order, "broker_order_id", None)
+        )
         fills = list(getattr(broker_order, "fills", ()) or ())
         if not fills and broker_order.filled_quantity > 0 and broker_order.avg_fill_price:
             # Broker sin detalle de fills pero con agregado autoritativo.
@@ -491,6 +518,15 @@ class PaperTradingEngine:
                 )
             ]
         if not fills:
+            return
+        # LIVE-02: idempotencia de fills. Si TODOS los fills del lote ya estan
+        # aplicados al ledger (misma identidad `(cid, fill_sequence)`), no
+        # re-aplicar: protege reconnect, polling y re-entrega del mismo lote
+        # (evita `apply_fill` sobre orden terminal y auditoria duplicada).
+        if all(
+            self._ledger.is_applied(cid, int(getattr(f, "fill_sequence", i)))
+            for i, f in enumerate(fills)
+        ):
             return
         qty = sum(f.quantity for f in fills)
         vwap = sum(f.quantity * f.price for f in fills) / qty
@@ -815,14 +851,40 @@ class PaperTradingEngine:
         self._broker_errors = 0
 
     def _resolve_pending_submissions(self) -> None:
+        """Resuelve submissions UNKNOWN por broker lookup.
+
+        LIVE-02: distingue explicitamente (no mezclar):
+          * **NOT_FOUND** (`get_order` -> None, o `OrderNotFoundError`): el broker
+            respondio que NO conoce la orden. NO es un timeout/error, NO confirma
+            cancelacion, NO es evidencia de que el submit no ocurrio. Se mantiene
+            UNKNOWN/pending (fail-safe); sin resubmit; sin mutacion terminal.
+          * **LOOKUP_UNCERTAIN** (`BrokerConnectionError`/transporte): no se pudo
+            determinar el estado. Permanece pending; sin resubmit.
+          * **INDETERMINATE** (`state is UNKNOWN`): el broker respondio pero el
+            estado no es determinable. Permanece pending.
+          * **RESUELTO**: estado/fills determinables -> se adopta.
+        """
         for cid in list(self._pending_resolution):
             try:
                 bro = self.broker.get_order(cid)
+            except OrderNotFoundError:
+                # NOT_FOUND explicito (algunos adapters lo lanzan en vez de None).
+                continue
+            except BrokerConnectionError:
+                # LOOKUP_UNCERTAIN: sin respuesta; reintentar en la proxima.
+                continue
             except BrokerError:
                 continue
-            if bro is None or bro.state is BrokerOrderState.UNKNOWN:
+            if bro is None:
+                # NOT_FOUND: el broker no conoce la orden. Fail-safe: permanece
+                # UNKNOWN/pending (NO terminal, NO resubmit, NO cancel implicito).
+                continue
+            if bro.state is BrokerOrderState.UNKNOWN:
+                # INDETERMINATE: el broker respondio, estado no determinable.
                 continue
             self._pending_resolution.discard(cid)
+            # LIVE-02: registrar el id del broker al resolver por lookup.
+            self._record_broker_order_id(cid, getattr(bro, "broker_order_id", None))
             if bro.fills:
                 self._apply_fills(cid, bro, self._clock())
                 self._audit_rec(
