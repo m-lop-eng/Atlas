@@ -582,11 +582,12 @@ pre-fill con precio de ejecución (`open(t+1)`); projected state desde
   (consistente→MATCH / divergente→MISMATCH) cubiertos por tests.
 - **RESOLVED.** Deuda I2/I3/I4/I5/I6 sigue **fuera** de F-06 (no bloqueante).
 
-### F-07 — `OrderManager` admite transiciones de estado inválidas — **RESOLVED — pending commit**
+### F-07 — `OrderManager` admite transiciones de estado inválidas — **CLOSED** (excepción `UNKNOWN` resuelta en S-04-a)
 - ID: F-07
 - severidad: **HIGH**
 - archivo: `execution/order_manager.py` (`_transition`)
-- **estado: RESOLVED — pending commit**
+- **estado: CLOSED** (cerrado en `84108d8`; la excepción de `UNKNOWN` se resolvió
+  en S-04-a, reabriendo contractualmente **solo** `UNKNOWN`).
 - **Causa raíz**: `_transition` solo rechazaba transiciones **desde** estado
   terminal; no validaba que la arista perteneciera al grafo. Permitía
   `CREATED → ACKNOWLEDGED`, `CREATED → SUBMITTED`, `APPROVED → ACKNOWLEDGED`,
@@ -624,9 +625,11 @@ pre-fill con precio de ejecución (`open(t+1)`); projected state desde
   `PARTIALLY_FILLED` válida; todos los terminales sin salidas.
 - **Evidencia**: `pytest` → 845 passed; `execution/order_manager.py` 99%.
 - **no cerrado del todo** hasta el commit.
-- **Hallazgo incidental (NO corregido)**: `UNKNOWN` está modelado como terminal,
-  pero §8 lo describe como estado a **resolver** con `get_order`; al ser terminal,
-  no hay arista para salir de él. Fuera del alcance de F-07.
+- **Hallazgo incidental — RESUELTO (S-04-a)**: `UNKNOWN` estaba modelado como
+  terminal, pero §8 lo describe como estado a **resolver** con `get_order`.
+  Corregido: `UNKNOWN` es **transitorio** (no terminal) con salidas congeladas
+  `{SUBMITTED, PARTIALLY_FILLED, FILLED, REJECTED, CANCELLED}`; ver **S-04-a**.
+  El resto del grafo de F-07 queda **intacto**.
 
 ### F-08 — Position sizing sin `quantity_step`/contratos enteros — **CONTRACT GAP — NOT APPLICABLE TO CURRENT INSTRUMENT CONTRACT**
 - ID: F-08
@@ -948,10 +951,11 @@ pre-fill con precio de ejecución (`open(t+1)`); projected state desde
   `UNKNOWN` (execution/order.py:58-67) mientras §8 lo describe como estado a
   resolver — incidental de **F-07**, fuera del claim de S-04.
 
-#### S-04-a — `OrderStatus.UNKNOWN` semantics (MODEL B) — **CONTRACT FROZEN — READY FOR IMPLEMENTATION**
+#### S-04-a — `OrderStatus.UNKNOWN` semantics (MODEL B) — **IMPLEMENTED**
 - ID: S-04-a (subfinding separado de S-04).
-- **estado: `CONTRACT FROZEN — READY FOR IMPLEMENTATION`** (HEAD `c6e00a5`;
-  ratificado **MODEL B — UNKNOWN IS TRANSIENT**). NO implementado.
+- **estado: `IMPLEMENTED`** (contrato congelado en `6a6d575`; **MODEL B — UNKNOWN
+  IS TRANSIENT**). Implementado en `execution/order.py` + `execution/order_manager.py`
+  (solo afecta a `UNKNOWN`; el resto del grafo intacto).
 - **Definición**: `UNKNOWN` = orden cuyo resultado **no pudo determinarse** después
   del envío (timeout / pérdida de respuesta). **No** significa fallo, cancelación,
   expiración ni éxito. Por tanto **NO es terminal**; `OrderStatus.terminal` debe
@@ -994,14 +998,16 @@ pre-fill con precio de ejecución (`open(t+1)`); projected state desde
     idempotencia del ledger;
   - el gap separado de **adopción ledger/broker tras restart** (F-06/F-03)
     permanece **fuera** de este contrato.
-- **F-07**: **`F-07 REOPENED CONTRACTUALLY — UNKNOWN ONLY`**. Delta de
-  implementación futuro (mínimo):
-  1. `OrderStatus.terminal` excluye `UNKNOWN`.
-  2. `ALLOWED_TRANSITIONS[UNKNOWN]` toma el conjunto congelado.
-  3. actualizar tests de terminalidad
-     (`test_all_terminal_states_have_no_outgoing`, etc.).
-  4. añadir tests de resolución y de ausencia de self-loop.
-  5. **no** modificar el resto del grafo.
+- **F-07**: **`F-07 REOPENED CONTRACTUALLY — UNKNOWN ONLY`** → **aplicado**
+  (F-07 vuelve a `CLOSED`). Delta implementado (mínimo):
+  1. `OrderStatus.terminal` excluye `UNKNOWN` (terminales: FILLED/CANCELLED/
+     REJECTED/EXPIRED/FAILED).
+  2. `ALLOWED_TRANSITIONS[UNKNOWN] = {SUBMITTED, PARTIALLY_FILLED, FILLED,
+     REJECTED, CANCELLED}`.
+  3. tests de terminalidad actualizados (`test_all_terminal_states_have_no_outgoing`
+     sin UNKNOWN; `test_unknown_is_not_terminal`).
+  4. tests de resolución y ausencia de self-loop añadidos (`TestUnknownTransient`).
+  5. **no** se modificó el resto del grafo.
 - **Documentación `06_EXECUTION_OPERATION.md`** (a alinear en la implementación
   futura; **no** editar ahora): §7 y §8 deben expresar una única semántica —
   `UNKNOWN` **no terminal**, **requiere reconciliation/broker lookup**, **no

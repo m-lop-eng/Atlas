@@ -213,9 +213,20 @@ class TestTransitionGraph:
             OrderStatus.REJECTED,
             OrderStatus.EXPIRED,
             OrderStatus.FAILED,
-            OrderStatus.UNKNOWN,
         ):
             assert ALLOWED_TRANSITIONS[status] == frozenset()
+
+    def test_unknown_is_not_terminal(self) -> None:
+        # S-04-a: UNKNOWN es transitorio, NO terminal.
+        assert OrderStatus.UNKNOWN.terminal is False
+        for status in (
+            OrderStatus.FILLED,
+            OrderStatus.CANCELLED,
+            OrderStatus.REJECTED,
+            OrderStatus.EXPIRED,
+            OrderStatus.FAILED,
+        ):
+            assert status.terminal is True
 
 
 class TestFills:
@@ -266,3 +277,117 @@ class TestFills:
         order = manager.create_order(**_make(quantity=2))
         with pytest.raises(OrderStateError, match="cantidad"):
             manager.apply_fill(order.order_id, Fill(order_id=order.order_id, quantity=0, price=100.0))
+
+
+class TestUnknownTransient:
+    """S-04-a: UNKNOWN es transitorio (no terminal), resoluble por broker lookup."""
+
+    def _unknown_order(
+        self, *, quantity: int | float = 2, cid: str = "UNK"
+    ) -> tuple[OrderManager, Order]:
+        from execution.order_manager import ALLOWED_TRANSITIONS
+
+        m = OrderManager()
+        o = m.create_order(**_make(client_order_id=cid, quantity=quantity))
+        m.approve(o.order_id)
+        m.submit(o.order_id)
+        # SUBMITTED -> UNKNOWN (producer ya presente en el grafo).
+        assert OrderStatus.UNKNOWN in ALLOWED_TRANSITIONS[OrderStatus.SUBMITTED]
+        m._transition(o.order_id, OrderStatus.UNKNOWN)
+        return m, m.orders[o.order_id]
+
+    def test_unknown_reachable_from_submitted(self) -> None:
+        _, o = self._unknown_order()
+        assert o.status == OrderStatus.UNKNOWN
+
+    def test_valid_exits(self) -> None:
+        for target in (
+            OrderStatus.SUBMITTED,
+            OrderStatus.PARTIALLY_FILLED,
+            OrderStatus.FILLED,
+            OrderStatus.REJECTED,
+            OrderStatus.CANCELLED,
+        ):
+            m, o = self._unknown_order(cid=f"V-{target.value}")
+            assert m._transition(o.order_id, target).status == target
+
+    def test_self_loop_rejected(self) -> None:
+        m, o = self._unknown_order()
+        with pytest.raises(OrderStateError, match="inválida"):
+            m._transition(o.order_id, OrderStatus.UNKNOWN)
+        assert m.orders[o.order_id].status == OrderStatus.UNKNOWN
+
+    def test_excluded_targets_rejected(self) -> None:
+        for target in (
+            OrderStatus.ACKNOWLEDGED,
+            OrderStatus.EXPIRED,
+            OrderStatus.FAILED,
+        ):
+            m, o = self._unknown_order(cid=f"X-{target.value}")
+            with pytest.raises(OrderStateError, match="inválida"):
+                m._transition(o.order_id, target)
+            assert m.orders[o.order_id].status == OrderStatus.UNKNOWN
+
+    def test_unknown_partial_fill_resolves_via_apply_fill(self) -> None:
+        from execution.order import Fill
+
+        m, o = self._unknown_order(quantity=4)
+        resolved = m.apply_fill(
+            o.order_id, Fill(order_id=o.order_id, quantity=1, price=100.0)
+        )
+        assert resolved.status == OrderStatus.PARTIALLY_FILLED
+        assert resolved.fill_quantity == 1
+
+    def test_unknown_full_fill_resolves_via_apply_fill(self) -> None:
+        from execution.order import Fill
+
+        m, o = self._unknown_order(quantity=2)
+        resolved = m.apply_fill(
+            o.order_id, Fill(order_id=o.order_id, quantity=2, price=100.0)
+        )
+        assert resolved.status == OrderStatus.FILLED
+        assert resolved.fill_quantity == 2
+
+    def test_unknown_invalid_fill_no_partial_mutation(self) -> None:
+        from execution.order import Fill
+
+        m, o = self._unknown_order(quantity=2)
+        with pytest.raises(OrderStateError, match="excede"):
+            m.apply_fill(
+                o.order_id, Fill(order_id=o.order_id, quantity=5, price=100.0)
+            )
+        after = m.orders[o.order_id]
+        assert after.status == OrderStatus.UNKNOWN
+        assert after.fill_quantity == 0
+
+    def test_unknown_unresolved_stays_unknown(self) -> None:
+        # Lookup sin resolver (broker sigue UNKNOWN / no resuelve): no muta.
+        m, o = self._unknown_order()
+        assert m.orders[o.order_id].status == OrderStatus.UNKNOWN
+        assert m.orders[o.order_id].fill_quantity == 0
+
+    def test_unknown_still_blocks_duplicate_active_cid(self) -> None:
+        # UNKNOWN no terminal => la orden sigue activa => no recrear/re-enviar.
+        m, _ = self._unknown_order(cid="DUP")
+        with pytest.raises(OrderStateError, match="duplicada"):
+            m.create_order(**_make(client_order_id="DUP"))
+
+    def test_terminal_states_still_reject_fills(self) -> None:
+        from execution.order import Fill
+
+        # CANCELLED
+        m = OrderManager()
+        o = m.create_order(**_make(quantity=2))
+        m.cancel(o.order_id)
+        with pytest.raises(OrderStateError, match="terminal"):
+            m.apply_fill(
+                o.order_id, Fill(order_id=o.order_id, quantity=1, price=100.0)
+            )
+        # REJECTED
+        m2 = OrderManager()
+        o2 = m2.create_order(**_make(client_order_id="REJ", quantity=2))
+        m2.reject(o2.order_id, "x")
+        with pytest.raises(OrderStateError, match="terminal"):
+            m2.apply_fill(
+                o2.order_id, Fill(order_id=o2.order_id, quantity=1, price=100.0)
+            )

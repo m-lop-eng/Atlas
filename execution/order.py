@@ -57,13 +57,15 @@ class OrderStatus(str, Enum):
 
     @property
     def terminal(self) -> bool:
+        # S-04-a: UNKNOWN es TRANSITORIO (no terminal): una orden cuyo resultado
+        # no pudo determinarse tras el envio debe poder resolverse por broker
+        # lookup. Terminales: FILLED/CANCELLED/REJECTED/EXPIRED/FAILED.
         return self in (
             OrderStatus.FILLED,
             OrderStatus.CANCELLED,
             OrderStatus.REJECTED,
             OrderStatus.EXPIRED,
             OrderStatus.FAILED,
-            OrderStatus.UNKNOWN,
         )
 
 

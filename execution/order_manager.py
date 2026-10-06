@@ -76,13 +76,22 @@ ALLOWED_TRANSITIONS: dict[OrderStatus, frozenset[OrderStatus]] = {
         OrderStatus.UNKNOWN,
         OrderStatus.FAILED,
     }),
+    # S-04-a: UNKNOWN es TRANSITORIO (no terminal). Salidas congeladas = estados
+    # que el adapter concreto puede devolver en `get_order` (broker lookup):
+    # SUBMITTED/PARTIALLY_FILLED/FILLED/REJECTED/CANCELLED. NO self-loop.
+    OrderStatus.UNKNOWN: frozenset({
+        OrderStatus.SUBMITTED,
+        OrderStatus.PARTIALLY_FILLED,
+        OrderStatus.FILLED,
+        OrderStatus.REJECTED,
+        OrderStatus.CANCELLED,
+    }),
     # Terminales: sin salidas.
     OrderStatus.FILLED: frozenset(),
     OrderStatus.CANCELLED: frozenset(),
     OrderStatus.REJECTED: frozenset(),
     OrderStatus.EXPIRED: frozenset(),
     OrderStatus.FAILED: frozenset(),
-    OrderStatus.UNKNOWN: frozenset(),
 }
 
 

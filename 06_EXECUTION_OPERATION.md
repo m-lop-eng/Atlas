@@ -284,8 +284,10 @@ CANCELLED
 REJECTED
 EXPIRED
 FAILED
-UNKNOWN
 ```
+
+`UNKNOWN` is **NOT** terminal: it is a **transient** state (see §8) that must be
+resolved via broker reconciliation.
 
 The `UNKNOWN` state is critical.
 
@@ -319,6 +321,12 @@ Therefore:
 > A timeout is not proof of order failure.
 
 The system must reconcile broker state before resubmitting.
+
+`UNKNOWN` is a **transient** state, **not terminal**: it must be resolved by
+querying the broker (`get_order` / reconciliation) and adopting the observed
+state. Until the broker state is reconciled, the order must **not** be
+resubmitted. Resolution may land on an intermediate or final state
+(e.g. `SUBMITTED`, `PARTIALLY_FILLED`, `FILLED`, `REJECTED`, `CANCELLED`).
 
 ---
 
