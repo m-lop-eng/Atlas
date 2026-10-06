@@ -248,8 +248,84 @@ class PaperTradingEngine:
     def last_monitoring(self):
         return self._last_monitoring
 
+    def _bar_rejection_reason(
+        self, closed: ClosedBarEvent, now: datetime
+    ) -> str | None:
+        """LIVE-03: validez estructural + temporal de una barra, antes de procesar.
+
+        Bloquea (antes de cualquier mutacion de estado/ledger) barras:
+          * OHLC no finito / no positivo / incoherente, volumen invalido;
+          * timestamp ausente/no positivo/no alineado al intervalo;
+          * timestamp **futuro** (la vela aun no habria cerrado respecto al
+            reloj autoritativo `self._clock()`).
+
+        NO implementa freshness (antiguedad maxima): requiere decision de
+        configuracion (ver contrato LIVE-03). Devuelve `None` si la barra es
+        valida. Epoch-based => independiente del timezone local.
+        """
+        # LIVE-03: identidad de market data (instrumento/intervalo esperados).
+        if closed.symbol != self.config.instrument:
+            return "wrong_instrument"
+        if (
+            self._interval_seconds is not None
+            and closed.interval_seconds != self._interval_seconds
+        ):
+            return "wrong_interval"
+        vals = (closed.open, closed.high, closed.low, closed.close, closed.volume)
+        if any(
+            not isinstance(v, (int, float)) or not math.isfinite(float(v))
+            for v in vals
+        ):
+            return "invalid_ohlc"
+        if closed.open <= 0 or closed.close <= 0 or closed.volume < 0:
+            return "invalid_ohlc"
+        if (
+            closed.high < max(closed.open, closed.close)
+            or closed.low > min(closed.open, closed.close)
+            or closed.low > closed.high
+        ):
+            return "invalid_ohlc"
+        if (
+            closed.interval_seconds <= 0
+            or closed.open_time <= 0
+            or closed.open_time % closed.interval_seconds != 0
+        ):
+            return "invalid_timestamp"
+        if closed.close_time > int(now.timestamp()):
+            return "future_timestamp"
+        return None
+
+    def _freshness_rejection(self, now: datetime) -> str | None:
+        """LIVE-03: freshness del market data en el punto de submit (G-MD-D).
+
+        `data_reference_time` = cierre de la ultima vela cerrada
+        (`_last_bar_close_dt`); `now_authoritative` = `now`. Fresh si
+        `now - reference <= data_max_age_s` (configuracion EXISTENTE en
+        `MonitorConfig`; no se inventa un valor nuevo). Fail-closed si no hay
+        referencia valida. Devuelve el motivo de rechazo o `None`.
+        """
+        ref = self._last_bar_close_dt
+        if ref is None:
+            return "no_market_data"
+        age = (now - ref).total_seconds()
+        if age < 0:
+            return "future_market_data"
+        if age > self.monitoring.config.data_max_age_s:
+            return "stale_market_data"
+        return None
+
     def on_closed_bar(self, closed: ClosedBarEvent) -> None:
         """Único punto de entrada: una barra ya cerrada (emisión de B1)."""
+        # LIVE-03: rechazar datos invalidos/futuros ANTES de cualquier
+        # procesamiento: una barra invalida NUNCA debe llegar a submit_order ni
+        # mutar ledger/posicion.
+        rejection = self._bar_rejection_reason(closed, self._clock())
+        if rejection is not None:
+            self._audit_rec(
+                PaperEvent.BAR_SKIPPED,
+                {"reason": rejection, "bar_open_time": closed.open_time},
+            )
+            return
         if (
             self._last_open_time is not None
             and closed.open_time <= self._last_open_time
@@ -306,6 +382,18 @@ class PaperTradingEngine:
         if not self._broker_healthy():
             self._audit_rec(
                 PaperEvent.ENTRY_SKIPPED_BROKER, {"signal_id": pe.cid}
+            )
+            self._pending = None
+            return
+        # LIVE-03: revalidacion EXPLICITA de freshness inmediatamente antes del
+        # submit (G-MD-D/TOCTOU). No depende de `_post_bar`/monitoring/kill switch:
+        # si el dato quedo stale entre la senal y la ejecucion, se bloquea aqui.
+        market_rejection = self._freshness_rejection(now)
+        if market_rejection is not None:
+            self._audit_rec(
+                PaperEvent.RISK_REJECTED,
+                {"signal_id": pe.cid, "reason": market_rejection,
+                 "stage": "market_data_pre_submit"},
             )
             self._pending = None
             return
