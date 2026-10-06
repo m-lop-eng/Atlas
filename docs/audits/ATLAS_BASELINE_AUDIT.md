@@ -97,9 +97,10 @@ en `HEAD = 53625fb`; se conservan como referencia de auditoría):
   productiva) y **F-08-b** (instrument quantity metadata, `INFRASTRUCTURE GAP`).
   - **F-11** — `CONTRACT GAP` (config de producción con `null` **no ejecutable /
   plantilla sin runtime**; el riesgo de arranque inseguro queda refutado en el
-  estado actual). Subfindings: **F-11-a** (superficie de config F-03, `CONTRACT
-  GAP / DEFERRED`), **F-11-b** (validación estructural del bloque `risk`,
-  `CONTRACT GAP`), **F-11-c** (cotas superiores F-03, `CONTRACT GAP — LOW`).
+  estado actual). Subfindings: **F-11-a** (superficie de config F-03,
+  **`CONTRACT FROZEN — READY FOR IMPLEMENTATION`**), **F-11-b** (validación
+  estructural del bloque `risk`, `CONTRACT GAP`), **F-11-c** (cotas superiores
+  F-03, `CONTRACT GAP — LOW`).
   - **margin / correlation** — `INFRASTRUCTURE GAP` (F-03 fase 1 no los modela).
   - **backtest** — fuera de alcance de F-03 (requiere `AccountLedger`/fuente
     equivalente).
@@ -910,18 +911,60 @@ pre-fill con precio de ejecución (`open(t+1)`); projected state desde
   (`config/paper/settings.yaml`) pero **no contiene** los cuatro límites F-03;
   por tanto la superficie de configuración de F-03 es todavía **programática**.
 
-#### F-11-a — F-03 risk-limit configuration surface
+#### F-11-a — F-03 risk-limit configuration surface — **CONTRACT FROZEN — READY FOR IMPLEMENTATION**
 - ID: F-11-a (subfinding separado de F-11).
-- **estado: `CONTRACT GAP / DEFERRED`** — NO implementado.
-- `RiskConfig` ya contiene `max_gross_exposure`, `max_net_exposure`,
-  `max_leverage`, `max_instrument_concentration` (default `None` = gate disabled).
-- El runtime paper/forward real **no los carga desde YAML**: `build_forward_runner`
-  no los transporta; ningún YAML los define.
-- En consecuencia los cuatro gates permanecen `None` y **disabled** salvo
-  construcción **programática** explícita (`RiskEngine(RiskConfig(...))`, como en
-  tests).
-- **No contradice** el contrato congelado de F-03: el **wiring YAML fue diferido
-  expresamente**. No inventar valores por defecto.
+- **estado: `CONTRACT FROZEN — READY FOR IMPLEMENTATION`** — NO implementado.
+- **Alcance**: superficie de configuración de los cuatro límites F-03 para el
+  runtime real de paper/forward: `max_gross_exposure`, `max_net_exposure`,
+  `max_leverage`, `max_instrument_concentration`.
+- **D1 — Ubicación**: los cuatro campos viven bajo `risk:` en
+  `config/paper/settings.yaml` (`risk.max_gross_exposure`,
+  `risk.max_net_exposure`, `risk.max_leverage`,
+  `risk.max_instrument_concentration`). **No** crear secciones paralelas
+  (`exposure:`, `limits:`, `portfolio_risk:`).
+- **D2 — Ausencia / null**: campo **ausente → `None`**; YAML **`null` → `None`**;
+  `None` = **gate disabled**; **`0` NO** significa disabled; negativos, `NaN`,
+  `Inf` y tipos inválidos son **configuración inválida**. No inventar defaults
+  numéricos.
+- **D3 — Paper / forward**: `paper` y `forward/A4` **comparten**
+  `config/paper/settings.yaml`, `build_forward_runner` y `RiskConfig`. Cadena:
+  `config/paper/settings.yaml → build_forward_runner → RiskConfig → RiskEngine →
+  projected pre-fill gates`. **No** existe una segunda configuración de riesgo
+  para forward.
+- **D4 — final_oos**: `config/final_oos/config.yaml` permanece como configuración
+  **frozen OOS/research**; **no** participa en el riesgo operativo de
+  paper/forward; **no** se añaden allí los cuatro límites F-03. Mantener su
+  `config_hash` y responsabilidades sin cambios.
+- **D5 — Backtest**: F-03 projected sigue siendo **paper-only**. Los campos pueden
+  aparecer en un config consumido por `RiskConfig` **sin efecto projected** en
+  backtest; **no** se crea wiring nuevo en `backtesting/`.
+- **D6 — Production YAML**: `config/production/settings.yaml` permanece
+  **template/placeholder**, **fuera** del runtime paper/forward; no se rellena; no
+  se conecta vía `config.loader`. Convertirlo en runtime será un bloque **F-11
+  separado**.
+- **D7 — Validación / ownership**: **`RiskConfig` es la autoridad semántica**. El
+  builder de paper/forward **no inventa defaults**, convierte ausencia/null a
+  `None`, pasa los valores explícitamente cuando existen, y deja que `RiskConfig`
+  rechace valores inválidos. **No** modificar el loader genérico en este paso.
+- **Configuración inválida**:
+  - `risk` ausente → **fail-loud**;
+  - YAML malformado → **fail-loud**;
+  - campo desconocido → **ignorado** (decisión contractual actual);
+  - `null`/ausente → **disabled legítimo**;
+  - `0` → **inválido**;
+  - negativo → **inválido**;
+  - `NaN`/`Inf` → **inválido**;
+  - tipo incorrecto → **inválido**.
+- **Tabla contractual**:
+
+  | Campo | YAML path | Tipo | Unidad | None/ausente | Validación | Runtime |
+  |---|---|---|---|---|---|---|
+  | `max_gross_exposure` | `risk.max_gross_exposure` | float | USD | disabled | >0 y finito | paper/forward |
+  | `max_net_exposure` | `risk.max_net_exposure` | float | USD | disabled | >0 y finito | paper/forward |
+  | `max_leverage` | `risk.max_leverage` | float | ratio | disabled | >0 y finito | paper/forward |
+  | `max_instrument_concentration` | `risk.max_instrument_concentration` | float | fracción de equity | disabled | >0 y finito | paper/forward |
+
+- **Cotas superiores**: **fuera** de este contrato; pertenecen a **F-11-c**.
 
 #### F-11-b — risk block structural validation
 - ID: F-11-b (subfinding separado de F-11).
@@ -948,7 +991,8 @@ pre-fill con precio de ejecución (`open(t+1)`); projected state desde
 1. `config/production/settings.yaml`: **template no ejecutable** vs convertirlo en
    **runtime real**.
 2. Si se decide runtime real: **endurecer el loader** y definir **fail-closed**.
-3. **Wiring de los límites F-03** a paper/forward (F-11-a).
+3. **Wiring de los límites F-03** a paper/forward (F-11-a): **contrato congelado**
+   (`CONTRACT FROZEN — READY FOR IMPLEMENTATION`); pendiente solo su implementación.
 4. **Contrato de límites superiores**, especialmente `concentration` (F-11-c).
 5. **Política exacta de validación estructural** del bloque `risk` (F-11-b).
 
