@@ -106,11 +106,10 @@ en `HEAD = 53625fb`; se conservan como referencia de auditoría):
   - **margin / correlation** — `INFRASTRUCTURE GAP` (F-03 fase 1 no los modela).
   - **backtest** — fuera de alcance de F-03 (requiere `AccountLedger`/fuente
     equivalente).
-  - **F-06-RECOVERY** (`CONTRACT GAP — DEFERRED UNTIL LOAD_SNAPSHOT HAS A
-    PRODUCTION ROLE`): gap de recovery **solo** en `load_snapshot()` (sin caller
-    de producción; A4/streaming recupera por replay). `UNKNOWN` ya es transient
-    (S-04-a); el gap es de persistencia del estado operativo + adopción de fills,
-    **no** de terminalidad. Ver F-06-RECOVERY.
+  - **F-06-RECOVERY** — **`CLOSED — REFUTED`**: `snapshot()/load_snapshot()` es
+    **API de soporte/test**; el recovery productivo es **replay** de `bars.jsonl`
+    (`ForwardRunner.start()`); `load_snapshot()` no es mecanismo de recovery
+    operativo. Ver F-06-RECOVERY.
 - Nota: la sección «Test Baseline» y las líneas de evidencia por-finding
   (`798/807/817/833/845 passed`) son **históricas** y documentan cuándo se cerró
   cada hallazgo; no describen el estado actual.
@@ -587,15 +586,30 @@ pre-fill con precio de ejecución (`open(t+1)`); projected state desde
   (consistente→MATCH / divergente→MISMATCH) cubiertos por tests.
 - **RESOLVED.** Deuda I2/I3/I4/I5/I6 sigue **fuera** de F-06 (no bloqueante).
 
-### F-06-RECOVERY — gap de recovery `load_snapshot` (ledger↔broker tras restart) — **CONTRACT GAP — DEFERRED UNTIL LOAD_SNAPSHOT HAS A PRODUCTION ROLE**
+### F-06-RECOVERY — gap de recovery `load_snapshot` (ledger↔broker tras restart) — **CLOSED — REFUTED**
 - ID: F-06-RECOVERY (subfinding posterior a F-06C; **no** reabre F-06C).
-- **estado: `CONTRACT GAP — DEFERRED UNTIL LOAD_SNAPSHOT HAS A PRODUCTION ROLE`**
-  (HEAD `1d26304`). NO implementado.
-- **Alcance**: el gap es real **únicamente** en `PaperTradingEngine.load_snapshot()`.
-  `load_snapshot()` **no tiene caller de producción** hoy (solo tests:
-  `test_paper_trading`, `test_broker_restart`, `test_account_reconciliation`), por
-  lo que **no existe un camino productivo actual** que arranque desde ese snapshot
-  y pierda fills. **No es un `IMPLEMENTATION BUG` productivo.**
+- **estado: `CLOSED — REFUTED`** (HEAD `e4d6f99`). No existe production role; el
+  recovery productivo actual es **replay**.
+- **Decisión contractual ratificada**:
+  > `PaperTradingEngine.snapshot()/load_snapshot()` es una **API de soporte/test**.
+  > `snapshot()` también se escribe como **artefacto de lineage** en A4/streaming,
+  > pero `load_snapshot()` **no** es un mecanismo de recovery operativo. El recovery
+  > productivo actual es **replay de `bars.jsonl`** mediante
+  > `ForwardRunner.start()`, que reconstruye broker y ledger juntos.
+  > `load_snapshot()` **no garantiza** recuperación de órdenes operativas, adopción
+  > de fills, ni persistencia de `OrderManager`, `_pending` o `_pending_resolution`;
+  > **no sustituye al replay**. Las invariantes de **F-06C** siguen vigentes para la
+  > **consistencia del snapshot**. Convertir `load_snapshot()` en recovery operativo
+  > requeriría un **contrato separado**.
+- **Distinción producción**: `snapshot()` producción = **artefacto** (lineage/estado);
+  `load_snapshot()` producción = **no usado**; **replay = recovery productivo**. Las
+  divergencias de `OrderManager`/pending tras `load_snapshot()` **no** son
+  production bug (capacidad no contratada).
+- **Evidencia**: `load_snapshot()` del engine tiene **cero callers productivos** (solo
+  `test_paper_trading`, `test_broker_restart`, `test_account_reconciliation`);
+  `snapshot()` es invocado por `forward_runner._write_snapshot` (`snapshot.json`)
+  como artefacto; el restart de A4/streaming reproduce `bars.jsonl`. **No es un
+  `IMPLEMENTATION BUG` productivo.**
 - **Separación respecto a F-06C**: **F-06C permanece `CLOSED`.** Sus invariantes
   siguen intactas y verificadas en `engine.snapshot()`/`load_snapshot()`:
   - snapshot **envelope**;
@@ -628,16 +642,20 @@ pre-fill con precio de ejecución (`open(t+1)`); projected state desde
   `UNKNOWN → SUBMITTED/PARTIALLY_FILLED/FILLED/REJECTED/CANCELLED`), pero **no**
   cablea el persistir/restaurar ni el disparador de lookup.
 - **No confundir** `reconciliation detects discrepancy` con
-  `recovery adopts broker state`: hoy reconciliation **detecta y bloquea**, pero
-  **nadie** aplica el fill al ledger en la ruta `load_snapshot`.
-- **Decisiones futuras (no elegidas todavía)**:
-  1. ¿`load_snapshot()` será una ruta de **producción** o solo **test/support**?
-  2. Si será productiva: qué **estado operativo** persistir; qué **pending**
-     persistir; cómo recuperar `UNKNOWN`; **quién** adopta fills y **cuándo**;
-     cómo garantizar **idempotencia** (`(client_order_id, fill_sequence)`); cómo
-     tratar **divergencias**.
-  3. Si **no** será productiva: documentarlo explícitamente y **no** tratar este
-     gap como production blocker.
+  `recovery adopts broker state`: en la ruta `load_snapshot` reconciliation
+  **detecta y bloquea**, pero **no** adopta; en producción el replay evita el
+  problema.
+- **Decisión RESUELTA**: `load_snapshot()` = **test/support only** (no recovery
+  operativo). **NO** se persigue la Opción B; si algún día se quisiera
+  `load_snapshot` como mecanismo operativo, sería un **contrato separado**
+  (persistencia de `OrderManager`/`_pending`/`_pending_resolution`, recuperación de
+  `UNKNOWN`, adopción de fills, idempotencia `(client_order_id, fill_sequence)`,
+  política de divergencia, autoridad durante restart). **No** es production blocker.
+- **Nota de docstring (hardening/documentation cleanup separado, NO finding
+  funcional)**: el docstring de `snapshot()` ("Estado serializable JSON para
+  **restart** sin duplicar exposición") es **impreciso** respecto al recovery
+  productivo actual (que es **replay**). Corregir el docstring, si se desea, es un
+  cleanup separado; **no** abre un finding funcional.
 
 ### F-07 — `OrderManager` admite transiciones de estado inválidas — **CLOSED** (excepción `UNKNOWN` resuelta en S-04-a)
 - ID: F-07
@@ -1272,9 +1290,9 @@ pre-fill con precio de ejecución (`open(t+1)`); projected state desde
 7. **F-08 sizing entero/`quantity_step`** — **`CONTRACT GAP — NOT APPLICABLE TO
    CURRENT INSTRUMENT CONTRACT`** (preventivo; sin bug actual; ver F-08).
 8. **margin / correlation (F-03)** — **ABIERTO** (`INFRASTRUCTURE GAP`).
-9. **F-06-RECOVERY** (`load_snapshot` recovery gap) — **ABIERTO** (`CONTRACT GAP —
-   DEFERRED UNTIL LOAD_SNAPSHOT HAS A PRODUCTION ROLE`; sin caller de producción
-   hoy; no es production blocker. Ver F-06-RECOVERY).
+9. **F-06-RECOVERY** (`load_snapshot` recovery gap) — **`CLOSED — REFUTED`**
+   (`snapshot()/load_snapshot()` = API de soporte/test; recovery productivo =
+   **replay**; no production blocker). Ver F-06-RECOVERY.
 
 ## Research Status
 
@@ -1329,8 +1347,8 @@ contrato de instrumentos actual) y **F-08-b** (`INFRASTRUCTURE GAP`); **F-08-a**
 queda **`CLOSED — REFUTED`** (sin ruta productiva); **F-11** = **`CLOSED —
 REFUTED`** (su subfinding **F-11-b** permanece como `CONTRACT GAP — NO CURRENT
 OPERATIONAL IMPACT` / futuro); **margin/correlation (F-03)**, **backtest fuera de
-alcance (F-03)**, **F-06-RECOVERY** (`load_snapshot`, `CONTRACT GAP — DEFERRED
-UNTIL LOAD_SNAPSHOT HAS A PRODUCTION ROLE`), y deuda no bloqueante
+alcance (F-03)**; **F-06-RECOVERY** = **`CLOSED — REFUTED`** (recovery productivo
+= replay; `load_snapshot` = test/support), y deuda no bloqueante
 **I2/I3/I4/I5/I6** (ver F-06).
 
 ---
@@ -1350,8 +1368,8 @@ UNTIL LOAD_SNAPSHOT HAS A PRODUCTION ROLE`), y deuda no bloqueante
   template/sin runtime, no un bug de runtime; su **F-11-b** permanece como
   contrato futuro); permanecen **F-08** (`CONTRACT GAP` preventivo, no aplicable
   al contrato de instrumentos actual) y **margin/correlation
-  (`INFRASTRUCTURE GAP`)**; **F-06-RECOVERY** abierto (`load_snapshot`,
-  `CONTRACT GAP`; sin caller de producción, no production blocker).
+  (`INFRASTRUCTURE GAP`)**; **F-06-RECOVERY** = **`CLOSED — REFUTED`** (recovery
+  productivo = replay; `load_snapshot` = test/support; no production blocker).
 - **Production readiness**: **NO** — sin broker real (por diseño), sin
   margin/correlation, sin config de producción ejecutable (por diseño;
   `config/production/settings.yaml` es template/no-runtime; F-11 = `CLOSED —
