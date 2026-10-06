@@ -101,7 +101,7 @@ en `HEAD = 53625fb`; se conservan como referencia de auditoría):
   **`IMPLEMENTED`**: los 4 límites configurables vía `config/paper/settings.yaml`),
   **F-11-b** (validación estructural del bloque `risk`, **`CONTRACT GAP — NO
   CURRENT OPERATIONAL IMPACT`**; subfindings **F-11-b-1/-2/-3**), **F-11-c** (cotas
-  superiores F-03, `CONTRACT GAP — LOW`).
+  superiores F-03, **`CLOSED — REFUTED`**).
   - **margin / correlation** — `INFRASTRUCTURE GAP` (F-03 fase 1 no los modela).
   - **backtest** — fuera de alcance de F-03 (requiere `AccountLedger`/fuente
     equivalente).
@@ -968,7 +968,8 @@ pre-fill con precio de ejecución (`open(t+1)`); projected state desde
   | `max_leverage` | `risk.max_leverage` | float | ratio | disabled | >0 y finito | paper/forward |
   | `max_instrument_concentration` | `risk.max_instrument_concentration` | float | fracción de equity | disabled | >0 y finito | paper/forward |
 
-- **Cotas superiores**: **fuera** de este contrato; pertenecen a **F-11-c**.
+- **Cotas superiores**: **fuera** de este contrato; **F-11-c** = `CLOSED — REFUTED`
+  (no existe upper bound universal exigible).
 
 #### F-11-b — risk block structural validation — **CONTRACT GAP — NO CURRENT OPERATIONAL IMPACT**
 - ID: F-11-b (subfinding separado de F-11).
@@ -1037,14 +1038,33 @@ pre-fill con precio de ejecución (`open(t+1)`); projected state desde
 4. endurecimiento del **loader** si algún día se convierte en runtime;
 5. relación con **F-11 production runtime** (F-11-b-3).
 
-#### F-11-c — upper bounds for F-03 risk limits
+#### F-11-c — upper bounds for F-03 risk limits — **CLOSED — REFUTED**
 - ID: F-11-c (subfinding separado de F-11).
-- **estado: `CONTRACT GAP — LOW`** — NO implementado.
-- `RiskConfig` valida **finitud y positividad** de los nuevos límites; **no**
-  define **cotas superiores** contractuales.
-- **No está ratificado** si deben existir ni cuáles serían; **no** afirmar que
-  valores `> 1` sean inválidos sin una decisión de dominio.
-- Posponer la decisión hasta el contrato/configuración formal de estos límites.
+- **estado: `CLOSED — REFUTED`** (HEAD `9da7067`).
+- **Conclusión**: los cuatro límites (`max_gross_exposure`, `max_net_exposure`,
+  `max_leverage`, `max_instrument_concentration`) admiten actualmente `None` **o**
+  un **valor finito positivo**; **no existe un upper bound universal exigible por
+  el contrato actual**.
+  - Gross/net son límites **absolutos en USD** y pueden **superar equity**.
+  - Leverage es **context-specific** según `03_RISK_MANAGEMENT.md §19`
+    (account/instrument/strategy/broker/prop firm), no universal.
+  - Concentration está definida como `abs(exposure_i) / equity` y **puede ser
+    `> 1`** cuando existe leverage.
+  - **No** existe ninguna relación contractual obligatoria entre los cuatro
+    límites (no se asume `net <= gross`, `gross/equity <= leverage`, ni
+    `concentration <= 1`).
+- **Seguridad / operabilidad**:
+  - `None` = gate **disabled**; un **valor grande** = gate **activo pero
+    permisivo** (no es lo mismo que disabled).
+  - La ausencia de upper bound **no** implica por sí misma bug, overflow, ni
+    aceptación de `NaN`/`Inf`: `RiskConfig` ya rechaza valores **no finitos o no
+    positivos** (`None` o `> 0` finito).
+  - Un límite permisivo es **política operativa** (qué valores configurar), no un
+    defecto de validación.
+- **F-11-c-concentration (nota conceptual, no finding abierto)**: la pregunta
+  "(0,1]" **no aplica** a la métrica actual. Cambiar a `abs(exposure_i) / gross`
+  sería una **métrica distinta** (`share-of-gross`) y requeriría **otro contrato**;
+  **no** se decide ni implementa esa alternativa ahora.
 
 #### Decisiones humanas pendientes (F-11)
 1. `config/production/settings.yaml`: **template no ejecutable** vs convertirlo en
@@ -1052,7 +1072,9 @@ pre-fill con precio de ejecución (`open(t+1)`); projected state desde
 2. Si se decide runtime real: **endurecer el loader** y definir **fail-closed**.
 3. **Wiring de los límites F-03** a paper/forward (F-11-a): **`IMPLEMENTED`**
    (configurable vía `config/paper/settings.yaml`).
-4. **Contrato de límites superiores**, especialmente `concentration` (F-11-c).
+4. **Contrato de límites superiores** (F-11-c): **`CLOSED — REFUTED`** (no existe
+   upper bound universal exigible; la métrica actual de `concentration` no está
+   acotada por 1). Nota conceptual `share-of-gross` fuera de alcance.
 5. **Política exacta de validación estructural** del bloque `risk` (F-11-b;
    subfindings **F-11-b-1/-2/-3**).
 
