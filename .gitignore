@@ -29,6 +29,8 @@ data/processed/
 
 # Secretos y credenciales
 .env
+.env.*
+!.env.example
 *.env.local
 .credentials*
 
