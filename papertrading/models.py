@@ -107,6 +107,8 @@ class PaperEngineConfig:
 
     account_id: str = "PAPER-01"
     instrument: str = "BTCUSDT"
+    # LIVE-06: moneda canonica de la cuenta (moneda unica, Fase 1 = USD).
+    currency: str = "USD"
     point_value: float = 1.0
     min_size: float = 0.0
     max_bars_in_trade: int | None = None

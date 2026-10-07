@@ -55,6 +55,7 @@ def broker_state_from_adapter(
                 state=o.state.value,
                 filled_quantity=o.filled_quantity,
                 avg_fill_price=o.avg_fill_price,
+                broker_order_id=o.broker_order_id,
             )
             for o in adapter.get_open_orders()
         )
@@ -93,6 +94,7 @@ def broker_state_from_adapter(
             account_id=account_state.account_id,
             cash=account_state.cash,
             equity=account_state.equity,
+            currency=account_state.currency,
         )
         return BrokerSnapshot(
             orders=orders,
@@ -149,6 +151,7 @@ def resolve_unknown_orders(
                     state=authoritative.state.value,
                     filled_quantity=authoritative.filled_quantity,
                     avg_fill_price=authoritative.avg_fill_price,
+                    broker_order_id=authoritative.broker_order_id,
                 )
             )
             if authoritative.fills:

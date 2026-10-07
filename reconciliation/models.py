@@ -76,7 +76,12 @@ class Domain(str, Enum):
 
 @dataclass(frozen=True, slots=True)
 class OrderSnapshot:
-    """Vista mínima de una orden para comparar (client_order_id como clave)."""
+    """Vista mínima de una orden para comparar (client_order_id como clave).
+
+    `client_order_id` es la identidad ESTABLE de la orden. `broker_order_id` es
+    el id observado del broker (LIVE-06); se compara cuando AMBOS lados lo
+    proporcionan (si falta en uno, no se marca mismatch artificial).
+    """
 
     client_order_id: str
     instrument: str
@@ -84,6 +89,7 @@ class OrderSnapshot:
     state: str
     filled_quantity: float = 0.0
     avg_fill_price: float | None = None
+    broker_order_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -111,11 +117,16 @@ class PositionSnapshot:
 
 @dataclass(frozen=True, slots=True)
 class AccountSnapshot:
-    """Vista mínima de la cuenta (cash/equity)."""
+    """Vista mínima de la cuenta (cash/equity/currency).
+
+    `currency` (LIVE-06) es la moneda de la cuenta; se compara solo si AMBOS
+    lados la proporcionan (None => no comparable, sin falso positivo).
+    """
 
     account_id: str
     cash: float
     equity: float
+    currency: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

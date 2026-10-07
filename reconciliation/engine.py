@@ -202,6 +202,26 @@ class ReconciliationEngine:
                 )
                 continue
 
+            # LIVE-06: identidad observada. `client_order_id` es la clave; el
+            # `broker_order_id` se compara SOLO si ambos lados lo conocen (si
+            # falta en uno, no se marca mismatch artificial).
+            if (
+                order.broker_order_id is not None
+                and broker_order.broker_order_id is not None
+                and order.broker_order_id != broker_order.broker_order_id
+            ):
+                diffs.append(
+                    DiffItem(
+                        domain=Domain.ORDER,
+                        key=f"{key}/broker_order_id",
+                        classification=DiscrepancyClass.MISMATCH,
+                        detail="broker_order_id divergente (identity mismatch)",
+                        internal_value=order.broker_order_id,
+                        broker_value=broker_order.broker_order_id,
+                    )
+                )
+                continue
+
             diffs.append(
                 DiffItem(
                     domain=Domain.ORDER,
@@ -459,6 +479,26 @@ class ReconciliationEngine:
                         broker_value=brk_val,
                     )
                 )
+        # LIVE-06: moneda de la cuenta. Se compara SOLO si ambos lados la
+        # proporcionan (None => no comparable, sin falso positivo). Un mismatch
+        # de moneda es critico (bloquea nuevas entradas); NO se adopta la moneda
+        # observada como nueva moneda interna.
+        if (
+            internal.account.currency is not None
+            and broker.account.currency is not None
+            and internal.account.currency != broker.account.currency
+        ):
+            aligned = False
+            diffs.append(
+                DiffItem(
+                    domain=Domain.ACCOUNT,
+                    key="account/currency",
+                    classification=DiscrepancyClass.MISMATCH,
+                    detail="moneda de cuenta divergente",
+                    internal_value=internal.account.currency,
+                    broker_value=broker.account.currency,
+                )
+            )
         if aligned:
             diffs.append(
                 DiffItem(

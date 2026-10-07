@@ -145,10 +145,16 @@ class AccountLedger:
             raise LedgerError(f"side invalido: {side!r}")
         q = float(quantity)
         p = float(price)
+        c = float(commission)
         if q != q or p != p or q <= 0 or p <= 0:  # NaN/<=0
             raise LedgerError(
                 f"fill invalido: quantity={quantity!r} price={price!r}"
             )
+        # LIVE-06: commission = importe monetario (moneda de cuenta), finito y
+        # no negativo. Es un COSTE que reduce cash (afecta equity); no altera el
+        # avg_entry ni el realized P&L (gross, por precio).
+        if not math.isfinite(c) or c < 0:
+            raise LedgerError(f"commission invalida: {commission!r}")
 
         key = (client_order_id, int(fill_sequence))
         if key in self._applied_fills:
@@ -161,6 +167,9 @@ class AccountLedger:
             self._cash -= q * p
         else:
             self._cash += q * p
+        # LIVE-06: la comision se aplica EXACTAMENTE UNA VEZ por fill (dentro del
+        # guard de idempotencia). Un coste siempre reduce cash.
+        self._cash -= c
 
         pos = self._positions.get(instrument)
         if pos is None:

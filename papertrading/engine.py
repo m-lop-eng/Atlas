@@ -677,7 +677,9 @@ class PaperTradingEngine:
                     price=float(f.price),
                     client_order_id=cid,
                     fill_sequence=seq,
-                    commission=0.0,
+                    # LIVE-06: commission OBSERVADA del fill (importe monetario);
+                    # antes se descartaba (0.0). Idempotente por (cid, seq).
+                    commission=float(getattr(f, "commission", 0.0) or 0.0),
                 )
         already = all_applied
         after = self._ledger.position(order.instrument)
@@ -1014,6 +1016,8 @@ class PaperTradingEngine:
                     state=o.status.value,
                     filled_quantity=o.fill_quantity,
                     avg_fill_price=o.average_fill_price,
+                    # LIVE-06: id observado del broker (None hasta conocerlo).
+                    broker_order_id=o.broker_order_id,
                 )
             )
             fl = self._order_fills.get(o.client_order_id, ())
@@ -1047,7 +1051,9 @@ class PaperTradingEngine:
             None
             if val is None
             else AccountSnapshot(
-                self.config.account_id, self._ledger.cash, val.equity
+                self.config.account_id, self._ledger.cash, val.equity,
+                # LIVE-06: moneda canonica esperada (config; NO del broker).
+                currency=self.config.currency,
             )
         )
         return InternalSnapshot(
