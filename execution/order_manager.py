@@ -223,6 +223,17 @@ class OrderManager:
     def cancel(self, order_id: str) -> Order:
         return self._transition(order_id, OrderStatus.CANCELLED)
 
+    def mark_unknown(self, order_id: str) -> Order:
+        """Marca una orden enviada como UNKNOWN (resultado no determinable).
+
+        LIVE-07: tras un submit cuya respuesta se pierde, el estado interno debe
+        reflejar la incertidumbre (`OrderStatus.UNKNOWN`, transitorio; S-04-a)
+        para que Monitoring/EXECUTION y la reconciliacion la OBSERVEN. NO es una
+        transicion terminal: solo se sale por resolución explicita del broker
+        (`submit`/`cancel`/`reject`/`apply_fill`), nunca por reenvio ciego.
+        """
+        return self._transition(order_id, OrderStatus.UNKNOWN)
+
     def reject(self, order_id: str, reason: str) -> Order:
         order = self._transition(order_id, OrderStatus.REJECTED)
         updated = replace(order, reject_reason=reason)

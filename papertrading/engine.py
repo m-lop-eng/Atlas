@@ -477,6 +477,12 @@ class PaperTradingEngine:
                 {"signal_id": pe.cid, "order_id": order.order_id, "detail": sub.detail},
             )
         elif sub.status is SubmitStatus.UNKNOWN:
+            # LIVE-07 (recovery): la incertidumbre del submit debe reflejarse en
+            # el estado INTERNO de la orden (UNKNOWN transitorio, S-04-a). Asi
+            # Monitoring/EXECUTION la observa (>0 UNKNOWN => no autoriza) y la
+            # reconciliacion la trata como UNKNOWN (no MISSING_BROKER). NO hay
+            # resubmit ciego: la unica salida es la resolucion por lookup.
+            self.order_manager.mark_unknown(order.order_id)
             self._pending_resolution.add(pe.cid)
             self._audit_rec(
                 PaperEvent.SUBMISSION_UNKNOWN,
@@ -990,17 +996,47 @@ class PaperTradingEngine:
             self._pending_resolution.discard(cid)
             # LIVE-02: registrar el id del broker al resolver por lookup.
             self._record_broker_order_id(cid, getattr(bro, "broker_order_id", None))
-            if bro.fills:
+            order = next(
+                (
+                    o
+                    for o in self.order_manager.orders.values()
+                    if o.client_order_id == cid
+                ),
+                None,
+            )
+            has_fill = bool(bro.fills) or float(
+                getattr(bro, "filled_quantity", 0.0) or 0.0
+            ) > 0
+            if has_fill:
                 self._apply_fills(cid, bro, self._clock())
                 self._audit_rec(
                     PaperEvent.SUBMISSION_RESOLVED,
                     {"signal_id": cid, "broker_state": bro.state.value},
                 )
-            elif bro.state is BrokerOrderState.REJECTED or bro.state is BrokerOrderState.CANCELLED:
+            elif bro.state is BrokerOrderState.REJECTED:
+                # LIVE-07: fijar el estado interno desde la verdad del broker.
+                # UNKNOWN es transitorio; NUNCA se infiere localmente REJECTED ni
+                # CANCELLED por ausencia de respuesta.
+                if order is not None and order.status is OrderStatus.UNKNOWN:
+                    self.order_manager.reject(
+                        order.order_id,
+                        bro.reject_reason or "rechazada por broker",
+                    )
                 self._audit_rec(
                     PaperEvent.ENTRY_REJECTED_BROKER,
                     {"signal_id": cid, "broker_state": bro.state.value},
                 )
+            elif bro.state is BrokerOrderState.CANCELLED:
+                if order is not None and order.status is OrderStatus.UNKNOWN:
+                    self.order_manager.cancel(order.order_id)
+                self._audit_rec(
+                    PaperEvent.ENTRY_REJECTED_BROKER,
+                    {"signal_id": cid, "broker_state": bro.state.value},
+                )
+            elif bro.state is BrokerOrderState.SUBMITTED:
+                # Broker confirma la orden viva y sin fills: UNKNOWN -> SUBMITTED.
+                if order is not None and order.status is OrderStatus.UNKNOWN:
+                    self.order_manager.submit(order.order_id)
 
     # -------------------------------------------------------- reconciliación
 
