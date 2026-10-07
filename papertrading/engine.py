@@ -39,6 +39,11 @@ from brokers.models import (
 )
 from brokers.paper import BrokerSnapshotError
 from execution.order import Fill, OrderSide, OrderStatus, OrderType
+from execution.intent_journal import (
+    IntentJournal,
+    IntentJournalError,
+    OrderIntent,
+)
 from execution.order_manager import OrderManager, OrderStateError
 from killswitches.coordinator import KillSwitchCoordinator
 from live.events import ClosedBarEvent
@@ -117,6 +122,7 @@ class PaperTradingEngine:
         config: PaperEngineConfig | None = None,
         initial_cash: float | None = None,
         ledger: "AccountLedger | None" = None,
+        intent_journal: "IntentJournal | None" = None,
     ) -> None:
         if not hasattr(broker, "price_source"):
             raise TypeError(
@@ -147,6 +153,12 @@ class PaperTradingEngine:
                     "del broker."
                 )
             self._ledger = AccountLedger(initial_cash=initial_cash)
+
+        # LIVE-08: journal write-ahead de intents (opcional). None = paper/A4
+        # sin persistencia (comportamiento intacto). Cuando se inyecta, el
+        # intent se persiste ANTES de `broker.submit_order` y es la autoridad
+        # de "que intent existio" (evita resubmit tras restart).
+        self._intents = intent_journal
 
         self._bars: list[dict[str, Any]] = []
         self._audit: list[PaperAuditEntry] = []
@@ -231,6 +243,11 @@ class PaperTradingEngine:
     def ledger(self) -> AccountLedger:
         """Autoridad interna contable (F-06A)."""
         return self._ledger
+
+    @property
+    def intent_journal(self) -> "IntentJournal | None":
+        """Journal write-ahead de intents (LIVE-08), o None si no se inyecto."""
+        return self._intents
 
     @property
     def realized_pnl(self) -> float:
@@ -437,6 +454,14 @@ class PaperTradingEngine:
         signal = pe.signal
         side = OrderSide.BUY if signal.action is Action.LONG else OrderSide.SELL
         self._set_price(float(bar["open"]))
+        # LIVE-08: si el intent ya esta persistido (p.ej. replay/restart), NO se
+        # recrea ni reenvia: la resolucion la decide el broker via recovery.
+        if self._intents is not None and self._intents.get(pe.cid) is not None:
+            self._audit_rec(
+                PaperEvent.ENTRY_SKIPPED_BROKER,
+                {"signal_id": pe.cid, "detail": "intent ya persistido (no resubmit)"},
+            )
+            return
         try:
             order = self.order_manager.create_order(
                 strategy_id=signal.strategy_id,
@@ -454,6 +479,23 @@ class PaperTradingEngine:
             # Idempotencia B7: el cid ya existe -> no duplicar exposición.
             self._audit_rec(PaperEvent.ENTRY_SKIPPED_KILL_SWITCH, {"signal_id": pe.cid})
             return
+        # LIVE-08: WRITE-AHEAD. El intent se persiste (durable) ANTES de enviar
+        # al broker. Si la persistencia falla => NO submit (fail-closed).
+        if self._intents is not None:
+            try:
+                self._intents.begin(
+                    OrderIntent.from_order(order, run_id=self.run_id)
+                )
+            except IntentJournalError as exc:
+                self.order_manager.reject(
+                    order.order_id, f"intent persist failed: {exc}"
+                )
+                self._audit_rec(
+                    PaperEvent.BROKER_ERROR,
+                    {"signal_id": pe.cid, "order_id": order.order_id,
+                     "detail": "intent persist failed: no submit"},
+                )
+                return
         self.order_manager.approve(order.order_id)
         self.order_manager.submit(order.order_id)
         self._signed.add(pe.cid)
@@ -469,9 +511,12 @@ class PaperTradingEngine:
         sub = self.broker.submit_order(order)
         self._note_broker_success(now)
         if sub.status is SubmitStatus.CONFIRMED and sub.broker_order is not None:
+            self._journal_broker_state(pe.cid, sub.broker_order)
             self._apply_fills(pe.cid, sub.broker_order, now)
         elif sub.status is SubmitStatus.REJECTED:
             self.order_manager.reject(order.order_id, sub.detail or "rechazada")
+            if self._intents is not None:
+                self._intents.mark_state(pe.cid, "REJECTED")
             self._audit_rec(
                 PaperEvent.ENTRY_REJECTED_BROKER,
                 {"signal_id": pe.cid, "order_id": order.order_id, "detail": sub.detail},
@@ -484,6 +529,8 @@ class PaperTradingEngine:
             # resubmit ciego: la unica salida es la resolucion por lookup.
             self.order_manager.mark_unknown(order.order_id)
             self._pending_resolution.add(pe.cid)
+            if self._intents is not None:
+                self._intents.mark_state(pe.cid, "UNKNOWN")
             self._audit_rec(
                 PaperEvent.SUBMISSION_UNKNOWN,
                 {"signal_id": pe.cid, "order_id": order.order_id},
@@ -540,6 +587,24 @@ class PaperTradingEngine:
             signal_id=pos.cid,
             reduce_only=True,
         )
+        # LIVE-08: write-ahead del intent de salida ANTES del submit. Un fallo de
+        # persistencia NO envia: fail-closed (la posicion sigue abierta y el
+        # sistema queda bloqueado por monitoring/reconciliation).
+        if self._intents is not None:
+            try:
+                self._intents.begin(
+                    OrderIntent.from_order(order, run_id=self.run_id)
+                )
+            except IntentJournalError as exc:
+                self.order_manager.reject(
+                    order.order_id, f"intent persist failed: {exc}"
+                )
+                self._audit_rec(
+                    PaperEvent.BROKER_ERROR,
+                    {"position_id": pos.cid, "exit_cid": exit_cid,
+                     "detail": "intent persist failed: no submit"},
+                )
+                return
         self.order_manager.approve(order.order_id)
         self.order_manager.submit(order.order_id)
         self._signed.add(exit_cid)
@@ -555,6 +620,7 @@ class PaperTradingEngine:
         sub = self.broker.submit_order(order)
         self._note_broker_success(now)
         if sub.status is SubmitStatus.CONFIRMED and sub.broker_order is not None:
+            self._journal_broker_state(exit_cid, sub.broker_order)
             self._apply_fills(exit_cid, sub.broker_order, now)
             trade = self._trades[-1]
             self._audit_rec(
@@ -593,6 +659,19 @@ class PaperTradingEngine:
         )
         if order is not None:
             self.order_manager.set_broker_order_id(order.order_id, broker_order_id)
+
+    def _journal_broker_state(self, cid: str, broker_order) -> None:
+        """LIVE-08: sincroniza estado/id observado del broker en el journal."""
+        if self._intents is None or self._intents.get(cid) is None:
+            return
+        state = getattr(broker_order, "state", None)
+        if state is None:
+            return
+        self._intents.mark_state(
+            cid,
+            getattr(state, "value", str(state)),
+            broker_order_id=getattr(broker_order, "broker_order_id", None),
+        )
 
     def _apply_fills(self, cid: str, broker_order, now: datetime) -> None:
         order = next(
@@ -652,6 +731,14 @@ class PaperTradingEngine:
             PaperEvent.EXIT_FILLED if is_exit else PaperEvent.ENTRY_FILLED, refs
         )
         self._apply_fill_to_ledger(order, cid, fills, vwap, qty, fill_ts)
+        # LIVE-08: persistir identidades de fill `(cid, seq)` para que la
+        # idempotencia sobreviva a un restart (L-PERSIST-8).
+        if self._intents is not None and self._intents.get(cid) is not None:
+            self._journal_broker_state(cid, broker_order)
+            for i, f in enumerate(fills):
+                self._intents.record_fill(
+                    cid, int(getattr(f, "fill_sequence", i))
+                )
 
     def _apply_fill_to_ledger(
         self, order, cid: str, fills: list, vwap: float, qty: float, at: datetime
@@ -1022,6 +1109,7 @@ class PaperTradingEngine:
                         order.order_id,
                         bro.reject_reason or "rechazada por broker",
                     )
+                self._journal_broker_state(cid, bro)
                 self._audit_rec(
                     PaperEvent.ENTRY_REJECTED_BROKER,
                     {"signal_id": cid, "broker_state": bro.state.value},
@@ -1029,6 +1117,7 @@ class PaperTradingEngine:
             elif bro.state is BrokerOrderState.CANCELLED:
                 if order is not None and order.status is OrderStatus.UNKNOWN:
                     self.order_manager.cancel(order.order_id)
+                self._journal_broker_state(cid, bro)
                 self._audit_rec(
                     PaperEvent.ENTRY_REJECTED_BROKER,
                     {"signal_id": cid, "broker_state": bro.state.value},
@@ -1037,6 +1126,7 @@ class PaperTradingEngine:
                 # Broker confirma la orden viva y sin fills: UNKNOWN -> SUBMITTED.
                 if order is not None and order.status is OrderStatus.UNKNOWN:
                     self.order_manager.submit(order.order_id)
+                self._journal_broker_state(cid, bro)
 
     # -------------------------------------------------------- reconciliación
 
