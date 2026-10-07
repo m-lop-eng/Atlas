@@ -23,6 +23,12 @@ dev = [
 streaming = [
     "websocket-client>=1.6",
 ]
+# LIVE-09: MetaTrader5 official Python integration. Optional: only required to
+# run the real MT5BrokerAdapter. The PyPI wheel targets CPython 3.12 Windows
+# x86-64; the offline test suite never imports it (dependency is isolated).
+mt5 = [
+    "MetaTrader5>=5.0.45",
+]
 
 [tool.setuptools.packages.find]
 include = [

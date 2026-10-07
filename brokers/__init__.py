@@ -21,6 +21,14 @@ from .models import (
 )
 from .paper import PaperBrokerAdapter
 from .reconcile import is_uncertain, resolve_order
+from .mt5 import (
+    MT5BrokerAdapter,
+    MT5Config,
+    MT5ConfigError,
+    MT5Credentials,
+    MT5Environment,
+    MT5SymbolSpec,
+)
 
 __all__ = [
     "AccountState",
@@ -30,6 +38,12 @@ __all__ = [
     "BrokerOrder",
     "BrokerOrderState",
     "BrokerConnectionError",
+    "MT5BrokerAdapter",
+    "MT5Config",
+    "MT5ConfigError",
+    "MT5Credentials",
+    "MT5Environment",
+    "MT5SymbolSpec",
     "OrderNotFoundError",
     "OrderRejectedError",
     "OrderSubmission",

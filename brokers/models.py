@@ -71,6 +71,38 @@ class OrderRejectedError(BrokerError):
     """El broker rechazó la operación (motivo en `reason`)."""
 
 
+class BrokerAuthError(BrokerError):
+    """Credenciales ausentes/inválidas o autenticación fallida (LIVE-09).
+
+    No es un error de transporte: reintentar no ayuda. `submit_allowed=False`,
+    `operator_required=True`.
+    """
+
+
+class BrokerPermissionError(BrokerError):
+    """Permiso/entorno insuficiente (p.ej. producción prohibida en LIVE-09)."""
+
+
+class BrokerRateLimitError(BrokerError):
+    """Rate limit del proveedor. Reintentable con backoff, nunca submit ciego."""
+
+
+class BrokerInsufficientFundsError(OrderRejectedError):
+    """Rechazo por fondos/margen insuficiente (código del broker inequívoco)."""
+
+
+class BrokerInvalidOrderError(OrderRejectedError):
+    """Rechazo de validación: símbolo/volumen/tipo/precio no operables."""
+
+
+class BrokerMarketClosedError(OrderRejectedError):
+    """Mercado cerrado o trading deshabilitado para el símbolo."""
+
+
+class BrokerDependencyError(BrokerError):
+    """Dependencia externa del adapter no disponible (p.ej. runtime MT5)."""
+
+
 @dataclass(frozen=True, slots=True)
 class BrokerFill:
     """Fill (total o parcial) reportado por el broker.
