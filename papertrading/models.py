@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 
+from execution.instrument import InstrumentSpec
 from monitoring.models import MonitorConfig
 from risk.types import RiskConfig
 
@@ -114,3 +115,8 @@ class PaperEngineConfig:
     max_bars_in_trade: int | None = None
     risk: RiskConfig = field(default_factory=RiskConfig)
     monitor: MonitorConfig = field(default_factory=MonitorConfig)
+    # MULTI-ASSET-03: economics explicito del instrumento. None = path LEGACY
+    # (spec implicito: contract_size = point_value, quote = currency). Si se
+    # provee, su contract_size debe ser coherente con point_value (salvo el
+    # default legacy 1.0); mismatch => fail-closed.
+    instrument_spec: InstrumentSpec | None = None

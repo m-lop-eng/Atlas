@@ -39,12 +39,19 @@ from brokers.models import (
 )
 from brokers.paper import BrokerSnapshotError
 from execution.order import Fill, OrderSide, OrderStatus, OrderType
+from execution.instrument import (
+    ExposureError,
+    InstrumentSpec,
+    InstrumentSpecError,
+    exposure_account,
+)
 from execution.intent_journal import (
     IntentJournal,
     IntentJournalError,
     OrderIntent,
 )
 from execution.order_manager import OrderManager, OrderStateError
+from risk.quantity import QuantityError, normalize_quantity
 from killswitches.coordinator import KillSwitchCoordinator
 from live.events import ClosedBarEvent
 from monitoring.engine import MonitoringEngine, apply_to_kill_switch
@@ -145,6 +152,11 @@ class PaperTradingEngine:
         # realized. El bootstrap es EXPLICITO (configuracion), nunca del broker.
         if ledger is not None:
             self._ledger = ledger
+            if ledger.account_currency != self.config.currency:
+                raise TypeError(
+                    "ledger.account_currency != config.currency: "
+                    f"{ledger.account_currency!r} != {self.config.currency!r}"
+                )
         else:
             if initial_cash is None:
                 raise TypeError(
@@ -152,7 +164,15 @@ class PaperTradingEngine:
                     "(o un `ledger`) explicito; el capital inicial NO se lee "
                     "del broker."
                 )
-            self._ledger = AccountLedger(initial_cash=initial_cash)
+            self._ledger = AccountLedger(
+                initial_cash=initial_cash, account_currency=self.config.currency
+            )
+
+        # MULTI-ASSET-03: economics del instrumento (spec explicito o legacy).
+        # Unico punto de resolucion; se registra en el ledger (autoridad de
+        # metadata economica, sin duplicar).
+        self._instrument_spec = self._resolve_instrument_spec(self.config)
+        self._ledger.register_instrument(self._instrument_spec)
 
         # LIVE-08: journal write-ahead de intents (opcional). None = paper/A4
         # sin persistencia (comportamiento intacto). Cuando se inyecta, el
@@ -248,6 +268,42 @@ class PaperTradingEngine:
     def intent_journal(self) -> "IntentJournal | None":
         """Journal write-ahead de intents (LIVE-08), o None si no se inyecto."""
         return self._intents
+
+    @property
+    def instrument_spec(self) -> InstrumentSpec:
+        """Economics del instrumento (MULTI-ASSET-03)."""
+        return self._instrument_spec
+
+    @staticmethod
+    def _resolve_instrument_spec(config: PaperEngineConfig) -> InstrumentSpec:
+        """Resuelve el InstrumentSpec (explicito o legacy) con consistencia.
+
+        - Sin spec: LEGACY -> contract_size = point_value, quote = currency.
+        - Con spec: exige coherencia Atlas (mismo instrument id; y si
+          `point_value` no es el default legacy 1.0, debe igualar
+          `contract_size`); mismatch => fail-closed.
+        """
+        spec = config.instrument_spec
+        if spec is None:
+            return InstrumentSpec.legacy(
+                config.instrument,
+                point_value=config.point_value,
+                currency=config.currency,
+            )
+        if spec.atlas_instrument_id != config.instrument:
+            raise InstrumentSpecError(
+                "instrument_spec.atlas_instrument_id != config.instrument: "
+                f"{spec.atlas_instrument_id!r} != {config.instrument!r}"
+            )
+        point_value = float(config.point_value)
+        if not math.isclose(point_value, 1.0, rel_tol=1e-9, abs_tol=1e-12) and not (
+            math.isclose(point_value, spec.contract_size, rel_tol=1e-9, abs_tol=1e-12)
+        ):
+            raise InstrumentSpecError(
+                "point_value y contract_size incompatibles: "
+                f"{point_value!r} != {spec.contract_size!r}"
+            )
+        return spec
 
     @property
     def realized_pnl(self) -> float:
@@ -852,7 +908,14 @@ class PaperTradingEngine:
                 )
 
     def _realize(self, pos: PaperPosition, qty: float, price: float) -> float:
-        """Compatibilidad: el P&L realizado vive en el ledger (F-06A)."""
+        """Compatibilidad: el P&L realizado vive en el ledger (F-06A).
+
+        MULTI-ASSET-03: usa el multiplicador economico del instrumento
+        (contract_size x FX); fail-closed si el instrumento requiere FX ausente.
+        """
+        multiplier = self._ledger._economic_multiplier(
+            pos.instrument, spec=None, fx_rate=None
+        )
         return self._ledger._realize(
             LedgerPosition(
                 instrument=pos.instrument,
@@ -861,6 +924,7 @@ class PaperTradingEngine:
             ),
             qty,
             price,
+            multiplier,
         )
 
     # ---------------------------------------------------------- señales/riesgo
@@ -892,7 +956,9 @@ class PaperTradingEngine:
             },
         )
         decision = self.risk_engine.validate(
-            signal, self._risk_state(), point_value=self.config.point_value
+            signal,
+            self._risk_state(),
+            contract_size=self._instrument_spec.contract_size,
         )
         self._audit_rec(
             PaperEvent.RISK_DECISION,
@@ -906,6 +972,32 @@ class PaperTradingEngine:
         if not decision.approved:
             self._audit_rec(PaperEvent.RISK_REJECTED, {"reason": decision.reason})
             return
+        # MULTI-ASSET-03: normalizar la cantidad al lattice del instrumento
+        # (floor, nunca round-up, nunca mutacion silenciosa). Si el floor cae
+        # por debajo del minimo => reject. La cantidad efectiva <= target, por lo
+        # que NUNCA aumenta el riesgo.
+        try:
+            effective = normalize_quantity(
+                self._instrument_spec, decision.approved_quantity
+            )
+        except QuantityError as exc:
+            self._audit_rec(
+                PaperEvent.RISK_REJECTED,
+                {"reason": f"quantity_contract: {exc}"},
+            )
+            return
+        if effective != decision.approved_quantity:
+            self._audit_rec(
+                PaperEvent.RISK_DECISION,
+                {
+                    "strategy_id": signal.strategy_id,
+                    "approved": True,
+                    "quantity": effective,
+                    "reason": "quantity_contract_floor",
+                    "target_quantity": decision.approved_quantity,
+                },
+            )
+            decision = replace(decision, approved_quantity=effective)
         if decision.approved_quantity < self.config.min_size:
             self._audit_rec(PaperEvent.RISK_REJECTED, {"reason": "min_size"})
             return
@@ -973,7 +1065,23 @@ class PaperTradingEngine:
                     net_exposure=None,
                     exposure_by_instrument=None,
                 )
-            by_instrument[i] = q * float(price)
+            spec = self._instrument_spec if i == instrument else (
+                self._ledger.spec(i) or self._instrument_spec
+            )
+            try:
+                # MULTI-ASSET-03: account-ccy exposure (contract_size + FX).
+                # FX no disponible => FxMissingError => fail-closed (None).
+                by_instrument[i] = exposure_account(
+                    spec, q, float(price),
+                    account_currency=self.config.currency,
+                )
+            except ExposureError:
+                return ProjectedExposure(
+                    equity=equity,
+                    gross_exposure=None,
+                    net_exposure=None,
+                    exposure_by_instrument=None,
+                )
         gross = sum(abs(v) for v in by_instrument.values())
         net = sum(by_instrument.values())
         return ProjectedExposure(

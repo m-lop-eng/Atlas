@@ -35,12 +35,14 @@ NO usa `pickle`. NO persiste ni registra secretos.
 
 from __future__ import annotations
 
+import math
 import zlib
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Callable, Mapping
 
+from execution.instrument import AssetClass, InstrumentSpec, InstrumentSpecError
 from execution.order import Order, OrderSide, OrderType
 
 from brokers.base import BrokerAdapter
@@ -255,6 +257,66 @@ class MT5SymbolSpec:
     trade_mode: int
     filling_mode: int
     digits: int
+
+
+def instrument_spec_from_mt5(
+    mt5_spec: MT5SymbolSpec,
+    *,
+    atlas_instrument_id: str,
+    asset_class: AssetClass = AssetClass.OTHER,
+    contract_size: float | None = None,
+    quote_currency: str | None = None,
+    base_currency: str | None = None,
+) -> InstrumentSpec:
+    """Construye/valida un `InstrumentSpec` Atlas desde metadata MT5.
+
+    Precedence (MULTI-ASSET-02 §17):
+      * Atlas aporta la SEMANTICA economica (`contract_size`, moneda de cotizacion).
+      * El broker es AUTORITATIVO para el lattice de cantidad (volume_min/step/max).
+      * Cross-validacion: si Atlas fija `contract_size` y el broker permite
+        derivarlo (`tick_value/tick_size`), deben ser compatibles; mismatch =>
+        `InstrumentSpecError` (fail-closed). Nunca overwrite silencioso.
+    """
+    if not atlas_instrument_id or not str(atlas_instrument_id).strip():
+        raise InstrumentSpecError("atlas_instrument_id obligatorio")
+
+    broker_quote = str(mt5_spec.currency_profit or "")
+    if quote_currency is not None and broker_quote and quote_currency != broker_quote:
+        raise InstrumentSpecError(
+            "quote_currency mismatch: Atlas "
+            f"{quote_currency!r} != MT5 currency_profit {broker_quote!r}"
+        )
+    quote = quote_currency or broker_quote or "USD"
+
+    derived: float | None = None
+    if mt5_spec.trade_tick_size > 0 and mt5_spec.trade_tick_value > 0:
+        derived = mt5_spec.trade_tick_value / mt5_spec.trade_tick_size
+
+    if contract_size is None:
+        if derived is None:
+            raise InstrumentSpecError(
+                "contract_size no provisto y no derivable (tick metadata ausente)"
+            )
+        contract_size = derived
+    elif derived is not None and not math.isclose(
+        float(contract_size), derived, rel_tol=1e-3, abs_tol=1e-6
+    ):
+        raise InstrumentSpecError(
+            "contract_size Atlas "
+            f"{contract_size!r} incompatible con MT5 tick_value/tick_size "
+            f"({derived!r})"
+        )
+
+    return InstrumentSpec(
+        atlas_instrument_id=str(atlas_instrument_id),
+        asset_class=asset_class,
+        contract_size=float(contract_size),
+        quote_currency=quote,
+        base_currency=base_currency or (mt5_spec.currency_base or None),
+        quantity_min=float(mt5_spec.volume_min),
+        quantity_step=float(mt5_spec.volume_step),
+        quantity_max=float(mt5_spec.volume_max),
+    )
 
 
 def _finite(value: Any) -> float:
@@ -991,4 +1053,5 @@ __all__ = [
     "MT5Credentials",
     "MT5Environment",
     "MT5SymbolSpec",
+    "instrument_spec_from_mt5",
 ]

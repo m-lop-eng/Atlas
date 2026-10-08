@@ -206,6 +206,7 @@ def _stack(
     initial_cash: float = 1_000_000.0,
     monitor_config: MonitorConfig | None = None,
     intent_journal: object | None = None,
+    instrument_spec: object | None = None,
 ) -> SimpleNamespace:
     clock = clock or Clock(T0)
     broker = PaperBrokerAdapter(initial_cash=initial_cash, clock=clock)
@@ -231,7 +232,10 @@ def _stack(
         monitoring,
         clock=clock,
         initial_cash=initial_cash,  # F-06A: bootstrap del ledger (misma config)
-        config=PaperEngineConfig(instrument=INSTRUMENT, account_id="PAPER-01"),
+        config=PaperEngineConfig(
+            instrument=INSTRUMENT, account_id="PAPER-01",
+            instrument_spec=instrument_spec,
+        ),
         intent_journal=intent_journal,
     )
     return SimpleNamespace(

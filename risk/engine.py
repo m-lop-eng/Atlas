@@ -70,20 +70,34 @@ class RiskEngine:
         state: AccountRiskState,
         *,
         point_value: float | None = None,
+        contract_size: float | None = None,
     ) -> RiskDecision:
         """Evalúa una intención y devuelve una decisión determinista.
 
         Args:
             signal: Intención de trading de la estrategia.
             state: Estado vivo de cuenta.
-            point_value: P&L monetario por unidad de precio del instrumento.
-                Al proveerlo habilita el sizing fixed-fractional y la cantidad
-                de la decisión deriva de RiskConfig sin estimador externo.
+            point_value: P&L monetario por unidad de precio del instrumento
+                (LEGACY). Alias de `contract_size` para paper/backtest históricos.
+            contract_size: multiplicador económico canónico (MULTI-ASSET-03):
+                `risk_per_unit = distance * contract_size`. Es la vía preferida;
+                no debe combinarse con un `point_value` distinto.
         """
         if signal.action is Action.NO_TRADE:
             return self._reject(
                 "Señal NO_TRADE no genera operación", {"action_valid": False}
             )
+
+        if (
+            point_value is not None
+            and contract_size is not None
+            and not self._same_multiplier(point_value, contract_size)
+        ):
+            raise ValueError(
+                "point_value y contract_size incompatibles "
+                f"({point_value!r} != {contract_size!r}): usa uno solo"
+            )
+        multiplier = contract_size if contract_size is not None else point_value
 
         checks: dict[str, bool] = {}
         reasons: list[str] = []
@@ -126,9 +140,9 @@ class RiskEngine:
                 False,
                 "Riesgo no cuantificable: se requieren reference_price y stop_price",
             )
-        elif point_value is not None:
+        elif multiplier is not None:
             quantity, ok_reason = self._size_fixed_fractional(
-                signal, risk_cap, point_value
+                signal, risk_cap, multiplier
             )
             if ok_reason is not None:
                 _check("quantifiable_risk", False, ok_reason)
@@ -297,19 +311,28 @@ class RiskEngine:
         self,
         signal: Signal,
         risk_cap: float,
-        point_value: float,
+        multiplier: float,
     ) -> tuple[float, str | None]:
         """Sizing fixed-fractional.
+
+        `multiplier` = contract_size (MULTI-ASSET-03) o su alias legacy
+        `point_value`: `risk_per_unit = distance * multiplier`.
 
         Returns: (cantidad, None) si es viable; (0.0, motivo) si no.
         """
         distance = abs(signal.reference_price - signal.stop_price)
         if distance <= 0:
             return 0.0, "Stop sin distancia: riesgo indefinido"
-        if point_value <= 0:
-            return 0.0, "point_value debe ser positivo"
-        unit_risk = distance * point_value
+        if multiplier <= 0:
+            return 0.0, "contract_size/point_value debe ser positivo"
+        unit_risk = distance * multiplier
         quantity = risk_cap / unit_risk
         if quantity <= 0:
             return 0.0, "Riesgo por operación sin tamaño"
         return quantity, None
+
+    @staticmethod
+    def _same_multiplier(a: float, b: float) -> bool:
+        import math
+
+        return math.isclose(float(a), float(b), rel_tol=1e-9, abs_tol=1e-12)
