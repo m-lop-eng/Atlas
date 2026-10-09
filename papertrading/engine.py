@@ -130,6 +130,10 @@ class PaperTradingEngine:
         initial_cash: float | None = None,
         ledger: "AccountLedger | None" = None,
         intent_journal: "IntentJournal | None" = None,
+        price_registry: dict[str, float] | None = None,
+        order_fills: dict[str, tuple] | None = None,
+        risk_state_provider: Callable[[], AccountRiskState] | None = None,
+        enable_monitoring: bool = True,
     ) -> None:
         if not hasattr(broker, "price_source"):
             raise TypeError(
@@ -180,6 +184,23 @@ class PaperTradingEngine:
         # de "que intent existio" (evita resubmit tras restart).
         self._intents = intent_journal
 
+        # MULTI-ASSET-04: hooks de orquestacion multi-instrumento (opcionales).
+        # - `price_registry`: marks/execution prices COMPARTIDOS por instrumento;
+        #   si se provee, `_set_price` escribe ahi y `_marks()` lo lee (permite
+        #   un unico broker global sin que un instrumento pise a otro).
+        # - `order_fills`: registro COMPARTIDO de fills por cid (reconciliacion
+        #   global correcta).
+        # - `risk_state_provider`: estado de riesgo GLOBAL (equity/open_positions/
+        #   daily/drawdown de la cuenta), para no duplicar daily risk por engine.
+        self._price_registry = price_registry
+        self._risk_state_provider = risk_state_provider
+        # MULTI-ASSET-04 (global/local): un worker multi-instrumento NO debe
+        # escribir fuentes GLOBALES del kill switch con observaciones LOCALES
+        # (p.ej. DATA_FEED de su instrumento). `enable_monitoring=False` hace que
+        # el worker se limite a reconciliar/operar; la UNICA autoridad de
+        # monitoring global es el orquestador. Default True = legacy intacto.
+        self.enable_monitoring = enable_monitoring
+
         self._bars: list[dict[str, Any]] = []
         self._audit: list[PaperAuditEntry] = []
         self._seq = 0
@@ -190,7 +211,9 @@ class PaperTradingEngine:
         # de quantity/avg_entry/cash/realized es `self._ledger`.
         self._position: PaperPosition | None = None
         self._pending_resolution: set[str] = set()
-        self._order_fills: dict[str, tuple] = {}
+        self._order_fills: dict[str, tuple] = (
+            order_fills if order_fills is not None else {}
+        )
 
         self._last_open_time: int | None = None
         self._interval_seconds: int | None = None
@@ -955,9 +978,14 @@ class PaperTradingEngine:
                 "bar_open_time": bar["ts"],
             },
         )
+        risk_state = (
+            self._risk_state_provider()
+            if self._risk_state_provider is not None
+            else self._risk_state()
+        )
         decision = self.risk_engine.validate(
             signal,
-            self._risk_state(),
+            risk_state,
             contract_size=self._instrument_spec.contract_size,
         )
         self._audit_rec(
@@ -1123,7 +1151,13 @@ class PaperTradingEngine:
 
         En paper, el precio de la barra en curso es el mark vigente del
         instrumento (misma referencia que usa el PaperBroker para fills).
+
+        MULTI-ASSET-04: si se inyecto un `price_registry` compartido, se devuelve
+        el mapa COMPLETO (todos los instrumentos) para que la valoracion global
+        (ledger) sea correcta.
         """
+        if self._price_registry is not None:
+            return dict(self._price_registry)
         try:
             return {self.config.instrument: float(self.broker.price_source(
                 self.config.instrument
@@ -1134,6 +1168,12 @@ class PaperTradingEngine:
     # ------------------------------------------------------- broker helpers
 
     def _set_price(self, price: float) -> None:
+        if self._price_registry is not None:
+            # MULTI-ASSET-04: el broker es COMPARTIDO; NO se pisa `price_source`
+            # (un instrumento no puede clobber a otro). Se escribe el precio en
+            # el registro compartido y el broker lo consulta por instrumento.
+            self._price_registry[self.config.instrument] = float(price)
+            return
         self.broker.price_source = lambda _instrument: price
 
     def _broker_healthy(self) -> bool:
@@ -1266,11 +1306,17 @@ class PaperTradingEngine:
                         fill_count=len(fl),
                     )
                 )
-        pos = self._position
-        positions = (
-            (PositionSnapshot(instrument=pos.instrument, quantity=pos.quantity, avg_entry_price=pos.avg_entry_price),)
-            if pos is not None
-            else ()
+        # MULTI-ASSET-04: las posiciones ESPERADAS se derivan del LEDGER
+        # (autoridad contable global), no de la proyeccion mono-instrumento
+        # `_position`. En single-instrument son equivalentes; en multi-asset
+        # evita falsos MISSING_INTERNAL de otros instrumentos.
+        positions = tuple(
+            PositionSnapshot(
+                instrument=p.instrument,
+                quantity=p.quantity,
+                avg_entry_price=p.avg_entry_price,
+            )
+            for p in self._ledger.positions()
         )
         # F-06C: la cuenta ESPERADA (expected) procede del ledger interno
         # (autoridad contable), NO del broker. El broker alimenta únicamente el
@@ -1358,7 +1404,11 @@ class PaperTradingEngine:
 
     def _post_bar(self, now: datetime) -> None:
         self.reconcile()
-        self.run_monitoring(now)
+        # MULTI-ASSET-04: solo la autoridad global (orquestador) aplica
+        # monitoring al kill switch compartido. El worker multi-instrumento se
+        # limita a reconciliar (observacion global) y operar.
+        if self.enable_monitoring:
+            self.run_monitoring(now)
 
     # ------------------------------------------------------- snapshot/restore
 
