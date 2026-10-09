@@ -396,6 +396,47 @@ class PaperTradingEngine:
             return "future_timestamp"
         return None
 
+    def _bar_admission(
+        self, closed: ClosedBarEvent, now: datetime
+    ) -> tuple[str, str] | None:
+        """Decide (SIN mutar) si `on_closed_bar` procesaria la vela.
+
+        UNICA implementacion de las guardas de admision, compartida por
+        `bar_rejection_reason` (prevalidacion no mutante) y `on_closed_bar`
+        (procesamiento efectivo), de modo que no puedan divergir:
+          1. LIVE-03 estructural/temporal (`_bar_rejection_reason`);
+          2. idempotencia/reinicio: `open_time <= _last_open_time`.
+
+        Returns:
+            `(kind, reason)` con `kind` en {"structural", "restart"} (motivo en
+            `reason`), o `None` si la vela seria procesada.
+        """
+        structural = self._bar_rejection_reason(closed, now)
+        if structural is not None:
+            return ("structural", structural)
+        if (
+            self._last_open_time is not None
+            and closed.open_time <= self._last_open_time
+        ):
+            return ("restart", "restart_skip")
+        return None
+
+    def bar_rejection_reason(self, closed: ClosedBarEvent) -> str | None:
+        """Validacion NO MUTANTE de una barra: LIVE-03 + idempotencia del worker.
+
+        Devuelve el motivo por el cual `on_closed_bar` NO procesaria la vela
+        (rechazo estructural LIVE-03, o `"restart_skip"`), o `None` si seria
+        procesada. Es un wrapper de `_bar_admission`, la MISMA implementacion que
+        usa `on_closed_bar` (sin reglas divergentes).
+
+        Expuesta para que un orquestador prevalue ANTES de tocar estado
+        compartido (p.ej. marks) sin duplicar reglas ni mutar el engine.
+        `on_closed_bar` vuelve a validar despues (defensa en profundidad) y
+        conserva su auditoria (BAR_SKIPPED / RESTART_SKIP).
+        """
+        decision = self._bar_admission(closed, self._clock())
+        return None if decision is None else decision[1]
+
     def _freshness_rejection(self, now: datetime) -> str | None:
         """LIVE-03: freshness del market data en el punto de submit (G-MD-D).
 
@@ -417,25 +458,27 @@ class PaperTradingEngine:
 
     def on_closed_bar(self, closed: ClosedBarEvent) -> None:
         """Único punto de entrada: una barra ya cerrada (emisión de B1)."""
-        # LIVE-03: rechazar datos invalidos/futuros ANTES de cualquier
-        # procesamiento: una barra invalida NUNCA debe llegar a submit_order ni
-        # mutar ledger/posicion.
-        rejection = self._bar_rejection_reason(closed, self._clock())
-        if rejection is not None:
-            self._audit_rec(
-                PaperEvent.BAR_SKIPPED,
-                {"reason": rejection, "bar_open_time": closed.open_time},
-            )
-            return
-        if (
-            self._last_open_time is not None
-            and closed.open_time <= self._last_open_time
-        ):
-            # Restart / replay: nunca reprocesar, nunca duplicar exposición.
-            self._audit_rec(
-                PaperEvent.RESTART_SKIP,
-                {"bar_open_time": closed.open_time, "last_open_time": self._last_open_time},
-            )
+        # LIVE-03 + idempotencia: rechazar ANTES de cualquier procesamiento.
+        # Una barra invalida/futura/duplicada NUNCA debe llegar a submit_order ni
+        # mutar ledger/posicion. Reutiliza la MISMA guarda que la prevalidacion
+        # no mutante (`_bar_admission`), sin logica duplicada.
+        decision = self._bar_admission(closed, self._clock())
+        if decision is not None:
+            kind, reason = decision
+            if kind == "restart":
+                # Restart / replay: nunca reprocesar, nunca duplicar exposición.
+                self._audit_rec(
+                    PaperEvent.RESTART_SKIP,
+                    {
+                        "bar_open_time": closed.open_time,
+                        "last_open_time": self._last_open_time,
+                    },
+                )
+            else:
+                self._audit_rec(
+                    PaperEvent.BAR_SKIPPED,
+                    {"reason": reason, "bar_open_time": closed.open_time},
+                )
             return
         self._last_open_time = closed.open_time
         self._interval_seconds = closed.interval_seconds

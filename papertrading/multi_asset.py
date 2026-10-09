@@ -205,9 +205,17 @@ class MultiAssetPaperOrchestrator:
         worker = self.workers.get(closed.symbol)
         if worker is None:
             return None
-        # Mark/compartido antes de procesar (valoracion global consistente).
-        self._prices[closed.symbol] = float(closed.close)
-        self._last_close_dt = datetime.fromtimestamp(closed.close_time, tz=_UTC)
+        # MULTI-ASSET-05 (fix): prevalidar SIN efectos secundarios ANTES de tocar
+        # el estado compartido. `worker.bar_rejection_reason` cubre LIVE-03
+        # (timestamp futuro/invalido) Y la idempotencia del worker
+        # (`open_time <= _last_open_time` -> "restart_skip"), por lo que un
+        # duplicado o evento antiguo tampoco muta `_prices`/marks ni el estado de
+        # valoracion/riesgo. No se duplican reglas y `worker.on_closed_bar` vuelve
+        # a validar (defensa en profundidad) conservando su auditoria.
+        if worker.bar_rejection_reason(closed) is None:
+            # Mark/compartido antes de procesar (valoracion global consistente).
+            self._prices[closed.symbol] = float(closed.close)
+            self._last_close_dt = datetime.fromtimestamp(closed.close_time, tz=_UTC)
         worker.note_data_feed(data_state, data_quality)
         record = worker.on_closed_bar(closed)
         # Autoridad GLOBAL de monitoring: solo observaciones GLOBALES al kill
