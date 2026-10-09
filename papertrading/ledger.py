@@ -381,6 +381,8 @@ class AccountLedger:
     # ------------------------------------------------------- snapshot/restore
 
     def snapshot(self) -> dict:
+        # Orden CANONICO (por instrumento) para reproducibilidad independiente del
+        # orden de registro/procesamiento (MULTI-ASSET-06).
         return {
             "initial_cash": self.initial_cash,
             "account_currency": self.account_currency,
@@ -392,9 +394,9 @@ class AccountLedger:
                     "quantity": p.quantity,
                     "avg_entry_price": p.avg_entry_price,
                 }
-                for p in self._positions.values()
+                for _, p in sorted(self._positions.items())
             ],
-            "specs": [s.to_dict() for s in self._specs.values()],
+            "specs": [self._specs[k].to_dict() for k in sorted(self._specs)],
             "applied_fills": sorted(self._applied_fills),
         }
 

@@ -541,6 +541,26 @@ class PaperTradingEngine:
             )
             self._pending = None
             return
+        # MULTI-ASSET-06: re-verificacion GLOBAL de `max_open_positions` en el
+        # punto EFECTIVO de envio (pre-fill), con el estado COMPARTIDO mas
+        # reciente (ledger/riesgo globales). Evita que varios workers con senales
+        # pendientes del mismo grupo (o de barras previas) eludan el limite: una
+        # posicion ya abierta/ejecutada por otro worker cuenta aqui aunque la
+        # senal pasara el gate de señalizacion. Admision secuencial y
+        # determinista (orden de evaluacion).
+        global_state = (
+            self._risk_state_provider()
+            if self._risk_state_provider is not None
+            else self._risk_state()
+        )
+        if global_state.open_positions >= self.risk_engine.config.max_open_positions:
+            self._audit_rec(
+                PaperEvent.RISK_REJECTED,
+                {"signal_id": pe.cid, "reason": "max_open_positions_global",
+                 "stage": "pre_submit"},
+            )
+            self._pending = None
+            return
         # F-03: enforcement PROJECTED pre-fill. Ultimo punto antes del fill, con
         # el precio de ejecucion disponible (open de t+1 en paper MARKET). Si
         # algun gate projected activo se viola (o la metrica no esta disponible

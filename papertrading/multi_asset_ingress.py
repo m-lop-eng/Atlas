@@ -122,6 +122,15 @@ class StreamMetrics:
         }
 
 
+@dataclass(frozen=True, slots=True)
+class IngressEmission:
+    """Emision NORMALIZADA de B1 lista para despacho (identidad = atlas_id)."""
+
+    closed: ClosedBarEvent
+    data_state: str
+    data_quality: str
+
+
 class MultiAssetIngress:
     """Dispatcher secuencial: raw MarketDataEvent -> LiveDataEngine -> worker."""
 
@@ -139,6 +148,10 @@ class MultiAssetIngress:
         self.metrics: dict[str, StreamMetrics] = {}
         self.unknown_symbol_rejections: list[str] = []
         self._unknown_symbols = 0
+        # Buffer de emisiones para procesamiento por GRUPO temporal (aditivo;
+        # `receive()` conserva el despacho inmediato).
+        self._buffering = False
+        self._buffer: list[IngressEmission] | None = None
 
         seen_atlas: set[str] = set()
         for config, adapter in streams:
@@ -236,8 +249,30 @@ class MultiAssetIngress:
         self._classify_new_issues(config.atlas_id, before, emitted)
         return emitted
 
+    def receive_group(
+        self, events: Iterable[MarketDataEvent]
+    ) -> list[IngressEmission]:
+        """Ingress de un GRUPO temporal sin despachar hasta completarlo.
+
+        Aditivo (MULTI-ASSET-06): procesa los eventos crudos por sus motores B1
+        (validacion/dedup/orden/gap) y ACUMULA las emisiones normalizadas en
+        lugar de enviarlas al orquestador una a una. `receive()` conserva el
+        despacho inmediato. No es reentrante.
+        """
+        if self._buffering:
+            raise RuntimeError("receive_group no es reentrante")
+        self._buffering = True
+        self._buffer = []
+        try:
+            for event in events:
+                self.receive(event)
+            return list(self._buffer)
+        finally:
+            self._buffer = None
+            self._buffering = False
+
     def _on_engine_closed(self, closed: ClosedBarEvent) -> None:
-        """Callback de B1: normaliza identidad y despacha al worker correcto."""
+        """Callback de B1: normaliza identidad y despacha (o bufferiza) al worker."""
         config = self._by_market_symbol.get(closed.symbol)
         if config is None:  # pragma: no cover - engine solo emite su simbolo
             self._unknown_symbols += 1
@@ -258,10 +293,19 @@ class MultiAssetIngress:
         metrics = self.metrics[config.atlas_id]
         metrics.emitted += 1
         metrics.last_open_time_emitted = closed.open_time
-        self._orchestrator.on_closed_bar(
-            normalized,
+        emission = IngressEmission(
+            closed=normalized,
             data_state=engine.state.value,
             data_quality=engine.quality.value,
+        )
+        if self._buffering:
+            assert self._buffer is not None
+            self._buffer.append(emission)
+            return
+        self._orchestrator.on_closed_bar(
+            emission.closed,
+            data_state=emission.data_state,
+            data_quality=emission.data_quality,
         )
 
     # ------------------------------------------------------------ clasificacion
@@ -302,6 +346,7 @@ class MultiAssetIngress:
 
 __all__ = [
     "IngressConfigError",
+    "IngressEmission",
     "InstrumentStreamConfig",
     "MultiAssetIngress",
     "StreamMetrics",

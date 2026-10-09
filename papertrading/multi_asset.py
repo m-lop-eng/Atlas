@@ -223,6 +223,56 @@ class MultiAssetPaperOrchestrator:
         self._apply_global_monitoring(worker.last_report)
         return record
 
+    def apply_bar_group(self, emissions) -> None:
+        """Procesa un GRUPO temporal (mismo `close_time`) con barrera de mercado.
+
+        MULTI-ASSET-06. `emissions`: iterable de objetos con `closed`
+        (`ClosedBarEvent` con `symbol == atlas_id`), `data_state`, `data_quality`
+        (p. ej. `IngressEmission`). Secuencia:
+
+          1. Prevalidar (no mutante) cada evento (`worker.bar_rejection_reason`).
+          2. Actualizar los marks de TODOS los admisibles del grupo.
+          3. Evaluar los workers en orden estable por `atlas_id`, aplicando el
+             veto global DESPUES DE CADA worker (antes del siguiente).
+
+        Los eventos rechazados NO mutan marks; aun asi se les pasa al worker para
+        conservar su auditoria (BAR_SKIPPED/RESTART_SKIP). Unico escritor de
+        fuentes globales: el orquestador.
+        """
+        resolved: list[tuple] = []
+        for emission in emissions:
+            closed = emission.closed
+            worker = self.workers.get(closed.symbol)
+            if worker is None:
+                continue
+            resolved.append((worker, emission))
+
+        # 1-2. Prevalidar y fijar marks de los admisibles ANTES de evaluar.
+        max_close_time: int | None = None
+        for worker, emission in resolved:
+            if worker.bar_rejection_reason(emission.closed) is None:
+                self._prices[emission.closed.symbol] = float(emission.closed.close)
+                ct = emission.closed.close_time
+                max_close_time = ct if max_close_time is None else max(max_close_time, ct)
+        if max_close_time is not None:
+            self._last_close_dt = datetime.fromtimestamp(max_close_time, tz=_UTC)
+
+        # 3. Evaluar en orden estable por atlas_id; veto global tras cada worker.
+        for worker, emission in sorted(
+            resolved, key=lambda we: we[1].closed.symbol
+        ):
+            worker.note_data_feed(emission.data_state, emission.data_quality)
+            worker.on_closed_bar(emission.closed)
+            self._apply_global_monitoring(worker.last_report)
+
+    def set_global_data_feed(self, provider) -> None:
+        """Fija (o limpia con `None`) la observacion GLOBAL de infra de datos.
+
+        MULTI-ASSET-06: permite al driver de replay publicar salud global SOLO
+        tras validar los streams; `None` => DATA_FEED UNKNOWN (fail-closed).
+        """
+        self._global_data_feed = provider
+
     def _apply_global_monitoring(self, report) -> None:
         """Aplica al kill switch SOLO observaciones GLOBALES de cuenta.
 
