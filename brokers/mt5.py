@@ -339,6 +339,75 @@ def _load_mt5():
     return mt5
 
 
+def read_mt5_symbol_spec(
+    mt5,
+    mt5_name: str,
+    strategy_instrument: str,
+    *,
+    filling_mode_default: int,
+    require_operable: bool = True,
+    select_if_invisible: bool = True,
+) -> MT5SymbolSpec:
+    """Lee/valida la metadata de un simbolo MT5 (SOLO LECTURA de datos).
+
+    Reutilizado por `MT5BrokerAdapter._symbol_spec` y por el probe de solo
+    lectura. No envia ordenes.
+
+    `select_if_invisible`:
+      * True (adapter de ejecucion): si el simbolo no esta visible, lo selecciona
+        en Market Watch (`symbol_select`) para poder operarlo. Es un EFECTO
+        LATERAL sobre el terminal.
+      * False (probe de solo lectura): NUNCA modifica el Market Watch; lee la
+        metadata tal cual y refleja `visible` real (el llamante reporta la
+        incompatibilidad si el simbolo no es visible/operable).
+
+    `require_operable=False` permite inspeccionar un simbolo no operable.
+    """
+    info = mt5.symbol_info(mt5_name)
+    if info is None:
+        raise BrokerInvalidOrderError(f"simbolo MT5 inexistente: {mt5_name!r}")
+    visible = bool(getattr(info, "visible", True))
+    if not visible and select_if_invisible:
+        try:
+            mt5.symbol_select(mt5_name, True)
+        except Exception:  # noqa: BLE001
+            pass
+        info = mt5.symbol_info(mt5_name)
+        if info is None or not bool(getattr(info, "visible", False)):
+            raise BrokerInvalidOrderError(
+                f"simbolo MT5 no visible/operable: {mt5_name!r}"
+            )
+        visible = True
+    trade_mode = int(getattr(info, "trade_mode", -1))
+    if require_operable and trade_mode != SYMBOL_TRADE_MODE_FULL:
+        raise BrokerInvalidOrderError(
+            f"simbolo {mt5_name!r} no operable (trade_mode={trade_mode})"
+        )
+    spec = MT5SymbolSpec(
+        strategy_instrument=strategy_instrument,
+        name=mt5_name,
+        visible=visible,
+        volume_min=_finite(getattr(info, "volume_min")),
+        volume_step=_finite(getattr(info, "volume_step")),
+        volume_max=_finite(getattr(info, "volume_max")),
+        point=_finite(getattr(info, "point")),
+        trade_tick_size=_finite(getattr(info, "trade_tick_size", 0.0)),
+        trade_tick_value=_finite(getattr(info, "trade_tick_value", 0.0)),
+        trade_contract_size=_finite(getattr(info, "trade_contract_size", 0.0)),
+        currency_base=str(getattr(info, "currency_base", "")),
+        currency_profit=str(getattr(info, "currency_profit", "")),
+        currency_margin=str(getattr(info, "currency_margin", "")),
+        trade_mode=trade_mode,
+        filling_mode=int(getattr(info, "filling_mode", filling_mode_default)),
+        digits=int(getattr(info, "digits", 0)),
+    )
+    if spec.volume_min <= 0 or spec.volume_step <= 0 or spec.volume_max < spec.volume_min:
+        raise BrokerInvalidOrderError(
+            f"metadata de volumen invalida para {mt5_name!r}"
+        )
+    return spec
+
+
 class MT5BrokerAdapter(BrokerAdapter):
     """Adapter real MT5 (DEMO-only en LIVE-09).
 
@@ -505,47 +574,13 @@ class MT5BrokerAdapter(BrokerAdapter):
             raise BrokerInvalidOrderError(
                 f"sin mapping explicito Atlas->MT5 para {strategy_instrument!r}"
             )
-        mt5 = self._module()
-        info = mt5.symbol_info(mt5_name)
-        if info is None:
-            raise BrokerInvalidOrderError(f"simbolo MT5 inexistente: {mt5_name!r}")
-        if not bool(getattr(info, "visible", True)):
-            try:
-                mt5.symbol_select(mt5_name, True)
-            except Exception:  # noqa: BLE001
-                pass
-            info = mt5.symbol_info(mt5_name)
-            if info is None or not bool(getattr(info, "visible", False)):
-                raise BrokerInvalidOrderError(
-                    f"simbolo MT5 no visible/operable: {mt5_name!r}"
-                )
-        trade_mode = int(getattr(info, "trade_mode", -1))
-        if trade_mode != SYMBOL_TRADE_MODE_FULL:
-            raise BrokerInvalidOrderError(
-                f"simbolo {mt5_name!r} no operable (trade_mode={trade_mode})"
-            )
-        spec = MT5SymbolSpec(
-            strategy_instrument=strategy_instrument,
-            name=mt5_name,
-            visible=True,
-            volume_min=_finite(getattr(info, "volume_min")),
-            volume_step=_finite(getattr(info, "volume_step")),
-            volume_max=_finite(getattr(info, "volume_max")),
-            point=_finite(getattr(info, "point")),
-            trade_tick_size=_finite(getattr(info, "trade_tick_size", 0.0)),
-            trade_tick_value=_finite(getattr(info, "trade_tick_value", 0.0)),
-            trade_contract_size=_finite(getattr(info, "trade_contract_size", 0.0)),
-            currency_base=str(getattr(info, "currency_base", "")),
-            currency_profit=str(getattr(info, "currency_profit", "")),
-            currency_margin=str(getattr(info, "currency_margin", "")),
-            trade_mode=trade_mode,
-            filling_mode=int(getattr(info, "filling_mode", self.config.filling_mode)),
-            digits=int(getattr(info, "digits", 0)),
+        spec = read_mt5_symbol_spec(
+            self._module(),
+            mt5_name,
+            strategy_instrument,
+            filling_mode_default=self.config.filling_mode,
+            require_operable=True,
         )
-        if spec.volume_min <= 0 or spec.volume_step <= 0 or spec.volume_max < spec.volume_min:
-            raise BrokerInvalidOrderError(
-                f"metadata de volumen invalida para {mt5_name!r}"
-            )
         self._specs[strategy_instrument] = spec
         return spec
 
@@ -1054,4 +1089,5 @@ __all__ = [
     "MT5Environment",
     "MT5SymbolSpec",
     "instrument_spec_from_mt5",
+    "read_mt5_symbol_spec",
 ]
