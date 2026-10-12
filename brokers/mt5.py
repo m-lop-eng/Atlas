@@ -43,6 +43,7 @@ from enum import Enum
 from typing import Any, Callable, Mapping
 
 from execution.instrument import AssetClass, InstrumentSpec, InstrumentSpecError
+from execution.intent_journal import OPERATION_CANCEL
 from execution.order import Order, OrderSide, OrderType
 
 from brokers.base import BrokerAdapter
@@ -954,19 +955,36 @@ class MT5BrokerAdapter(BrokerAdapter):
             pass
         return self._clock()
 
-    def cancel_order(self, client_order_id: str) -> BrokerOrder:
-        """Cancela una orden existente (NO coordinado — LIVE-09 heredado).
+    def cancel_order(
+        self, client_order_id: str, *, operation_id: str | None = None
+    ) -> BrokerOrder:
+        """Cancela una orden pendiente.
 
-        ALCANCE EXPLICITO (H2): `cancel_order` NO esta integrado en
-        `LiveExecutionCoordinator`. Las cancelaciones coordinadas permanecen
-        FUERA DE ALCANCE. La futura ruta de ejecucion no debe invocar
-        cancelaciones directamente al margen de una autorizacion y una politica
-        de recuperacion; no se autorizara una prueba de orden hasta resolver
-        explicitamente esta capacidad. Este metodo no participa del
-        `ExecutionGate` de submit.
+        Compatibilidad heredada (LIVE-09): sin gate enlazado, `operation_id` se
+        ignora y el comportamiento es el de siempre (NO es ruta coordinada
+        segura; no debe usarse desde un runner live).
+
+        Modo coordinado (MT5-DEMO-EXECUTION-CONTROLS-02A): si hay un
+        `ExecutionGate` enlazado, la operacion exige autorizacion de capacidad de
+        tipo `CANCEL`, ligada a `(operation_id, client_order_id)`. Sin `operation_id`
+        o sin autorizacion valida => se impide la llamada al broker. El gate lo
+        posee SOLO el `LiveExecutionCoordinator`; un caller con el adapter no
+        puede cancelar sin su autorizacion. NO cierra/reduce posiciones (fuera de
+        alcance 02A).
         """
         self._require_demo()
         self._require_ready()
+        if self._execution_gate is not None:
+            if not operation_id or not str(operation_id).strip():
+                raise BrokerError(
+                    "cancelacion coordinada (gate enlazado) requiere operation_id: "
+                    "sin identidad de operacion no se llama al broker"
+                )
+            self._execution_gate.check_operation(
+                OPERATION_CANCEL,
+                op_id=str(operation_id),
+                target=client_order_id,
+            )
         ticket = self._cid_to_ticket.get(client_order_id)
         if ticket is None:
             matches = self._discover_tickets(client_order_id)

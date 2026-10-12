@@ -18,8 +18,13 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from execution.intent_journal import (
+    OPERATION_CANCEL,
+    OPERATION_OPEN,
     SCHEMA_VERSION,
+    SCHEMA_VERSION_V1,
     IntentJournal,
     IntentJournalCorruptionError,
     IntentJournalDuplicateError,
@@ -28,6 +33,7 @@ from execution.intent_journal import (
     IntentJournalSchemaError,
     IntentJournalStorageAmbiguousError,
     OrderIntent,
+    recover_pending_cancels,
     recover_pending_intents,
 )
 from execution.order import Order, OrderSide, OrderType
@@ -459,3 +465,207 @@ class TestA4IntentAuthority:
         _drive(env2, HAPPY[:3])
         # La senal reproducida NO genera una nueva orden (el intent manda).
         assert env2.broker._orders == {}
+
+
+# --------------------------------------------------------------------------
+# COMPATIBILIDAD DE ESQUEMA v1 -> v2 (MT5-DEMO-EXECUTION-CONTROLS-02A)
+# --------------------------------------------------------------------------
+
+
+def _v1_record(cid: str) -> dict:
+    """Registro v1: intent OPEN serializado SIN los campos nuevos."""
+    d = OrderIntent.from_order(_order(cid)).to_dict()
+    for key in ("operation", "target_client_order_id", "target_broker_order_id"):
+        d.pop(key, None)
+    return d
+
+
+def _dump_v1(path, intents: dict) -> None:
+    payload = {
+        "schema_version": SCHEMA_VERSION_V1,
+        "updated_at": "2026-01-01T00:00:00+00:00",
+        "intents": intents,
+    }
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    path.with_name(path.name + ".init").write_text("{}", encoding="utf-8")
+
+
+class _SpyBroker:
+    def __init__(self, mapping):
+        self.mapping = mapping
+        self.asked: list[str] = []
+
+    def get_order(self, client_order_id):
+        self.asked.append(client_order_id)
+        return self.mapping.get(client_order_id)
+
+
+def _broker_order(cid: str, state: BrokerOrderState) -> BrokerOrder:
+    return BrokerOrder(
+        client_order_id=cid, broker_order_id="900", instrument=INSTRUMENT,
+        side=OrderSide.BUY, order_type=OrderType.MARKET, quantity=1.0, state=state,
+    )
+
+
+class TestSchemaCompatibilityV2:
+    def test_v1_journal_loads(self, tmp_path):
+        path = tmp_path / "v1.json"
+        _dump_v1(path, {"C1": _v1_record("C1")})
+        j = IntentJournal(path)
+        assert j.loaded_schema_version == SCHEMA_VERSION_V1
+        assert j.schema_version == SCHEMA_VERSION
+        assert len(j) == 1 and j.get("C1") is not None
+
+    def test_v1_record_without_operation_is_open(self, tmp_path):
+        path = tmp_path / "v1.json"
+        _dump_v1(path, {"C1": _v1_record("C1")})
+        j = IntentJournal(path)
+        intent = j.get("C1")
+        assert intent.operation == OPERATION_OPEN
+        assert intent.target_client_order_id is None
+        assert intent.target_broker_order_id is None
+
+    def test_v1_with_cancel_operation_rejected(self, tmp_path):
+        path = tmp_path / "v1bad.json"
+        rec = _v1_record("C-BAD")
+        rec["operation"] = OPERATION_CANCEL
+        _dump_v1(path, {"C-BAD": rec})
+        with pytest.raises(IntentJournalSchemaError):
+            IntentJournal(path)
+
+    def test_v1_with_v2_target_field_rejected(self, tmp_path):
+        path = tmp_path / "v1bad2.json"
+        rec = _v1_record("C-BAD")
+        rec["target_client_order_id"] = "C-BAD"
+        _dump_v1(path, {"C-BAD": rec})
+        with pytest.raises(IntentJournalSchemaError):
+            IntentJournal(path)
+
+        path2 = tmp_path / "v1bad3.json"
+        rec2 = _v1_record("C-BAD")
+        rec2["target_broker_order_id"] = "900"
+        _dump_v1(path2, {"C-BAD": rec2})
+        with pytest.raises(IntentJournalSchemaError):
+            IntentJournal(path2)
+
+    def test_cancel_is_persisted_as_v2(self, tmp_path):
+        j = _journal(tmp_path, "c2v2.json")
+        j.begin(
+            OrderIntent.for_cancel(
+                operation_id="CANCEL:X", target_client_order_id="X",
+                instrument=INSTRUMENT, side="BUY", order_type="MARKET",
+                quantity=1.0,
+            )
+        )
+        raw = json.loads(j.path.read_text(encoding="utf-8"))
+        assert raw["schema_version"] == SCHEMA_VERSION
+        assert raw["intents"]["CANCEL:X"]["operation"] == OPERATION_CANCEL
+
+    def test_cancels_not_confused_with_opens_on_recovery(self, tmp_path):
+        j = _journal(tmp_path, "mix.json")
+        j.begin(OrderIntent.from_order(_order("C-OPEN")))
+        j.begin(
+            OrderIntent.for_cancel(
+                operation_id="CANCEL:C-OPEN", target_client_order_id="C-OPEN",
+                instrument=INSTRUMENT, side="BUY", order_type="MARKET",
+                quantity=1.0,
+            )
+        )
+        # La recuperacion de APERTURAS nunca consulta el id de cancelacion.
+        spy_open = _SpyBroker({
+            "C-OPEN": _broker_order("C-OPEN", BrokerOrderState.FILLED),
+            "CANCEL:C-OPEN": _broker_order("C-OPEN", BrokerOrderState.CANCELLED),
+        })
+        recover_pending_intents(j, spy_open)
+        assert spy_open.asked == ["C-OPEN"]
+
+        # La recuperacion de CANCELACIONES consulta el OBJETIVO, no el op id.
+        j2 = IntentJournal(j.path)
+        spy_cancel = _SpyBroker({
+            "C-OPEN": _broker_order("C-OPEN", BrokerOrderState.CANCELLED),
+            "CANCEL:C-OPEN": _broker_order("C-OPEN", BrokerOrderState.FILLED),
+        })
+        outcomes = recover_pending_cancels(j2, spy_cancel)
+        assert spy_cancel.asked == ["C-OPEN"]
+        assert outcomes[0].result == "RESOLVED_CANCELLED"
+        assert j2.get("CANCEL:C-OPEN").state == "CANCELLED"
+
+    def test_new_schema_not_silently_read_as_v1(self, tmp_path):
+        # Un lector que solo entiende v1 (version antigua de Atlas) DEBE fallar
+        # cerrado ante el schema nuevo, no ignorar `operation`.
+        p_new = tmp_path / "new.json"
+        j = IntentJournal.initialize(p_new)
+        j.begin(OrderIntent.from_order(_order("C-NEW")))
+        raw = json.loads(p_new.read_text(encoding="utf-8"))
+        assert raw["schema_version"] == SCHEMA_VERSION == 2
+
+        def _old_v1_loader(path):
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if data.get("schema_version") != SCHEMA_VERSION_V1:
+                raise IntentJournalSchemaError("lector v1: schema no soportada")
+            return data
+
+        with pytest.raises(IntentJournalSchemaError):
+            _old_v1_loader(p_new)
+
+        # El lector NUEVO tambien falla cerrado ante un esquema desconocido/futuro.
+        p_unknown = tmp_path / "unknown.json"
+        IntentJournal.initialize(p_unknown)
+        p_unknown.write_text(
+            json.dumps({"schema_version": 999, "intents": {}}), encoding="utf-8"
+        )
+        with pytest.raises(IntentJournalSchemaError):
+            IntentJournal(p_unknown)
+
+    def test_restart_preserves_unknown_and_pending_cancel(self, tmp_path):
+        path = tmp_path / "persist.json"
+        j = IntentJournal.initialize(path)
+        j.begin(OrderIntent.from_order(_order("C-UNK")))
+        j.mark_state("C-UNK", "UNKNOWN")
+        j.begin(
+            OrderIntent.for_cancel(
+                operation_id="CANCEL:C-UNK", target_client_order_id="C-UNK",
+                instrument=INSTRUMENT, side="BUY", order_type="MARKET",
+                quantity=1.0,
+            )
+        )
+        j2 = IntentJournal(path)
+        assert j2.get("C-UNK").state == "UNKNOWN"
+        assert j2.get("C-UNK").terminal is False
+        ci = j2.get("CANCEL:C-UNK")
+        assert ci.operation == OPERATION_CANCEL
+        assert ci.target_client_order_id == "C-UNK"
+        assert ci.terminal is False
+        assert {i.client_order_id for i in j2.unresolved()} == {
+            "C-UNK", "CANCEL:C-UNK",
+        }
+
+    def test_migration_preserves_identity_fills_tombstones(self, tmp_path):
+        path = tmp_path / "mig.json"
+        filled = _v1_record("C-FILLED")
+        filled["state"] = "FILLED"
+        filled["fills_applied"] = [0, 1]
+        filled["broker_order_id"] = "777"
+        pending = _v1_record("C-PEND")
+        _dump_v1(path, {"C-FILLED": filled, "C-PEND": pending})
+
+        j = IntentJournal(path)
+        assert j.loaded_schema_version == SCHEMA_VERSION_V1
+        assert j.get("C-FILLED").fills_applied == (0, 1)
+        assert j.get("C-FILLED").state == "FILLED"
+        assert j.get("C-FILLED").broker_order_id == "777"
+        assert {t.client_order_id for t in j.tombstones()} == {"C-FILLED"}
+
+        assert j.migrate_if_needed() is True
+        assert j.migrate_if_needed() is False  # ya migrado: idempotente
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        assert raw["schema_version"] == SCHEMA_VERSION
+
+        # Reabrir: identidades, fills, tombstones y estados intactos.
+        j2 = IntentJournal(path)
+        assert j2.loaded_schema_version == SCHEMA_VERSION
+        assert j2.get("C-FILLED").fills_applied == (0, 1)
+        assert j2.get("C-FILLED").broker_order_id == "777"
+        assert j2.get("C-PEND").state == "CREATED"
+        assert {t.client_order_id for t in j2.tombstones()} == {"C-FILLED"}
+        assert [i.client_order_id for i in j2.unresolved()] == ["C-PEND"]

@@ -35,17 +35,23 @@ from typing import Any, Callable
 
 from execution.instrument import InstrumentSpec
 from execution.intent_journal import (
+    OPERATION_CANCEL,
+    OPERATION_OPEN,
     IntentJournal,
     IntentJournalError,
     OrderIntent,
+    recover_pending_cancels,
     recover_pending_intents,
 )
 from execution.order import Order, OrderSide, OrderType
 from execution.order_manager import OrderManager, OrderStateError
 
 from brokers.models import (
+    BrokerConnectionError,
     BrokerOrder,
     BrokerOrderState,
+    OrderNotFoundError,
+    OrderRejectedError,
     OrderSubmission,
     SubmitStatus,
 )
@@ -143,37 +149,71 @@ def check_market_data_reference(
 class ExecutionGate:
     """Gate de capacidad que enlaza el adapter con el coordinador.
 
-    Solo quien posee el token puede `approve`/`consume`. El adapter, que recibe
-    el gate pero NO el token, unicamente puede `check`. Esto impide que un
-    caller con el adapter en la mano envie una orden sin pasar por el
-    coordinador (que es el unico que aprueba `client_order_id`).
+    Solo quien posee el token puede `approve*`/`consume*`. El adapter, que recibe
+    el gate pero NO el token, unicamente puede `check*`. Esto impide que un
+    caller con el adapter en la mano envie/cancele sin pasar por el coordinador.
+
+    MT5-DEMO-EXECUTION-CONTROLS-02A: cada permiso queda ligado a la TUPLA
+    `(kind, op_id, target)`:
+
+      * `kind` distingue el TIPO de operacion (`OPEN` vs `CANCEL`): un permiso
+        de apertura NUNCA autoriza una cancelacion (y viceversa);
+      * `op_id` es la identidad de la operacion;
+      * `target` es el objetivo exacto (`client_order_id` afectado).
+
+    Los metodos historicos `approve`/`consume`/`check` son el caso `OPEN` con
+    `op_id == target == client_order_id` (compatibilidad LIVE-09 intacta).
     """
 
     def __init__(self, token: str) -> None:
         if not isinstance(token, str) or not token:
             raise ValueError("ExecutionGate requiere un token no vacio")
         self.__token = token
-        self._approved: set[str] = set()
+        self._approved: set[tuple[str, str, str]] = set()
 
     def _require_token(self, token: str) -> None:
         if not isinstance(token, str) or token != self.__token:
             raise ExecutionNotAuthorizedError("token de autorizacion invalido")
 
-    def approve(self, client_order_id: str, *, token: str) -> None:
+    # -------------------------------------------------- permisos por operacion
+
+    def approve_operation(
+        self, kind: str, *, op_id: str, target: str, token: str
+    ) -> None:
         self._require_token(token)
-        self._approved.add(client_order_id)
+        self._approved.add((str(kind), str(op_id), str(target)))
+
+    def consume_operation(
+        self, kind: str, *, op_id: str, target: str, token: str
+    ) -> None:
+        self._require_token(token)
+        self._approved.discard((str(kind), str(op_id), str(target)))
+
+    def check_operation(self, kind: str, *, op_id: str, target: str) -> None:
+        """Invocado por el adapter (submit/cancel). No requiere token."""
+        if (str(kind), str(op_id), str(target)) not in self._approved:
+            raise ExecutionNotAuthorizedError(
+                f"operacion {kind!r} sin autorizacion explicita del coordinador: "
+                f"op_id={op_id!r} target={target!r}"
+            )
+
+    # -------------------------------------------------- compatibilidad OPEN
+
+    def approve(self, client_order_id: str, *, token: str) -> None:
+        self.approve_operation(
+            OPERATION_OPEN, op_id=client_order_id, target=client_order_id, token=token
+        )
 
     def consume(self, client_order_id: str, *, token: str) -> None:
-        self._require_token(token)
-        self._approved.discard(client_order_id)
+        self.consume_operation(
+            OPERATION_OPEN, op_id=client_order_id, target=client_order_id, token=token
+        )
 
     def check(self, client_order_id: str) -> None:
         """Invocado por el adapter en `submit_order`. No requiere token."""
-        if client_order_id not in self._approved:
-            raise ExecutionNotAuthorizedError(
-                f"submit sin autorizacion explicita del coordinador: "
-                f"{client_order_id!r}"
-            )
+        self.check_operation(
+            OPERATION_OPEN, op_id=client_order_id, target=client_order_id
+        )
 
     @property
     def approved_count(self) -> int:
@@ -305,6 +345,10 @@ class LiveExecutionCoordinator:
         """
         primed = 0
         for intent in self._journal.all():
+            # 02A: la identidad cid<->ticket es de una orden de TRADING (OPEN);
+            # el id de una operacion de cancelacion NO es una orden del broker.
+            if intent.operation != OPERATION_OPEN:
+                continue
             broker_id = intent.broker_order_id
             if not broker_id:
                 continue
@@ -317,8 +361,17 @@ class LiveExecutionCoordinator:
         return primed
 
     def resolve_pending(self):
-        """Resuelve (SOLO lookup) los intents pendientes. NUNCA reenvia."""
+        """Resuelve (SOLO lookup) los intents de APERTURA pendientes. NUNCA reenvia."""
         return recover_pending_intents(self._journal, self._broker, clock=self._clock)
+
+    def resolve_pending_cancels(self):
+        """Resuelve (SOLO lookup) las cancelaciones pendientes. NUNCA repite.
+
+        Mira el estado autoritativo del OBJETIVO; jamas reenvia ni cancela a
+        ciegas. Un target `SUBMITTED`/`PARTIALLY_FILLED` deja la cancelacion sin
+        resolver (no se repite automaticamente).
+        """
+        return recover_pending_cancels(self._journal, self._broker, clock=self._clock)
 
     # ---------------------------------------------------------- reconciliacion
 
@@ -545,6 +598,210 @@ class LiveExecutionCoordinator:
             self._broker.remember_identity(cid, int(broker_id))
         except (TypeError, ValueError):
             return
+
+    # ---------------------------------------------- cancelacion (02A)
+
+    def _order_by_client_id(self, client_order_id: str) -> Order | None:
+        for order in self._order_manager.orders.values():
+            if order.client_order_id == client_order_id:
+                return order
+        return None
+
+    def _adopt_target_cancelled(self, target_cid: str) -> None:
+        """Refleja en el estado interno que el OBJETIVO quedo CANCELLED."""
+        intent = self._journal.get(target_cid)
+        if intent is not None and not intent.terminal:
+            self._journal.mark_state(target_cid, "CANCELLED")
+        order = self._order_by_client_id(target_cid)
+        if order is not None and not order.status.terminal:
+            try:
+                self._order_manager.cancel(order.order_id)
+            except OrderStateError:
+                pass
+
+    def _adopt_target_state(self, target_cid: str, broker_order) -> None:
+        """Adopta el estado AUTORITATIVO del broker para el objetivo (journal)."""
+        intent = self._journal.get(target_cid)
+        state = getattr(getattr(broker_order, "state", None), "value", None)
+        if intent is None or not state or intent.terminal:
+            return
+        try:
+            self._journal.mark_state(target_cid, state)
+        except IntentJournalError:
+            pass
+
+    def cancel_pending(
+        self, *, client_order_id: str, operation_id: str | None = None
+    ) -> ExecutionOutcome:
+        """Cancelacion COORDINADA de una orden de APERTURA pendiente (02A).
+
+        Alcance: SOLO ordenes originales de apertura identificadas de forma
+        inequivoca. NO cierra/reduce posiciones ni cancela ordenes de reduccion
+        (fuera de alcance). Una cancelacion REDUCE exposicion POTENCIAL, por lo
+        que NO se bloquea por el veto de nuevas entradas; pero exige broker sano,
+        evidencia ACTUAL del broker sobre la orden exacta, write-ahead del intent
+        y autorizacion de capacidad `CANCEL`. Un resultado ambiguo NO se reenvia:
+        queda `UNKNOWN` y se resuelve solo por lookup. La repeticion de una
+        solicitud ya resuelta es idempotente (no vuelve a llamar al broker).
+        """
+        target_cid = str(client_order_id or "")
+        if not target_cid:
+            raise ExecutionBlockedError("identity", "client_order_id obligatorio")
+        op_id = str(operation_id) if operation_id else f"CANCEL:{target_cid}"
+
+        # 1) Idempotencia: resuelta => no-op; sin resolver => NO repetir a ciegas.
+        existing = self._journal.get(op_id)
+        if existing is not None:
+            if existing.terminal:
+                return ExecutionOutcome(
+                    allowed=True,
+                    stage="cancel_idempotent",
+                    reason="cancelacion ya resuelta; sin segunda llamada al broker",
+                    intent=existing,
+                )
+            raise ExecutionBlockedError(
+                "cancel_pending",
+                "cancelacion previa sin resolver: resolver por lookup (no repetir)",
+            )
+
+        # 2) Objetivo identificado inequivocamente: intent OPEN de apertura.
+        target_intent = self._journal.get(target_cid)
+        if target_intent is None:
+            raise ExecutionBlockedError(
+                "cancel_target", "objetivo sin intent de apertura identificable"
+            )
+        if target_intent.operation != OPERATION_OPEN:
+            raise ExecutionBlockedError(
+                "cancel_target", "el objetivo no es una apertura (fuera de alcance 02A)"
+            )
+        if target_intent.reduce_only:
+            raise ExecutionBlockedError(
+                "cancel_target", "orden de reduccion: fuera de alcance 02A"
+            )
+
+        # 3) Broker sano: necesario para obtener evidencia y para cancelar.
+        self._assert_broker_health()
+
+        # 4) Evidencia ACTUAL del broker sobre la orden EXACTA (aunque la
+        #    reconciliacion este bloqueada: no se usa ninguna suposicion).
+        try:
+            current = self._broker.get_order(target_cid)
+        except OrderNotFoundError:
+            raise ExecutionBlockedError(
+                "cancel_evidence", "el broker no conoce la orden objetivo"
+            )
+        except BrokerConnectionError:
+            raise ExecutionBlockedError(
+                "cancel_evidence", "estado del broker incierto"
+            )
+        if current is None:
+            raise ExecutionBlockedError(
+                "cancel_evidence", "el broker no conoce la orden objetivo"
+            )
+        if current.state is BrokerOrderState.UNKNOWN:
+            raise ExecutionBlockedError(
+                "cancel_evidence", "estado de la orden no determinable"
+            )
+        if current.state is BrokerOrderState.CANCELLED:
+            self._adopt_target_cancelled(target_cid)
+            return ExecutionOutcome(
+                allowed=True,
+                stage="cancel_already_done",
+                reason="la orden ya estaba cancelada en el broker",
+            )
+        if current.state is BrokerOrderState.FILLED:
+            self._adopt_target_state(target_cid, current)
+            raise ExecutionBlockedError(
+                "cancel_target_filled",
+                "orden ya ejecutada: no se cancela; se preservan los fills",
+            )
+        if current.state in (BrokerOrderState.REJECTED, BrokerOrderState.EXPIRED):
+            self._adopt_target_state(target_cid, current)
+            raise ExecutionBlockedError(
+                "cancel_target_terminal",
+                f"orden en estado {current.state.value}: nada pendiente que cancelar",
+            )
+        # SUBMITTED / PARTIALLY_FILLED => cancelar SOLO el remanente pendiente.
+        if float(current.remaining) <= 0.0:
+            self._adopt_target_state(target_cid, current)
+            raise ExecutionBlockedError(
+                "cancel_target_filled", "sin remanente pendiente que cancelar"
+            )
+
+        # 5) Write-ahead del intent de cancelacion ANTES de tocar el broker.
+        cancel_intent = OrderIntent.for_cancel(
+            operation_id=op_id,
+            target_client_order_id=target_cid,
+            instrument=target_intent.instrument,
+            side=target_intent.side,
+            order_type=target_intent.order_type,
+            quantity=target_intent.quantity,
+            target_broker_order_id=(
+                current.broker_order_id or target_intent.broker_order_id
+            ),
+            run_id=self._run_id,
+        )
+        try:
+            intent = self._journal.begin(cancel_intent)
+        except IntentJournalError as exc:
+            raise ExecutionBlockedError("journal_persist", str(exc)) from exc
+
+        # 6) Autorizacion de capacidad `CANCEL` + llamada al broker.
+        self._gate.approve_operation(
+            OPERATION_CANCEL, op_id=op_id, target=target_cid, token=self._token
+        )
+        try:
+            broker_order = self._broker.cancel_order(
+                target_cid, operation_id=op_id
+            )
+        except OrderRejectedError as exc:
+            self._journal.mark_state(op_id, "REJECTED")
+            raise ExecutionBlockedError("cancel_rejected", str(exc)) from exc
+        except OrderNotFoundError as exc:
+            # NOT_FOUND no prueba nada: permanece sin resolver (sin suposicion).
+            raise ExecutionBlockedError(
+                "cancel_not_found", "el broker no conoce entonces la orden"
+            ) from exc
+        except BrokerConnectionError as exc:
+            self._journal.mark_state(op_id, "UNKNOWN")
+            raise ExecutionBlockedError(
+                "cancel_unknown", "resultado incierto: resolver por lookup"
+            ) from exc
+        finally:
+            self._gate.consume_operation(
+                OPERATION_CANCEL, op_id=op_id, target=target_cid, token=self._token
+            )
+
+        # 7) Reflexion del resultado (verdad del broker).
+        state = getattr(broker_order, "state", None)
+        if state is BrokerOrderState.CANCELLED:
+            self._journal.mark_state(
+                op_id, "CANCELLED",
+                broker_order_id=getattr(broker_order, "broker_order_id", None),
+            )
+            self._adopt_target_cancelled(target_cid)
+            return ExecutionOutcome(
+                allowed=True,
+                stage="cancel_confirmed",
+                reason="cancelacion confirmada; remanente pendiente cancelado",
+                intent=intent,
+            )
+        if state is BrokerOrderState.FILLED:
+            self._journal.mark_state(
+                op_id, "REJECTED",
+                broker_order_id=getattr(broker_order, "broker_order_id", None),
+            )
+            self._adopt_target_state(target_cid, broker_order)
+            raise ExecutionBlockedError(
+                "cancel_target_filled",
+                "la orden se ejecuto: no cancelada; se preservan los fills",
+            )
+        # Aun SUBMITTED/PARTIALLY_FILLED tras cancelar: sin resolver, sin reenvio.
+        self._journal.mark_state(op_id, "UNKNOWN")
+        raise ExecutionBlockedError(
+            "cancel_unknown",
+            f"estado tras cancelar {getattr(state, 'value', state)}: sin resolver",
+        )
 
 
 __all__ = [

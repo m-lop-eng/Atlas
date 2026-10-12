@@ -75,7 +75,31 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
-SCHEMA_VERSION = 1
+# MT5-DEMO-EXECUTION-CONTROLS-02A (revision de compatibilidad):
+#   * v1 = formato LIVE-08 (solo intents de APERTURA; sin campos de operacion).
+#   * v2 = formato con semantica de operacion (`operation` OPEN/CANCEL y
+#     `target_client_order_id`/`target_broker_order_id`).
+# El writer SIEMPRE persiste `SCHEMA_VERSION` (v2). Un lector antiguo (que exige
+# v1) DEBE fallar cerrado ante el nuevo esquema, en vez de ignorar
+# `operation=CANCEL` y confundir una cancelacion con una apertura.
+# La version declarada DETERMINA el contrato: un journal v1 legitimo solo puede
+# contener registros sin campos v2 (=> OPEN). Un journal declarado v1 que incluya
+# cualquier campo exclusivo de v2 es INCONSISTENTE y se rechaza (fail-closed).
+SCHEMA_VERSION = 2
+SCHEMA_VERSION_V1 = 1
+_READABLE_SCHEMA_VERSIONS = frozenset({SCHEMA_VERSION_V1, SCHEMA_VERSION})
+
+# Campos exclusivos del esquema v2: NO pueden aparecer en un documento v1.
+_V2_ONLY_FIELDS = (
+    "operation",
+    "target_client_order_id",
+    "target_broker_order_id",
+)
+
+# MT5-DEMO-EXECUTION-CONTROLS-02A: tipo de operacion del intent.
+OPERATION_OPEN = "OPEN"
+OPERATION_CANCEL = "CANCEL"
+_KNOWN_OPERATIONS = frozenset({OPERATION_OPEN, OPERATION_CANCEL})
 
 # Estados del ciclo de vida persistidos. Es un superconjunto de
 # `OrderStatus`/`BrokerOrderState` (SUBm...); `CREATED` es el estado
@@ -160,6 +184,11 @@ class OrderIntent:
     broker_order_id: str | None = None
     fills_applied: tuple[int, ...] = ()
     updated_at: str | None = None
+    # MT5-DEMO-EXECUTION-CONTROLS-02A: tipo de operacion y objetivo canonico.
+    # Default OPEN/None => los intents LIVE-08 existentes no cambian.
+    operation: str = OPERATION_OPEN
+    target_client_order_id: str | None = None
+    target_broker_order_id: str | None = None
 
     @property
     def terminal(self) -> bool:
@@ -197,6 +226,45 @@ class OrderIntent:
             ),
         )
 
+    @staticmethod
+    def for_cancel(
+        *,
+        operation_id: str,
+        target_client_order_id: str,
+        instrument: str,
+        side: str,
+        order_type: str,
+        quantity: float,
+        target_broker_order_id: str | int | None = None,
+        run_id: str | None = None,
+    ) -> "OrderIntent":
+        """Construye el intent DURABLE de una operacion de cancelacion (02A).
+
+        Identidad de operacion = `operation_id` (p.ej. `CANCEL:<cid>`); referencia
+        canonica al `client_order_id` original en `target_client_order_id` y, si
+        se conoce, a su ticket en `target_broker_order_id`. `order_id` es
+        determinista para que una repeticion sea idempotente (`begin`).
+        `side`/`order_type`/`quantity` copian la orden original solo como
+        metadatos del objetivo (no se crea una segunda orden de trading).
+        """
+        return OrderIntent(
+            client_order_id=str(operation_id),
+            order_id=f"CANCELORD:{operation_id}",
+            instrument=str(instrument),
+            side=str(side),
+            order_type=str(order_type),
+            quantity=float(quantity),
+            reduce_only=False,
+            run_id=run_id,
+            operation=OPERATION_CANCEL,
+            target_client_order_id=str(target_client_order_id),
+            target_broker_order_id=(
+                str(target_broker_order_id)
+                if target_broker_order_id is not None
+                else None
+            ),
+        )
+
     def to_dict(self) -> dict:
         return {
             "client_order_id": self.client_order_id,
@@ -218,6 +286,9 @@ class OrderIntent:
             "broker_order_id": self.broker_order_id,
             "fills_applied": list(self.fills_applied),
             "updated_at": self.updated_at,
+            "operation": self.operation,
+            "target_client_order_id": self.target_client_order_id,
+            "target_broker_order_id": self.target_broker_order_id,
         }
 
     @staticmethod
@@ -243,6 +314,18 @@ class OrderIntent:
             raise IntentJournalCorruptionError(f"estado desconocido: {state!r}")
         if quantity <= 0 or quantity != quantity:
             raise IntentJournalCorruptionError(f"quantity invalida: {quantity!r}")
+        # 02A: campos ADITIVOS. Ausentes => OPEN (registros LIVE-08 intactos).
+        operation = str(d.get("operation", OPERATION_OPEN))
+        if operation not in _KNOWN_OPERATIONS:
+            raise IntentJournalCorruptionError(
+                f"operacion desconocida: {operation!r}"
+            )
+        target_cid = d.get("target_client_order_id")
+        target_bid = d.get("target_broker_order_id")
+        if operation == OPERATION_CANCEL and not target_cid:
+            raise IntentJournalCorruptionError(
+                "intent CANCEL sin target_client_order_id (objetivo no identificable)"
+            )
         return OrderIntent(
             client_order_id=cid,
             order_id=order_id,
@@ -263,6 +346,9 @@ class OrderIntent:
             broker_order_id=d.get("broker_order_id"),
             fills_applied=fills,
             updated_at=d.get("updated_at"),
+            operation=operation,
+            target_client_order_id=target_cid,
+            target_broker_order_id=target_bid,
         )
 
 
@@ -344,6 +430,7 @@ class IntentJournal:
         self._clock = clock
         self._marker_path = self.path.with_name(self.path.name + ".init")
         self._intents: dict[str, OrderIntent] = {}
+        self._loaded_version: int = SCHEMA_VERSION
         has_journal = self.path.exists()
         has_marker = self._marker_path.exists()
         if has_marker and not has_journal:
@@ -383,6 +470,30 @@ class IntentJournal:
     @property
     def marker_path(self) -> Path:
         return self._marker_path
+
+    @property
+    def schema_version(self) -> int:
+        """Version de esquema con la que se PERSISTE el journal (actual)."""
+        return SCHEMA_VERSION
+
+    @property
+    def loaded_schema_version(self) -> int:
+        """Version de esquema LEIDA del fichero (o la actual en primer init)."""
+        return self._loaded_version
+
+    def migrate_if_needed(self) -> bool:
+        """Migra el journal a la version de esquema ACTUAL si procede.
+
+        Determinista y NO destructivo: reescribe el MISMO conjunto de intents
+        (identidades, fills aplicados, tombstones y estados terminales intactos)
+        con `schema_version` actual. La conversion de registros v1 es implicita:
+        un registro sin `operation` es OPEN. Devuelve True si reescribio.
+        """
+        if self._loaded_version >= SCHEMA_VERSION:
+            return False
+        self._persist()
+        self._loaded_version = SCHEMA_VERSION
+        return True
 
     # --------------------------------------------------------------- consulta
 
@@ -552,9 +663,24 @@ class IntentJournal:
             broker_order_id=base.get("broker_order_id", intent.broker_order_id),
             fills_applied=base.get("fills_applied", intent.fills_applied),
             updated_at=base["updated_at"],
+            operation=intent.operation,
+            target_client_order_id=intent.target_client_order_id,
+            target_broker_order_id=intent.target_broker_order_id,
         )
 
     def to_dict(self) -> dict:
+        # Invariante 02A: una operacion CANCEL exige esquema v2. El writer
+        # declara SIEMPRE `SCHEMA_VERSION`; si alguna vez se rebajara por debajo
+        # de v2 con un CANCEL presente, se falla cerrado en vez de persistir un
+        # documento v1 que ocultaria la operacion.
+        if (
+            SCHEMA_VERSION < SCHEMA_VERSION_V1 + 1
+            and any(i.operation != OPERATION_OPEN for i in self._intents.values())
+        ):
+            raise IntentJournalError(
+                "operacion CANCEL requiere schema v2; el writer declara "
+                f"v{SCHEMA_VERSION} (fail-closed)"
+            )
         return {
             "schema_version": SCHEMA_VERSION,
             "updated_at": self._clock().isoformat(),
@@ -610,16 +736,35 @@ class IntentJournal:
         if not isinstance(data, dict):
             raise IntentJournalCorruptionError("journal no es un objeto JSON")
         version = data.get("schema_version")
-        if version != SCHEMA_VERSION:
+        if version not in _READABLE_SCHEMA_VERSIONS:
+            # Fail-closed: una version que no entendemos (incluida una FUTURA)
+            # NO se interpreta silenciosamente como v1 (eso ignoraria
+            # `operation=CANCEL`). Igual criterio que exige el lector antiguo
+            # frente al schema nuevo.
             raise IntentJournalSchemaError(
-                f"schema_version {version!r} desconocida (esperada "
-                f"{SCHEMA_VERSION}); fail-closed"
+                f"schema_version {version!r} no soportada (soportadas "
+                f"{sorted(_READABLE_SCHEMA_VERSIONS)}); fail-closed"
             )
+        self._loaded_version = int(version)
         intents = data.get("intents")
         if not isinstance(intents, dict):
             raise IntentJournalCorruptionError("bloque `intents` invalido")
         parsed: dict[str, OrderIntent] = {}
         for cid, payload in intents.items():
+            # La version declarada determina el contrato: un journal v1 NO puede
+            # contener campos exclusivos de v2 (seria un CANCEL oculto que un
+            # lector v1 interpretaria como OPEN).
+            if (
+                self._loaded_version == SCHEMA_VERSION_V1
+                and isinstance(payload, dict)
+                and any(key in payload for key in _V2_ONLY_FIELDS)
+            ):
+                present = [k for k in _V2_ONLY_FIELDS if k in payload]
+                raise IntentJournalSchemaError(
+                    f"journal v1 inconsistente: el intent {cid!r} declara campos "
+                    f"exclusivos de v2 {present}; fail-closed (no se interpreta "
+                    "silenciosamente como OPEN)"
+                )
             intent = OrderIntent.from_dict(payload)
             if intent.client_order_id != cid:
                 raise IntentJournalCorruptionError(
@@ -652,6 +797,10 @@ def recover_pending_intents(
 
     outcomes: list[IntentRecoveryOutcome] = []
     for intent in journal.unresolved():
+        # 02A: la resolucion de cancelaciones es un flujo SEPARADO
+        # (`recover_pending_cancels`); aqui solo se resuelven intents de APERTURA.
+        if intent.operation != OPERATION_OPEN:
+            continue
         cid = intent.client_order_id
         try:
             bro = broker.get_order(cid)
@@ -696,6 +845,118 @@ def recover_pending_intents(
     return tuple(outcomes)
 
 
+def recover_pending_cancels(
+    journal: IntentJournal,
+    broker,
+    *,
+    clock: Callable[[], datetime] = _utc_now,
+) -> tuple[IntentRecoveryOutcome, ...]:
+    """Resuelve (SOLO lookup) los intents de CANCELACION pendientes (02A).
+
+    Mira el estado AUTORITATIVO del OBJETIVO (`target_client_order_id`) en el
+    broker; NUNCA reenvia ni repite una cancelacion a ciegas:
+
+      * target `CANCELLED` -> la cancelacion se confirma: intent resuelto.
+      * target `SUBMITTED`/`PARTIALLY_FILLED` -> el objetivo sigue activo: NO se
+        repite la cancelacion automaticamente (permanece sin resolver).
+      * target `FILLED` -> NO se afirma que se cancelo; se preservan los fills y
+        se marca la cancelacion como no aplicable (REJECTED) para reconciliacion.
+      * target `REJECTED`/`EXPIRED` -> objetivo terminal sin exposicion pendiente:
+        cancelacion no aplicable (REJECTED).
+      * `NOT_FOUND`/`LOOKUP_UNCERTAIN`/`UNKNOWN`/identidad ambigua -> se mantiene
+        sin resolver y bloquea operaciones incompatibles.
+
+    NUNCA envia/cancela/reenvia ordenes. NUNCA borra intents.
+    """
+    from brokers.models import (
+        BrokerConnectionError,
+        BrokerOrderState,
+        OrderNotFoundError,
+    )
+
+    outcomes: list[IntentRecoveryOutcome] = []
+    for intent in journal.unresolved():
+        if intent.operation != OPERATION_CANCEL:
+            continue
+        op_id = intent.client_order_id
+        target = intent.target_client_order_id
+        if not target:
+            outcomes.append(
+                IntentRecoveryOutcome(op_id, "NOT_FOUND", intent.state)
+            )
+            continue
+        try:
+            bro = broker.get_order(target)
+        except OrderNotFoundError:
+            outcomes.append(
+                IntentRecoveryOutcome(op_id, "NOT_FOUND", intent.state)
+            )
+            continue
+        except BrokerConnectionError:
+            outcomes.append(
+                IntentRecoveryOutcome(op_id, "LOOKUP_UNCERTAIN", intent.state)
+            )
+            continue
+        except Exception:  # noqa: BLE001 - estado incierto => unresolved
+            outcomes.append(
+                IntentRecoveryOutcome(op_id, "LOOKUP_UNCERTAIN", intent.state)
+            )
+            continue
+        if bro is None:
+            outcomes.append(
+                IntentRecoveryOutcome(op_id, "NOT_FOUND", intent.state)
+            )
+            continue
+        if bro.state is BrokerOrderState.UNKNOWN:
+            outcomes.append(
+                IntentRecoveryOutcome(op_id, "BROKER_UNKNOWN", intent.state)
+            )
+            continue
+        if bro.state is BrokerOrderState.CANCELLED:
+            journal.mark_state(
+                op_id, "CANCELLED", broker_order_id=bro.broker_order_id
+            )
+            outcomes.append(
+                IntentRecoveryOutcome(
+                    op_id, "RESOLVED_CANCELLED", "CANCELLED",
+                    broker_order_id=bro.broker_order_id,
+                )
+            )
+            continue
+        if bro.state is BrokerOrderState.FILLED:
+            # No se confirma cancelacion: preservar fills; cancelacion no aplicable.
+            journal.mark_state(
+                op_id, "REJECTED", broker_order_id=bro.broker_order_id
+            )
+            outcomes.append(
+                IntentRecoveryOutcome(
+                    op_id, "TARGET_FILLED", "REJECTED",
+                    broker_order_id=bro.broker_order_id,
+                )
+            )
+            continue
+        if bro.state in (
+            BrokerOrderState.SUBMITTED,
+            BrokerOrderState.PARTIALLY_FILLED,
+        ):
+            outcomes.append(
+                IntentRecoveryOutcome(
+                    op_id, "TARGET_ACTIVE", intent.state,
+                    broker_order_id=bro.broker_order_id,
+                )
+            )
+            continue
+        # REJECTED/EXPIRED: objetivo terminal sin exposicion pendiente.
+        journal.mark_state(op_id, "REJECTED", broker_order_id=bro.broker_order_id)
+        outcomes.append(
+            IntentRecoveryOutcome(
+                op_id, "TARGET_TERMINAL", "REJECTED",
+                broker_order_id=bro.broker_order_id,
+            )
+        )
+    return tuple(outcomes)
+
+
 __all__ = [
     "IntentJournal",
     "IntentJournalCorruptionError",
@@ -705,7 +966,10 @@ __all__ = [
     "IntentJournalSchemaError",
     "IntentJournalStorageAmbiguousError",
     "IntentRecoveryOutcome",
+    "OPERATION_CANCEL",
+    "OPERATION_OPEN",
     "OrderIntent",
     "SCHEMA_VERSION",
+    "recover_pending_cancels",
     "recover_pending_intents",
 ]

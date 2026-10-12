@@ -14,9 +14,12 @@ import pytest
 
 from execution.instrument import InstrumentSpec
 from execution.intent_journal import (
+    OPERATION_CANCEL,
     IntentJournal,
     IntentJournalError,
     IntentJournalNotInitializedError,
+    OrderIntent,
+    recover_pending_cancels,
 )
 from execution.live_execution import (
     ACCOUNT_MARGIN_MODE_RETAIL_HEDGING,
@@ -32,13 +35,20 @@ from execution.order import Order, OrderSide, OrderType
 from execution.order_manager import OrderManager
 from risk.types import AccountRiskState
 
-from brokers.models import BrokerError, SubmitStatus
+from brokers.models import (
+    BrokerConnectionError,
+    BrokerError,
+    BrokerOrderState,
+    SubmitStatus,
+)
 from brokers.mt5 import (
     MT5BrokerAdapter,
     MT5Config,
     MT5Credentials,
     MT5Environment,
+    ORDER_STATE_CANCELED,
     ORDER_STATE_FILLED,
+    ORDER_STATE_PLACED,
     ORDER_TYPE_BUY,
     TRADE_ACTION_REMOVE,
 )
@@ -71,7 +81,9 @@ class FakeMT5:
         self.ticks: dict = {}
         self.check_retcode = 0
         self.send_mode = "ok"  # ok | none | raise | reject | ambiguous
+        self.remove_mode = "ok"  # ok | none | raise | reject | ambiguous
         self.send_count = 0
+        self.cancel_count = 0
         self.check_count = 0
         self._orders: dict = {}
         self._open_orders: dict = {}
@@ -92,6 +104,22 @@ class FakeMT5:
 
     def add_tick(self, name: str, bid: float, ask: float) -> None:
         self.ticks[name] = SimpleNamespace(bid=bid, ask=ask)
+
+    def add_open_order(self, ticket, *, symbol=INSTRUMENT, magic=0, comment="",
+                       type=ORDER_TYPE_BUY, volume=0.1, price=1.1,
+                       state=ORDER_STATE_PLACED) -> None:
+        self._open_orders[ticket] = SimpleNamespace(
+            ticket=ticket, symbol=symbol, magic=magic, comment=comment,
+            type=type, state=state, volume_initial=volume, volume_current=volume,
+            price_open=price,
+        )
+
+    def add_deal(self, ticket, order, *, volume=1.0, price=1.1, commission=0.0,
+                 time=1_700_000_000) -> None:
+        self._deals[ticket] = SimpleNamespace(
+            ticket=ticket, order=order, volume=volume, price=price,
+            commission=commission, time=time,
+        )
 
     # --- API MT5 simulada
     def initialize(self, **kwargs):
@@ -131,9 +159,9 @@ class FakeMT5:
         )
 
     def order_send(self, request):
-        self.send_count += 1
         if request.get("action") == TRADE_ACTION_REMOVE:
-            return SimpleNamespace(retcode=10009, order=0, deal=0, volume=0.0, price=0.0)
+            return self._send_remove(request)
+        self.send_count += 1
         if self.send_mode == "none":
             return None
         if self.send_mode == "raise":
@@ -155,6 +183,24 @@ class FakeMT5:
             retcode=10009, order=ticket, deal=deal_ticket,
             volume=request["volume"], price=request["price"],
         )
+
+    def _send_remove(self, request):
+        self.cancel_count += 1
+        if self.remove_mode == "none":
+            return None
+        if self.remove_mode == "raise":
+            raise RuntimeError("transporte")
+        if self.remove_mode == "ambiguous":
+            return SimpleNamespace(retcode=10012, order=0, deal=0, volume=0.0, price=0.0)
+        if self.remove_mode == "reject":
+            return SimpleNamespace(retcode=10006, order=0, deal=0, volume=0.0, price=0.0)
+        ticket = int(request["order"])
+        order = self._open_orders.pop(ticket, None)
+        if order is None:
+            return SimpleNamespace(retcode=10006, order=0, deal=0, volume=0.0, price=0.0)
+        order.state = ORDER_STATE_CANCELED
+        self._orders[ticket] = order
+        return SimpleNamespace(retcode=10009, order=ticket, deal=0, volume=0.0, price=0.0)
 
     def orders_get(self, ticket=None):
         rows = list(self._open_orders.values())
@@ -680,3 +726,435 @@ class TestGateBindingHardening:
         with pytest.raises(ExecutionNotAuthorizedError):
             adapter.submit_order(_new_order("C-EXC"))
         assert fake.send_count == 0
+
+
+# ==========================================================================
+# 13. MT5-DEMO-EXECUTION-CONTROLS-02A: cancelacion coordinada (FakeMT5)
+# ==========================================================================
+
+
+def _seed_open_intent(
+    journal,
+    cid: str,
+    *,
+    instrument: str = INSTRUMENT,
+    side: OrderSide = OrderSide.BUY,
+    order_type: OrderType = OrderType.MARKET,
+    quantity: float = 0.1,
+    reduce_only: bool = False,
+) -> OrderIntent:
+    return journal.begin(
+        OrderIntent(
+            client_order_id=cid,
+            order_id=f"ORD-{cid}",
+            instrument=instrument,
+            side=side.value,
+            order_type=order_type.value,
+            quantity=quantity,
+            reduce_only=reduce_only,
+        )
+    )
+
+
+def _plant_pending(adapter, fake, cid: str, ticket: int, *, volume: float = 0.1,
+                   price: float = 1.1, filled: float | None = None) -> int:
+    """Planta una orden PENDIENTE en el broker fake y correlaciona cid<->ticket."""
+    fake.add_open_order(
+        ticket, symbol=INSTRUMENT, magic=adapter._magic_for(cid),
+        comment=adapter._comment_for(cid), volume=volume, price=price,
+    )
+    if filled is not None:
+        fake.add_deal(ticket + 10_000, ticket, volume=filled, price=price)
+    adapter._remember(cid, ticket)
+    return ticket
+
+
+def _cancel(coord, cid: str):
+    return coord.cancel_pending(client_order_id=cid)
+
+
+class TestCoordinatedCancel:
+    def test_cancel_confirmed_and_idempotent(self, tmp_path):
+        journal = IntentJournal.initialize(tmp_path / "j.json")
+        coord, adapter, fake = _coord(journal=journal)
+        _seed_open_intent(journal, "CANC-1")
+        _plant_pending(adapter, fake, "CANC-1", 500)
+
+        out = _cancel(coord, "CANC-1")
+        assert out.allowed is True and out.stage == "cancel_confirmed"
+        assert fake.cancel_count == 1 and fake.send_count == 0
+
+        # journal: cancelacion resuelta y objetivo resuelto
+        ci = journal.get("CANCEL:CANC-1")
+        assert ci is not None and ci.operation == OPERATION_CANCEL
+        assert ci.state == "CANCELLED"
+        assert ci.target_client_order_id == "CANC-1"
+        assert ci.target_broker_order_id == "500"
+        assert journal.get("CANC-1").state == "CANCELLED"
+        assert adapter.get_order("CANC-1").state is BrokerOrderState.CANCELLED
+
+        # idempotencia: repetir la solicitud resuelta NO genera otra cancelacion
+        out2 = _cancel(coord, "CANC-1")
+        assert out2.allowed is True and out2.stage == "cancel_idempotent"
+        assert fake.cancel_count == 1
+
+    def test_cancel_partial_preserves_fills(self, tmp_path):
+        journal = IntentJournal.initialize(tmp_path / "j.json")
+        coord, adapter, fake = _coord(journal=journal)
+        _seed_open_intent(journal, "CANC-P", quantity=0.5)
+        _plant_pending(adapter, fake, "CANC-P", 501, volume=0.5, filled=0.2)
+
+        out = _cancel(coord, "CANC-P")
+        assert out.allowed and fake.cancel_count == 1
+        bro = adapter.get_order("CANC-P")
+        assert bro.state is BrokerOrderState.CANCELLED
+        # fills existentes PRESERVADOS; solo se cancela el remanente
+        assert bro.filled_quantity == pytest.approx(0.2)
+        assert len(bro.fills) == 1
+        assert bro.remaining == pytest.approx(0.3, abs=1e-9)
+        assert journal.get("CANC-P").state == "CANCELLED"
+
+    def test_cancel_uninitialized_journal_zero_trading(self, tmp_path):
+        fake = _fake()
+        with pytest.raises(IntentJournalNotInitializedError):
+            IntentJournal(tmp_path / "missing.json")
+        assert fake.send_count == 0 and fake.cancel_count == 0
+
+    def test_cancel_corrupt_journal_failclosed(self, tmp_path):
+        path = tmp_path / "j.json"
+        path.write_text("{ no-es-json", encoding="utf-8")
+        (tmp_path / "j.json.init").write_text("{}", encoding="utf-8")
+        with pytest.raises(IntentJournalError):
+            IntentJournal(path)
+
+    def test_cancel_write_ahead_failure_blocks(self, tmp_path, monkeypatch):
+        journal = IntentJournal.initialize(tmp_path / "j.json")
+        coord, adapter, fake = _coord(journal=journal)
+        _seed_open_intent(journal, "CANC-W")
+        _plant_pending(adapter, fake, "CANC-W", 502)
+
+        def boom(intent):
+            raise IntentJournalError("fallo de persistencia simulado")
+
+        monkeypatch.setattr(journal, "begin", boom)
+        with pytest.raises(ExecutionBlockedError) as ei:
+            _cancel(coord, "CANC-W")
+        assert ei.value.stage == "journal_persist"
+        assert fake.cancel_count == 0  # NUNCA se llama al broker
+        assert journal.get("CANCEL:CANC-W") is None
+
+    def test_direct_cancel_requires_operation_id(self, tmp_path):
+        journal = IntentJournal.initialize(tmp_path / "j.json")
+        coord, adapter, fake = _coord(journal=journal)
+        _plant_pending(adapter, fake, "CANC-G", 503)
+        with pytest.raises(BrokerError):
+            adapter.cancel_order("CANC-G")  # gate enlazado, sin operation_id
+        assert fake.cancel_count == 0
+
+    def test_direct_cancel_wrong_operation_id_blocked(self, tmp_path):
+        journal = IntentJournal.initialize(tmp_path / "j.json")
+        coord, adapter, fake = _coord(journal=journal)
+        _plant_pending(adapter, fake, "CANC-G2", 513)
+        with pytest.raises(ExecutionNotAuthorizedError):
+            adapter.cancel_order("CANC-G2", operation_id="CANCEL:OTRO")
+        assert fake.cancel_count == 0
+
+    def test_open_permission_cannot_authorize_cancel(self, tmp_path):
+        journal = IntentJournal.initialize(tmp_path / "j.json")
+        coord, adapter, fake = _coord(journal=journal)
+        _seed_open_intent(journal, "CANC-OP")
+        _plant_pending(adapter, fake, "CANC-OP", 512)
+
+        # un permiso OPEN para el target NO autoriza una cancelacion
+        coord._gate.approve("CANC-OP", token=coord._token)
+        # y un permiso CANCEL con objetivo INCORRECTO tampoco
+        coord._gate.approve_operation(
+            OPERATION_CANCEL, op_id="CANCEL:CANC-OP", target="OTRO",
+            token=coord._token,
+        )
+        with pytest.raises(ExecutionNotAuthorizedError):
+            adapter.cancel_order("CANC-OP", operation_id="CANCEL:CANC-OP")
+        assert fake.cancel_count == 0
+        # el coordinador (permiso correcto) si puede cancelar
+        out = _cancel(coord, "CANC-OP")
+        assert out.allowed and fake.cancel_count == 1
+
+    def test_consumed_permission_cannot_be_reused(self, tmp_path):
+        journal = IntentJournal.initialize(tmp_path / "j.json")
+        coord, adapter, fake = _coord(journal=journal)
+        _seed_open_intent(journal, "CANC-5")
+        _plant_pending(adapter, fake, "CANC-5", 505)
+        assert _cancel(coord, "CANC-5").allowed
+        # el permiso CANCEL correcto fue consumido: un uso posterior no autoriza
+        with pytest.raises(ExecutionNotAuthorizedError):
+            adapter.cancel_order("CANC-5", operation_id="CANCEL:CANC-5")
+        assert fake.cancel_count == 1
+
+    def test_cancel_ambiguous_unknown_no_auto_retry(self, tmp_path):
+        journal = IntentJournal.initialize(tmp_path / "j.json")
+        coord, adapter, fake = _coord(journal=journal)
+        _seed_open_intent(journal, "CANC-A")
+        _plant_pending(adapter, fake, "CANC-A", 504)
+        fake.remove_mode = "ambiguous"  # resultado incierto
+        with pytest.raises(ExecutionBlockedError) as ei:
+            _cancel(coord, "CANC-A")
+        assert ei.value.stage == "cancel_unknown"
+        assert fake.cancel_count == 1
+        assert journal.get("CANCEL:CANC-A").state == "UNKNOWN"
+        # repetir: sin resolver => NO se repite a ciegas
+        with pytest.raises(ExecutionBlockedError) as ei2:
+            _cancel(coord, "CANC-A")
+        assert ei2.value.stage == "cancel_pending"
+        assert fake.cancel_count == 1
+
+    def test_cancel_response_lost_unknown(self, tmp_path):
+        journal = IntentJournal.initialize(tmp_path / "j.json")
+        coord, adapter, fake = _coord(journal=journal)
+        _seed_open_intent(journal, "CANC-N")
+        _plant_pending(adapter, fake, "CANC-N", 514)
+        fake.remove_mode = "none"  # respuesta perdida
+        with pytest.raises(ExecutionBlockedError) as ei:
+            _cancel(coord, "CANC-N")
+        assert ei.value.stage == "cancel_unknown"
+        assert journal.get("CANCEL:CANC-N").state == "UNKNOWN"
+        assert fake.cancel_count == 1
+
+    def test_cancel_rejected(self, tmp_path):
+        journal = IntentJournal.initialize(tmp_path / "j.json")
+        coord, adapter, fake = _coord(journal=journal)
+        _seed_open_intent(journal, "CANC-RJ")
+        _plant_pending(adapter, fake, "CANC-RJ", 515)
+        fake.remove_mode = "reject"
+        with pytest.raises(ExecutionBlockedError) as ei:
+            _cancel(coord, "CANC-RJ")
+        assert ei.value.stage == "cancel_rejected"
+        assert journal.get("CANCEL:CANC-RJ").state == "REJECTED"
+
+    def test_cancel_target_already_cancelled_idempotent(self, tmp_path):
+        journal = IntentJournal.initialize(tmp_path / "j.json")
+        coord, adapter, fake = _coord(journal=journal)
+        _seed_open_intent(journal, "CANC-AC")
+        fake._orders[516] = SimpleNamespace(
+            ticket=516, symbol=INSTRUMENT, magic=adapter._magic_for("CANC-AC"),
+            comment=adapter._comment_for("CANC-AC"), type=ORDER_TYPE_BUY,
+            state=ORDER_STATE_CANCELED, volume_initial=0.1, volume_current=0.0,
+            price_open=1.1,
+        )
+        adapter._remember("CANC-AC", 516)
+        out = _cancel(coord, "CANC-AC")
+        assert out.allowed and out.stage == "cancel_already_done"
+        assert fake.cancel_count == 0  # ya cancelada: sin segunda llamada
+        assert journal.get("CANC-AC").state == "CANCELLED"
+
+    def test_cancel_filled_target_blocked_preserves_fills(self, tmp_path):
+        journal = IntentJournal.initialize(tmp_path / "j.json")
+        coord, adapter, fake = _coord(journal=journal)
+        _seed_open_intent(journal, "CANC-F")
+        fake._orders[517] = SimpleNamespace(
+            ticket=517, symbol=INSTRUMENT, magic=adapter._magic_for("CANC-F"),
+            comment=adapter._comment_for("CANC-F"), type=ORDER_TYPE_BUY,
+            state=ORDER_STATE_FILLED, volume_initial=0.1, volume_current=0.0,
+            price_open=1.1,
+        )
+        fake.add_deal(5170, 517, volume=0.1, price=1.1)
+        adapter._remember("CANC-F", 517)
+        with pytest.raises(ExecutionBlockedError) as ei:
+            _cancel(coord, "CANC-F")
+        assert ei.value.stage == "cancel_target_filled"
+        assert fake.cancel_count == 0
+        # no se afirma cancelacion; fills preservados en el broker
+        assert len(adapter.get_order("CANC-F").fills) == 1
+
+    def test_kill_switch_does_not_block_cancel_but_blocks_open(self, tmp_path):
+        journal = IntentJournal.initialize(tmp_path / "j.json")
+        kill = FakeKillSwitch(can_trade=False, state="BLOCK_NEW_ORDERS")
+        coord, adapter, fake = _coord(journal=journal, kill_switch=kill)
+        _seed_open_intent(journal, "CANC-K")
+        _plant_pending(adapter, fake, "CANC-K", 506)
+        out = _cancel(coord, "CANC-K")
+        assert out.allowed and fake.cancel_count == 1
+        # el veto de nuevas entradas SI bloquea un OPEN
+        with pytest.raises(ExecutionBlockedError) as ei:
+            _submit(coord, "OPEN-K")
+        assert ei.value.stage == "kill_switch"
+
+    def test_reconciliation_blocked_allows_verified_cancel(self, tmp_path):
+        journal = IntentJournal.initialize(tmp_path / "j.json")
+        coord, adapter, fake = _coord(journal=journal)
+        _seed_open_intent(journal, "CANC-RB")
+        _plant_pending(adapter, fake, "CANC-RB", 507)
+        coord.update_reconciliation(ReconciliationStatus.RECONCILIATION_BLOCKED)
+        out = _cancel(coord, "CANC-RB")
+        assert out.allowed and fake.cancel_count == 1
+
+    def test_unhealthy_broker_blocks_cancel(self, tmp_path):
+        journal = IntentJournal.initialize(tmp_path / "j.json")
+        coord, adapter, fake = _coord(journal=journal)
+        _seed_open_intent(journal, "CANC-UH")
+        _plant_pending(adapter, fake, "CANC-UH", 508)
+        adapter._state = "DISCONNECTED"  # broker no sano
+        with pytest.raises(ExecutionBlockedError) as ei:
+            _cancel(coord, "CANC-UH")
+        assert ei.value.stage == "broker_health"
+        assert fake.cancel_count == 0
+
+    def test_unresolved_open_cancellable_new_opens_stay_blocked(self, tmp_path):
+        journal = IntentJournal.initialize(tmp_path / "j.json")
+        coord, adapter, fake = _coord(journal=journal)
+        _seed_open_intent(journal, "CANC-UN")
+        journal.mark_state("CANC-UN", "UNKNOWN")
+        _seed_open_intent(journal, "OTHER-UN")
+        journal.mark_state("OTHER-UN", "UNKNOWN")
+        _plant_pending(adapter, fake, "CANC-UN", 509)
+        out = _cancel(coord, "CANC-UN")
+        assert out.allowed and fake.cancel_count == 1
+        assert journal.get("CANC-UN").state == "CANCELLED"
+        # nuevas aperturas siguen bloqueadas por el intent restante sin resolver
+        with pytest.raises(UnresolvedIntentsError):
+            _submit(coord, "NEW-OPEN")
+
+    def test_cancel_reduce_order_out_of_scope_blocked(self, tmp_path):
+        journal = IntentJournal.initialize(tmp_path / "j.json")
+        coord, adapter, fake = _coord(journal=journal)
+        _seed_open_intent(journal, "EXIT:X", reduce_only=True)
+        _plant_pending(adapter, fake, "EXIT:X", 510)
+        with pytest.raises(ExecutionBlockedError) as ei:
+            _cancel(coord, "EXIT:X")
+        assert ei.value.stage == "cancel_target"
+        assert fake.cancel_count == 0
+
+    def test_cancel_without_open_intent_blocked(self, tmp_path):
+        journal = IntentJournal.initialize(tmp_path / "j.json")
+        coord, adapter, fake = _coord(journal=journal)
+        _plant_pending(adapter, fake, "NO-INTENT", 511)
+        with pytest.raises(ExecutionBlockedError) as ei:
+            _cancel(coord, "NO-INTENT")
+        assert ei.value.stage == "cancel_target"
+        assert fake.cancel_count == 0
+
+    def test_restart_preserves_cancel_identity(self, tmp_path):
+        path = tmp_path / "j.json"
+        journal = IntentJournal.initialize(path)
+        coord, adapter, fake = _coord(journal=journal)
+        _seed_open_intent(journal, "CANC-R")
+        _plant_pending(adapter, fake, "CANC-R", 505)
+        assert _cancel(coord, "CANC-R").allowed
+
+        # "Reinicio": nuevo adapter (mismo terminal fake) + journal recargado.
+        adapter2 = _adapter(fake)
+        journal2 = IntentJournal(path)
+        intent = journal2.get("CANCEL:CANC-R")
+        assert intent.operation == OPERATION_CANCEL
+        assert intent.target_client_order_id == "CANC-R"
+        assert intent.target_broker_order_id == "505"
+        assert intent.state == "CANCELLED"
+        coord2, _, _ = _coord(fake=fake, journal=journal2, adapter=adapter2)
+        out = _cancel(coord2, "CANC-R")  # idempotente tras reinicio
+        assert out.stage == "cancel_idempotent"
+        assert fake.cancel_count == 1
+
+
+class TestCoordinatedCancelRecovery:
+    def _journal_with_cancel(self, tmp_path, target="T"):
+        journal = IntentJournal.initialize(tmp_path / "j.json")
+        journal.begin(
+            OrderIntent.for_cancel(
+                operation_id=f"CANCEL:{target}", target_client_order_id=target,
+                instrument=INSTRUMENT, side="BUY", order_type="MARKET",
+                quantity=0.1,
+            )
+        )
+        return journal
+
+    def test_recover_not_found_stays_unresolved(self, tmp_path):
+        journal = self._journal_with_cancel(tmp_path, "NF")
+        adapter = _adapter(_fake())
+        outcomes = recover_pending_cancels(journal, adapter)
+        assert outcomes[0].result == "NOT_FOUND"
+        assert journal.get("CANCEL:NF").terminal is False
+
+    def test_recover_lookup_uncertain_stays_unresolved(self, tmp_path, monkeypatch):
+        journal = self._journal_with_cancel(tmp_path, "LU")
+        adapter = _adapter(_fake())
+
+        def boom(cid):
+            raise BrokerConnectionError("transporte")
+
+        monkeypatch.setattr(adapter, "get_order", boom)
+        outcomes = recover_pending_cancels(journal, adapter)
+        assert outcomes[0].result == "LOOKUP_UNCERTAIN"
+        assert journal.get("CANCEL:LU").terminal is False
+
+    def test_recover_broker_unknown_collision_stays_unresolved(self, tmp_path):
+        journal = self._journal_with_cancel(tmp_path, "COL")
+        fake = _fake()
+        adapter = _adapter(fake)
+        magic = adapter._magic_for("COL")
+        comment = adapter._comment_for("COL")
+        for ticket in (700, 701):
+            fake._orders[ticket] = SimpleNamespace(
+                ticket=ticket, symbol=INSTRUMENT, magic=magic, comment=comment,
+                type=ORDER_TYPE_BUY, state=ORDER_STATE_FILLED,
+                volume_initial=0.1, volume_current=0.0, price_open=1.1,
+            )
+        outcomes = recover_pending_cancels(journal, adapter)
+        assert outcomes[0].result == "BROKER_UNKNOWN"
+        assert journal.get("CANCEL:COL").terminal is False
+
+    def test_recover_target_active_no_auto_repeat(self, tmp_path):
+        journal = self._journal_with_cancel(tmp_path, "ACT")
+        fake = _fake()
+        adapter = _adapter(fake)
+        _plant_pending(adapter, fake, "ACT", 710)
+        outcomes = recover_pending_cancels(journal, adapter)
+        assert outcomes[0].result == "TARGET_ACTIVE"
+        assert journal.get("CANCEL:ACT").terminal is False
+        assert fake.cancel_count == 0  # lookup NUNCA cancela
+
+    def test_recover_confirmed_cancelled_resolved(self, tmp_path):
+        journal = self._journal_with_cancel(tmp_path, "RC")
+        fake = _fake()
+        adapter = _adapter(fake)
+        fake._orders[711] = SimpleNamespace(
+            ticket=711, symbol=INSTRUMENT, magic=adapter._magic_for("RC"),
+            comment=adapter._comment_for("RC"), type=ORDER_TYPE_BUY,
+            state=ORDER_STATE_CANCELED, volume_initial=0.1, volume_current=0.0,
+            price_open=1.1,
+        )
+        adapter._remember("RC", 711)
+        outcomes = recover_pending_cancels(journal, adapter)
+        assert outcomes[0].result == "RESOLVED_CANCELLED"
+        assert journal.get("CANCEL:RC").state == "CANCELLED"
+        assert fake.cancel_count == 0
+
+    def test_recover_target_filled_no_false_cancel(self, tmp_path):
+        journal = self._journal_with_cancel(tmp_path, "TF")
+        fake = _fake()
+        adapter = _adapter(fake)
+        fake._orders[712] = SimpleNamespace(
+            ticket=712, symbol=INSTRUMENT, magic=adapter._magic_for("TF"),
+            comment=adapter._comment_for("TF"), type=ORDER_TYPE_BUY,
+            state=ORDER_STATE_FILLED, volume_initial=0.1, volume_current=0.0,
+            price_open=1.1,
+        )
+        fake.add_deal(7120, 712, volume=0.1, price=1.1)
+        adapter._remember("TF", 712)
+        outcomes = recover_pending_cancels(journal, adapter)
+        assert outcomes[0].result == "TARGET_FILLED"
+        assert journal.get("CANCEL:TF").state == "REJECTED"  # no se afirma cancelacion
+        assert len(adapter.get_order("TF").fills) == 1
+
+
+class TestLegacyCancelCompatibility:
+    def test_legacy_cancel_without_gate_still_works(self):
+        fake = _fake()
+        adapter = _adapter(fake)
+        assert adapter._execution_gate is None  # modo LIVE-09 heredado
+        fake.add_open_order(
+            520, symbol=INSTRUMENT, magic=adapter._magic_for("LEG-C"),
+            comment=adapter._comment_for("LEG-C"), volume=0.1, price=1.1,
+        )
+        adapter._remember("LEG-C", 520)
+        out = adapter.cancel_order("LEG-C")
+        assert out.state is BrokerOrderState.CANCELLED
+        assert fake.cancel_count == 1
