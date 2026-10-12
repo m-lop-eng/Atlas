@@ -28,6 +28,7 @@ Garantias clave (no cambian LIVE-02..LIVE-09; son capas ADITIVAS):
 
 from __future__ import annotations
 
+import math
 import secrets
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -36,14 +37,23 @@ from typing import Any, Callable
 from execution.instrument import InstrumentSpec
 from execution.intent_journal import (
     OPERATION_CANCEL,
+    OPERATION_CLOSE,
     OPERATION_OPEN,
+    OPERATION_REDUCE,
     IntentJournal,
     IntentJournalError,
     OrderIntent,
     recover_pending_cancels,
     recover_pending_intents,
 )
-from execution.order import Order, OrderSide, OrderType
+from execution.order import (
+    PURPOSE_CLOSE,
+    PURPOSE_OPEN,
+    PURPOSE_REDUCE,
+    Order,
+    OrderSide,
+    OrderType,
+)
 from execution.order_manager import OrderManager, OrderStateError
 
 from brokers.models import (
@@ -345,9 +355,9 @@ class LiveExecutionCoordinator:
         """
         primed = 0
         for intent in self._journal.all():
-            # 02A: la identidad cid<->ticket es de una orden de TRADING (OPEN);
-            # el id de una operacion de cancelacion NO es una orden del broker.
-            if intent.operation != OPERATION_OPEN:
+            # 02A/02B: el id de una CANCELACION no es una orden del broker;
+            # OPEN/CLOSE/REDUCE SI son ordenes de broker con cid<->ticket propio.
+            if intent.operation == OPERATION_CANCEL:
                 continue
             broker_id = intent.broker_order_id
             if not broker_id:
@@ -467,6 +477,80 @@ class LiveExecutionCoordinator:
                 "position_limit",
                 f"open_positions {open_positions} >= max {self._max_open_positions}",
             )
+
+    # --------------------------------------------- gates de reduccion (02B)
+
+    def _assert_session_reduce(self, now: datetime) -> None:
+        """Sesion para CLOSE/REDUCE: bloquea cerrada/desconocida/HALTED."""
+        decision = self._sessions.get_session(
+            self._instrument, int(now.timestamp())
+        )
+        state = decision.state.value
+        if state in ("CLOSED", "UNKNOWN", "HALTED"):
+            raise ExecutionBlockedError(
+                "session", f"estado {state}: no se opera automaticamente"
+            )
+        if not decision.can_hold_positions:
+            raise ExecutionBlockedError(
+                "session", f"estado {state}: no permite gestionar posiciones"
+            )
+
+    def _assert_kill_switch_reduce(self) -> None:
+        """Kill switch para CLOSE/REDUCE: ALLOW/BLOCK_NEW_ORDERS permiten una
+        reduccion ESTRICTA; HALT/EMERGENCY la bloquean (sin bypass implicito)."""
+        status = self._kill_switch.status()
+        state = str(getattr(getattr(status, "state", None), "value", status.state))
+        if state in ("HALT", "EMERGENCY"):
+            raise ExecutionBlockedError(
+                "kill_switch",
+                f"estado {state}: reduccion automatica prohibida",
+            )
+
+    def _observe_net_position(self):
+        """Posicion neta FIABLE del broker para el instrumento (fail-closed)."""
+        try:
+            positions = list(self._broker.get_positions())
+        except BrokerConnectionError as exc:
+            raise ExecutionBlockedError(
+                "position_evidence", "posiciones del broker no determinables"
+            ) from exc
+        matching = [p for p in positions if p.instrument == self._instrument]
+        if not matching:
+            raise ExecutionBlockedError(
+                "position_evidence", "sin posicion abierta del instrumento"
+            )
+        if len(matching) > 1:
+            raise ExecutionBlockedError(
+                "position_evidence", "identidad de posicion ambigua (varias posiciones)"
+            )
+        pos = matching[0]
+        if abs(float(pos.quantity)) <= 1e-12:
+            raise ExecutionBlockedError("position_evidence", "posicion neta nula")
+        return pos
+
+    def _validate_reduce_quantity(self, quantity) -> float:
+        try:
+            q = float(quantity)
+        except (TypeError, ValueError):
+            raise ExecutionBlockedError("quantity", f"cantidad invalida: {quantity!r}")
+        if not math.isfinite(q) or q <= 0:
+            raise ExecutionBlockedError("quantity", f"cantidad no positiva: {quantity!r}")
+        spec = self._instrument_spec
+        if spec.quantity_min is not None and q < spec.quantity_min - 1e-9:
+            raise ExecutionBlockedError(
+                "quantity", f"cantidad {q} < quantity_min {spec.quantity_min}"
+            )
+        if spec.quantity_max is not None and q > spec.quantity_max + 1e-9:
+            raise ExecutionBlockedError(
+                "quantity", f"cantidad {q} > quantity_max {spec.quantity_max}"
+            )
+        if spec.quantity_step is not None and spec.quantity_step > 0:
+            steps = q / spec.quantity_step
+            if abs(steps - round(steps)) > 1e-6:
+                raise ExecutionBlockedError(
+                    "quantity", f"cantidad {q} no alineada al step {spec.quantity_step}"
+                )
+        return q
 
     # --------------------------------------------------------------- submit
 
@@ -801,6 +885,199 @@ class LiveExecutionCoordinator:
         raise ExecutionBlockedError(
             "cancel_unknown",
             f"estado tras cancelar {getattr(state, 'value', state)}: sin resolver",
+        )
+
+    # ------------------------------------------------ cierre/reduccion (02B)
+
+    def close_position(
+        self, *, operation_id: str | None = None, target_position_id: str | None = None
+    ) -> ExecutionOutcome:
+        """Cierra el REMANENTE de una posicion NETTING (02B).
+
+        Cantidad objetivo = exposicion neta OBSERVADA en el broker. Nunca se
+        inventa la cantidad. Exige modo NETTING, identidad de posicion
+        inequivoca, no-inversion, broker sano, sesion operable, kill switch
+        ALLOW/BLOCK_NEW_ORDERS, reconciliacion coherente y LIVE-03 valida.
+        """
+        return self._close_or_reduce(
+            operation=OPERATION_CLOSE,
+            requested=None,
+            operation_id=operation_id,
+            target_position_id=target_position_id,
+        )
+
+    def reduce_position(
+        self,
+        *,
+        quantity: float,
+        operation_id: str | None = None,
+        target_position_id: str | None = None,
+    ) -> ExecutionOutcome:
+        """Reduce una cantidad EXPLICITA de una posicion NETTING (02B).
+
+        La cantidad debe ser > 0 y <= exposicion neta observada en el broker, y
+        compatible con el lattice (min/step/max). No redondea hacia arriba.
+        """
+        return self._close_or_reduce(
+            operation=OPERATION_REDUCE,
+            requested=quantity,
+            operation_id=operation_id,
+            target_position_id=target_position_id,
+        )
+
+    def _close_or_reduce(
+        self,
+        *,
+        operation: str,
+        requested,
+        operation_id: str | None,
+        target_position_id: str | None,
+    ) -> ExecutionOutcome:
+        instrument = self._instrument
+        if operation == OPERATION_CLOSE:
+            op_id = str(operation_id) if operation_id else f"CLOSE:{instrument}"
+        else:
+            op_id = (
+                str(operation_id)
+                if operation_id
+                else f"REDUCE:{instrument}:{requested}"
+            )
+        kind = OPERATION_CLOSE if operation == OPERATION_CLOSE else OPERATION_REDUCE
+        purpose = PURPOSE_CLOSE if operation == OPERATION_CLOSE else PURPOSE_REDUCE
+        requested_q = None
+        if operation == OPERATION_REDUCE:
+            requested_q = self._validate_reduce_quantity(requested)
+
+        # 1) Idempotencia + no reutilizar el mismo op_id para otra operacion
+        #    (chequeo barato ANTES de tocar el broker).
+        existing = self._journal.get(op_id)
+        if existing is not None:
+            if existing.operation != operation or existing.instrument != instrument:
+                raise ExecutionBlockedError(
+                    "identity", "operation_id reutilizado con identidad distinta"
+                )
+            if (
+                operation == OPERATION_REDUCE
+                and abs(float(existing.quantity) - requested_q) > 1e-9
+            ):
+                raise ExecutionBlockedError(
+                    "identity", "operation_id reutilizado con cantidad distinta"
+                )
+            if existing.terminal:
+                return ExecutionOutcome(
+                    allowed=True,
+                    stage="reduce_idempotent",
+                    reason="operacion ya resuelta; sin segunda llamada al broker",
+                    intent=existing,
+                )
+            raise ExecutionBlockedError(
+                "reduce_pending",
+                "operacion previa sin resolver: resolver por lookup (no repetir)",
+            )
+
+        # 2) Gates obligatorios (NO se pasa por el limite de NUEVAS posiciones).
+        now = self._clock()
+        self._assert_account_mode(is_entry=False)  # NETTING verificado
+        self._assert_session_reduce(now)
+        self._assert_kill_switch_reduce()
+        self._assert_broker_health()
+        self._assert_reconciliation()
+        self._assert_market_data(now)
+        self._assert_currency()
+
+        # 3) Identidad/exposicion efectiva: posicion neta del BROKER.
+        pos = self._observe_net_position()
+        available = abs(float(pos.quantity))
+        net = float(pos.quantity)
+        side = OrderSide.SELL if net > 0 else OrderSide.BUY  # lado reductor
+        if operation == OPERATION_CLOSE:
+            qty = available
+        else:
+            if requested_q > available + 1e-9:
+                raise ExecutionBlockedError(
+                    "quantity",
+                    f"cantidad {requested_q} > exposicion disponible {available}",
+                )
+            qty = requested_q
+
+        # 4) Idempotencia en el broker: si ya cerrada, no hay nada que hacer.
+        if available <= 1e-12:
+            raise ExecutionBlockedError(
+                "position_evidence", "sin exposicion disponible que reducir"
+            )
+
+        # 5) Orden de broker EXPLICITA con proposito tipado y reduce_only. La
+        #    no-inversion la verifican el coordinador (side/qty) y el adapter
+        #    justo antes de enviar.
+        try:
+            order = self._order_manager.create_order(
+                strategy_id="coordinated",
+                strategy_version="1.0.0",
+                account_id=self._account_id,
+                instrument=instrument,
+                side=side,
+                quantity=qty,
+                order_type=OrderType.MARKET,
+                client_order_id=op_id,
+                signal_id=op_id,
+                reduce_only=True,
+                purpose=purpose,
+            )
+        except OrderStateError as exc:
+            raise ExecutionBlockedError("order_manager", str(exc)) from exc
+
+        # 6) Write-ahead del intent (v3) ANTES de tocar el broker.
+        if operation == OPERATION_CLOSE:
+            candidate = OrderIntent.for_close(
+                operation_id=op_id,
+                instrument=instrument,
+                side=side.value,
+                available_quantity=available,
+                target_position_id=target_position_id,
+                run_id=self._run_id,
+            )
+        else:
+            candidate = OrderIntent.for_reduce(
+                operation_id=op_id,
+                instrument=instrument,
+                side=side.value,
+                quantity=qty,
+                available_quantity=available,
+                target_position_id=target_position_id,
+                run_id=self._run_id,
+            )
+        try:
+            intent = self._journal.begin(candidate)
+        except IntentJournalError as exc:
+            try:
+                self._order_manager.reject(
+                    order.order_id, f"intent persist failed: {exc}"
+                )
+            except OrderStateError:
+                pass
+            raise ExecutionBlockedError("journal_persist", str(exc)) from exc
+
+        # 7) Gate por (kind, op_id, target=instrument) + envio + consumo seguro.
+        self._order_manager.approve(order.order_id)
+        self._order_manager.submit(order.order_id)
+        self._gate.approve_operation(
+            kind, op_id=op_id, target=instrument, token=self._token
+        )
+        try:
+            submission = self._broker.submit_order(order)
+        finally:
+            self._gate.consume_operation(
+                kind, op_id=op_id, target=instrument, token=self._token
+            )
+
+        self._reflect_submission(order, intent, submission)
+        return ExecutionOutcome(
+            allowed=True,
+            stage="closed" if operation == OPERATION_CLOSE else "reduced",
+            reason="operacion reductora enviada",
+            order=order,
+            submission=submission,
+            intent=intent,
         )
 
 

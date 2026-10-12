@@ -22,9 +22,12 @@ import pytest
 
 from execution.intent_journal import (
     OPERATION_CANCEL,
+    OPERATION_CLOSE,
     OPERATION_OPEN,
+    OPERATION_REDUCE,
     SCHEMA_VERSION,
     SCHEMA_VERSION_V1,
+    SCHEMA_VERSION_V2,
     IntentJournal,
     IntentJournalCorruptionError,
     IntentJournalDuplicateError,
@@ -473,9 +476,15 @@ class TestA4IntentAuthority:
 
 
 def _v1_record(cid: str) -> dict:
-    """Registro v1: intent OPEN serializado SIN los campos nuevos."""
+    """Registro v1: intent OPEN serializado SIN los campos de v2/v3."""
     d = OrderIntent.from_order(_order(cid)).to_dict()
-    for key in ("operation", "target_client_order_id", "target_broker_order_id"):
+    for key in (
+        "operation",
+        "target_client_order_id",
+        "target_broker_order_id",
+        "target_position_id",
+        "available_quantity",
+    ):
         d.pop(key, None)
     return d
 
@@ -597,7 +606,7 @@ class TestSchemaCompatibilityV2:
         j = IntentJournal.initialize(p_new)
         j.begin(OrderIntent.from_order(_order("C-NEW")))
         raw = json.loads(p_new.read_text(encoding="utf-8"))
-        assert raw["schema_version"] == SCHEMA_VERSION == 2
+        assert raw["schema_version"] == SCHEMA_VERSION == 3
 
         def _old_v1_loader(path):
             data = json.loads(path.read_text(encoding="utf-8"))
@@ -669,3 +678,123 @@ class TestSchemaCompatibilityV2:
         assert j2.get("C-PEND").state == "CREATED"
         assert {t.client_order_id for t in j2.tombstones()} == {"C-FILLED"}
         assert [i.client_order_id for i in j2.unresolved()] == ["C-PEND"]
+
+
+# --------------------------------------------------------------------------
+# COMPATIBILIDAD DE ESQUEMA v2 -> v3 (MT5-DEMO-EXECUTION-CONTROLS-02B)
+# --------------------------------------------------------------------------
+
+
+def _v2_record(cid: str, *, operation: str | None = None,
+               target_cid: str | None = None) -> dict:
+    """Registro v2: intent serializado SIN campos exclusivos de v3."""
+    d = OrderIntent.from_order(_order(cid)).to_dict()
+    d.pop("target_position_id", None)
+    d.pop("available_quantity", None)
+    if operation is not None:
+        d["operation"] = operation
+    if target_cid is not None:
+        d["target_client_order_id"] = target_cid
+    return d
+
+
+def _dump_doc(path, version: int, intents: dict) -> None:
+    payload = {
+        "schema_version": version,
+        "updated_at": "2026-01-01T00:00:00+00:00",
+        "intents": intents,
+    }
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    path.with_name(path.name + ".init").write_text("{}", encoding="utf-8")
+
+
+class TestSchemaCompatibilityV3:
+    def test_v2_journal_loads_open_and_cancel(self, tmp_path):
+        path = tmp_path / "v2.json"
+        _dump_doc(path, SCHEMA_VERSION_V2, {
+            "C-OPEN": _v2_record("C-OPEN"),
+            "CANCEL:C-OPEN": _v2_record(
+                "CANCEL:C-OPEN", operation=OPERATION_CANCEL,
+                target_cid="C-OPEN",
+            ),
+        })
+        j = IntentJournal(path)
+        assert j.loaded_schema_version == SCHEMA_VERSION_V2
+        assert j.get("C-OPEN").operation == OPERATION_OPEN
+        assert j.get("CANCEL:C-OPEN").operation == OPERATION_CANCEL
+
+    def test_v2_with_v3_field_rejected(self, tmp_path):
+        path = tmp_path / "v2bad.json"
+        rec = _v2_record("C-BAD")
+        rec["available_quantity"] = 0.5
+        _dump_doc(path, SCHEMA_VERSION_V2, {"C-BAD": rec})
+        with pytest.raises(IntentJournalSchemaError):
+            IntentJournal(path)
+
+    def test_v2_with_close_operation_rejected(self, tmp_path):
+        path = tmp_path / "v2close.json"
+        rec = _v2_record("CLOSE:X", operation=OPERATION_CLOSE)
+        rec["reduce_only"] = True
+        _dump_doc(path, SCHEMA_VERSION_V2, {"CLOSE:X": rec})
+        with pytest.raises(IntentJournalSchemaError):
+            IntentJournal(path)
+
+    def test_v3_close_and_reduce_load_and_recover(self, tmp_path):
+        path = tmp_path / "v3.json"
+        j = IntentJournal.initialize(path)
+        j.begin(OrderIntent.for_close(
+            operation_id="CLOSE:X", instrument=INSTRUMENT, side="SELL",
+            available_quantity=0.5,
+        ))
+        j.begin(OrderIntent.for_reduce(
+            operation_id="REDUCE:X", instrument=INSTRUMENT, side="SELL",
+            quantity=0.2, available_quantity=0.5,
+        ))
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        assert raw["schema_version"] == SCHEMA_VERSION == 3
+
+        j2 = IntentJournal(path)
+        assert j2.get("CLOSE:X").operation == OPERATION_CLOSE
+        assert j2.get("REDUCE:X").operation == OPERATION_REDUCE
+        assert j2.get("REDUCE:X").available_quantity == pytest.approx(0.5)
+        spy = _SpyBroker({
+            "CLOSE:X": _broker_order("CLOSE:X", BrokerOrderState.FILLED),
+            "REDUCE:X": _broker_order("REDUCE:X", BrokerOrderState.FILLED),
+        })
+        recover_pending_intents(j2, spy)
+        assert set(spy.asked) == {"CLOSE:X", "REDUCE:X"}
+        assert j2.get("CLOSE:X").state == "FILLED"
+        assert j2.get("REDUCE:X").state == "FILLED"
+
+    def test_v2_to_v3_migration_preserves(self, tmp_path):
+        path = tmp_path / "mig2.json"
+        filled = _v2_record("C-FILLED")
+        filled["state"] = "FILLED"
+        filled["fills_applied"] = [0]
+        _dump_doc(path, SCHEMA_VERSION_V2, {"C-FILLED": filled})
+        j = IntentJournal(path)
+        assert j.loaded_schema_version == SCHEMA_VERSION_V2
+        assert j.migrate_if_needed() is True
+        j2 = IntentJournal(path)
+        assert j2.loaded_schema_version == SCHEMA_VERSION
+        assert j2.get("C-FILLED").fills_applied == (0,)
+        assert j2.get("C-FILLED").state == "FILLED"
+
+    def test_old_v2_reader_rejects_v3(self, tmp_path):
+        path = tmp_path / "v3new.json"
+        j = IntentJournal.initialize(path)
+        j.begin(OrderIntent.for_close(
+            operation_id="CLOSE:Y", instrument=INSTRUMENT, side="SELL",
+            available_quantity=0.5,
+        ))
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        assert raw["schema_version"] == 3
+
+        def _old_v2_loader(path):
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if data.get("schema_version") not in (SCHEMA_VERSION_V1, SCHEMA_VERSION_V2):
+                raise IntentJournalSchemaError("lector v2: schema no soportada")
+            return data
+
+        with pytest.raises(IntentJournalSchemaError):
+            _old_v2_loader(path)

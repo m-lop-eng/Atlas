@@ -27,6 +27,7 @@ from brokers.models import (
     AccountState,
     BrokerError,
     BrokerFill,
+    BrokerInvalidOrderError,
     BrokerOrder,
     BrokerOrderState,
     BrokerConnectionError,
@@ -96,6 +97,12 @@ class PaperBrokerAdapter(BrokerAdapter):
             )
         if not order.quantity or order.quantity <= 0:
             raise BrokerError("quantity debe ser positivo")
+        # 02B: `reduce_only` NO se ignora. Una reduccion exige una posicion
+        # neta FIABLE (la del propio broker) del instrumento, sentido contrario
+        # y volumen <= exposicion; si falta informacion fiable, se RECHAZA en
+        # vez de netear a ciegas una orden contraria (evita inversion).
+        if order.reduce_only:
+            self._validate_reduce_only(order)
         if order.client_order_id in self._orders:
             # Idempotencia: reintento de una orden ya conocida. Si la primera
             # respuesta se perdió, Atlas debe resolver con get_order; aquí
@@ -471,6 +478,41 @@ class PaperBrokerAdapter(BrokerAdapter):
         )
 
     # -------------------------------------------------------------- helpers
+
+    def _net_qty(self, instrument: str) -> float:
+        """Posicion neta del instrumento derivada del estado FIABLE del broker."""
+        net = 0.0
+        for o in self._orders.values():
+            if not o.fills or o.state == BrokerOrderState.CANCELLED:
+                continue
+            if o.instrument != instrument:
+                continue
+            sign = 1.0 if o.side.value == "BUY" else -1.0
+            net += sign * sum(f.quantity for f in o.fills)
+        return net
+
+    def _validate_reduce_only(self, order: Order) -> None:
+        """Garantia de no-inversion para `reduce_only` (fail-closed).
+
+        Usa la posicion neta del propio broker (fuente fiable). Si no hay
+        posicion, el sentido no es contrario o el volumen excede la exposicion,
+        la orden se rechaza (nunca se netea a ciegas una orden contraria).
+        """
+        net = self._net_qty(order.instrument)
+        if abs(net) <= 1e-12:
+            raise BrokerInvalidOrderError(
+                "reduce_only sin posicion neta abierta (no se puede validar)"
+            )
+        required = OrderSide.SELL if net > 0 else OrderSide.BUY
+        if order.side is not required:
+            raise BrokerInvalidOrderError(
+                "reduce_only debe ser contrario a la posicion (no convertir en "
+                "apertura opuesta)"
+            )
+        if float(order.quantity) > abs(net) + 1e-9:
+            raise BrokerInvalidOrderError(
+                "reduce_only excede la posicion abierta (no puede invertir)"
+            )
 
     def _price(self, instrument: str) -> float:
         return float(self.price_source(instrument))

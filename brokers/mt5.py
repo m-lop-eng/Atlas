@@ -43,8 +43,19 @@ from enum import Enum
 from typing import Any, Callable, Mapping
 
 from execution.instrument import AssetClass, InstrumentSpec, InstrumentSpecError
-from execution.intent_journal import OPERATION_CANCEL
-from execution.order import Order, OrderSide, OrderType
+from execution.intent_journal import (
+    OPERATION_CANCEL,
+    OPERATION_CLOSE,
+    OPERATION_REDUCE,
+)
+from execution.order import (
+    PURPOSE_CLOSE,
+    PURPOSE_OPEN,
+    PURPOSE_REDUCE,
+    Order,
+    OrderSide,
+    OrderType,
+)
 
 from brokers.base import BrokerAdapter
 from brokers.models import (
@@ -733,10 +744,22 @@ class MT5BrokerAdapter(BrokerAdapter):
         cid = order.client_order_id
         if not cid:
             raise BrokerInvalidOrderError("client_order_id obligatorio")
-        # MT5-DEMO-EXECUTION-FOUNDATION-01: solo envia si el gate de capacidad
-        # enlazado autoriza este cid. Sin gate (default) => LIVE-09 intacto.
+        # MT5-DEMO-EXECUTION-FOUNDATION-01 / 02B: solo envia si el gate de
+        # capacidad enlazado autoriza esta operacion. El TIPO se deriva del
+        # `purpose` tipado (NO de reduce_only): OPEN usa target=cid; CLOSE/REDUCE
+        # usan target=instrument (posicion). Sin gate (default) => LIVE-09 intacto.
         if self._execution_gate is not None:
-            self._execution_gate.check(cid)
+            purpose = str(getattr(order, "purpose", PURPOSE_OPEN))
+            if purpose == PURPOSE_CLOSE:
+                self._execution_gate.check_operation(
+                    OPERATION_CLOSE, op_id=cid, target=str(order.instrument)
+                )
+            elif purpose == PURPOSE_REDUCE:
+                self._execution_gate.check_operation(
+                    OPERATION_REDUCE, op_id=cid, target=str(order.instrument)
+                )
+            else:
+                self._execution_gate.check(cid)
         if order.order_type is not OrderType.MARKET:
             raise BrokerInvalidOrderError(
                 f"tipo de orden no soportado por MT5 en LIVE-09: {order.order_type}"

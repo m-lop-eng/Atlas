@@ -75,19 +75,24 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
-# MT5-DEMO-EXECUTION-CONTROLS-02A (revision de compatibilidad):
+from execution.order import PURPOSE_CLOSE, PURPOSE_OPEN, PURPOSE_REDUCE
+
+# MT5-DEMO-EXECUTION-CONTROLS-02A/02B (compatibilidad de esquema):
 #   * v1 = formato LIVE-08 (solo intents de APERTURA; sin campos de operacion).
-#   * v2 = formato con semantica de operacion (`operation` OPEN/CANCEL y
-#     `target_client_order_id`/`target_broker_order_id`).
-# El writer SIEMPRE persiste `SCHEMA_VERSION` (v2). Un lector antiguo (que exige
-# v1) DEBE fallar cerrado ante el nuevo esquema, en vez de ignorar
-# `operation=CANCEL` y confundir una cancelacion con una apertura.
-# La version declarada DETERMINA el contrato: un journal v1 legitimo solo puede
-# contener registros sin campos v2 (=> OPEN). Un journal declarado v1 que incluya
-# cualquier campo exclusivo de v2 es INCONSISTENTE y se rechaza (fail-closed).
-SCHEMA_VERSION = 2
+#   * v2 = `operation` OPEN/CANCEL + `target_client_order_id`/
+#     `target_broker_order_id`.
+#   * v3 = operaciones CLOSE/REDUCE + `target_position_id`/`available_quantity`.
+# El writer SIEMPRE persiste `SCHEMA_VERSION` (v3). Un lector antiguo (que exige
+# v1 o v2) DEBE fallar cerrado ante el nuevo esquema, en vez de ignorar/reinterpretar
+# `operation` y confundir una operacion con otra.
+# La version declarada DETERMINA el contrato: ningun documento puede contener
+# campos exclusivos de una version posterior a la declarada (fail-closed).
+SCHEMA_VERSION = 3
 SCHEMA_VERSION_V1 = 1
-_READABLE_SCHEMA_VERSIONS = frozenset({SCHEMA_VERSION_V1, SCHEMA_VERSION})
+SCHEMA_VERSION_V2 = 2
+_READABLE_SCHEMA_VERSIONS = frozenset(
+    {SCHEMA_VERSION_V1, SCHEMA_VERSION_V2, SCHEMA_VERSION}
+)
 
 # Campos exclusivos del esquema v2: NO pueden aparecer en un documento v1.
 _V2_ONLY_FIELDS = (
@@ -95,11 +100,29 @@ _V2_ONLY_FIELDS = (
     "target_client_order_id",
     "target_broker_order_id",
 )
+# Campos exclusivos del esquema v3: NO pueden aparecer en v1 ni en v2.
+_V3_ONLY_FIELDS = (
+    "target_position_id",
+    "available_quantity",
+)
 
-# MT5-DEMO-EXECUTION-CONTROLS-02A: tipo de operacion del intent.
+# MT5-DEMO-EXECUTION-CONTROLS-02A/02B: tipo de operacion del intent.
 OPERATION_OPEN = "OPEN"
 OPERATION_CANCEL = "CANCEL"
-_KNOWN_OPERATIONS = frozenset({OPERATION_OPEN, OPERATION_CANCEL})
+OPERATION_CLOSE = "CLOSE"
+OPERATION_REDUCE = "REDUCE"
+_KNOWN_OPERATIONS = frozenset(
+    {OPERATION_OPEN, OPERATION_CANCEL, OPERATION_CLOSE, OPERATION_REDUCE}
+)
+# Operaciones validas en documentos v2 (v1 no admite `operation` en absoluto).
+_V2_OPERATIONS = frozenset({OPERATION_OPEN, OPERATION_CANCEL})
+
+# Proposito tipado de `Order` -> operacion del intent (02B).
+_PURPOSE_TO_OPERATION = {
+    PURPOSE_OPEN: OPERATION_OPEN,
+    PURPOSE_CLOSE: OPERATION_CLOSE,
+    PURPOSE_REDUCE: OPERATION_REDUCE,
+}
 
 # Estados del ciclo de vida persistidos. Es un superconjunto de
 # `OrderStatus`/`BrokerOrderState` (SUBm...); `CREATED` es el estado
@@ -189,6 +212,10 @@ class OrderIntent:
     operation: str = OPERATION_OPEN
     target_client_order_id: str | None = None
     target_broker_order_id: str | None = None
+    # 02B (v3): identidad de la POSICION objetivo y exposicion disponible
+    # observada en el broker cuando se decidio la operacion (evidencia).
+    target_position_id: str | None = None
+    available_quantity: float | None = None
 
     @property
     def terminal(self) -> bool:
@@ -201,7 +228,16 @@ class OrderIntent:
 
     @staticmethod
     def from_order(order, *, run_id: str | None = None) -> "OrderIntent":
-        """Construye el intent MINIMO a partir de una `Order` (sin secrets)."""
+        """Construye el intent MINIMO a partir de una `Order` (sin secrets).
+
+        02B: el `purpose` tipado de la orden determina la `operation` del intent
+        (OPEN/CLOSE/REDUCE). NO se infiere por `reduce_only`. Para CLOSE/REDUCE
+        usar preferentemente `for_close`/`for_reduce` (añaden la evidencia de
+        posicion). La compatibilidad LIVE-08 se mantiene: `purpose=OPEN` por
+        defecto.
+        """
+        purpose = str(getattr(order, "purpose", PURPOSE_OPEN))
+        operation = _PURPOSE_TO_OPERATION.get(purpose, OPERATION_OPEN)
         return OrderIntent(
             client_order_id=str(order.client_order_id),
             order_id=str(order.order_id),
@@ -224,6 +260,7 @@ class OrderIntent:
             created_at=(
                 order.created_at.isoformat() if order.created_at is not None else None
             ),
+            operation=operation,
         )
 
     @staticmethod
@@ -265,6 +302,75 @@ class OrderIntent:
             ),
         )
 
+    @staticmethod
+    def for_close(
+        *,
+        operation_id: str,
+        instrument: str,
+        side: str,
+        available_quantity: float,
+        target_position_id: str | int | None = None,
+        order_type: str = "MARKET",
+        run_id: str | None = None,
+    ) -> "OrderIntent":
+        """Intent DURABLE de un CIERRE total (02B). `operation=CLOSE`.
+
+        `quantity` = exposicion neta observada en el broker (`available_quantity`);
+        `reduce_only=True`; `side` = lado contrario a la posicion. Objetivo
+        canonico NETTING = `instrument`; ticket de posicion en
+        `target_position_id` cuando se conoce. `order_id` determinista para la
+        idempotencia de `begin`.
+        """
+        return OrderIntent(
+            client_order_id=str(operation_id),
+            order_id=f"CLOSEORD:{operation_id}",
+            instrument=str(instrument),
+            side=str(side),
+            order_type=str(order_type),
+            quantity=float(available_quantity),
+            reduce_only=True,
+            run_id=run_id,
+            operation=OPERATION_CLOSE,
+            target_position_id=(
+                str(target_position_id) if target_position_id is not None else None
+            ),
+            available_quantity=float(available_quantity),
+        )
+
+    @staticmethod
+    def for_reduce(
+        *,
+        operation_id: str,
+        instrument: str,
+        side: str,
+        quantity: float,
+        available_quantity: float,
+        target_position_id: str | int | None = None,
+        order_type: str = "MARKET",
+        run_id: str | None = None,
+    ) -> "OrderIntent":
+        """Intent DURABLE de una REDUCCION parcial (02B). `operation=REDUCE`.
+
+        `quantity` = cantidad explicita solicitada (<= exposicion disponible);
+        `available_quantity` = exposicion neta observada en el broker (evidencia);
+        `reduce_only=True`; `side` contrario a la posicion.
+        """
+        return OrderIntent(
+            client_order_id=str(operation_id),
+            order_id=f"REDUCEORD:{operation_id}",
+            instrument=str(instrument),
+            side=str(side),
+            order_type=str(order_type),
+            quantity=float(quantity),
+            reduce_only=True,
+            run_id=run_id,
+            operation=OPERATION_REDUCE,
+            target_position_id=(
+                str(target_position_id) if target_position_id is not None else None
+            ),
+            available_quantity=float(available_quantity),
+        )
+
     def to_dict(self) -> dict:
         return {
             "client_order_id": self.client_order_id,
@@ -289,6 +395,8 @@ class OrderIntent:
             "operation": self.operation,
             "target_client_order_id": self.target_client_order_id,
             "target_broker_order_id": self.target_broker_order_id,
+            "target_position_id": self.target_position_id,
+            "available_quantity": self.available_quantity,
         }
 
     @staticmethod
@@ -322,10 +430,31 @@ class OrderIntent:
             )
         target_cid = d.get("target_client_order_id")
         target_bid = d.get("target_broker_order_id")
+        target_pos = d.get("target_position_id")
+        available = d.get("available_quantity")
         if operation == OPERATION_CANCEL and not target_cid:
             raise IntentJournalCorruptionError(
                 "intent CANCEL sin target_client_order_id (objetivo no identificable)"
             )
+        if operation in (OPERATION_CLOSE, OPERATION_REDUCE):
+            if not bool(d.get("reduce_only", False)):
+                raise IntentJournalCorruptionError(
+                    f"intent {operation} debe ser reduce_only=True (no inversion)"
+                )
+            if available is None:
+                raise IntentJournalCorruptionError(
+                    f"intent {operation} sin available_quantity (evidencia)"
+                )
+            try:
+                available = float(available)
+            except (TypeError, ValueError) as exc:
+                raise IntentJournalCorruptionError(
+                    f"available_quantity invalida: {available!r}"
+                ) from exc
+            if available <= 0 or available != available:
+                raise IntentJournalCorruptionError(
+                    f"available_quantity invalida: {available!r}"
+                )
         return OrderIntent(
             client_order_id=cid,
             order_id=order_id,
@@ -349,6 +478,8 @@ class OrderIntent:
             operation=operation,
             target_client_order_id=target_cid,
             target_broker_order_id=target_bid,
+            target_position_id=target_pos,
+            available_quantity=available,
         )
 
 
@@ -666,19 +797,30 @@ class IntentJournal:
             operation=intent.operation,
             target_client_order_id=intent.target_client_order_id,
             target_broker_order_id=intent.target_broker_order_id,
+            target_position_id=intent.target_position_id,
+            available_quantity=intent.available_quantity,
         )
 
     def to_dict(self) -> dict:
-        # Invariante 02A: una operacion CANCEL exige esquema v2. El writer
-        # declara SIEMPRE `SCHEMA_VERSION`; si alguna vez se rebajara por debajo
-        # de v2 con un CANCEL presente, se falla cerrado en vez de persistir un
-        # documento v1 que ocultaria la operacion.
-        if (
-            SCHEMA_VERSION < SCHEMA_VERSION_V1 + 1
-            and any(i.operation != OPERATION_OPEN for i in self._intents.values())
-        ):
+        # Invariante 02A/02B: CANCEL exige >= v2; CLOSE/REDUCE exigen >= v3. El
+        # writer declara SIEMPRE `SCHEMA_VERSION`; si alguna vez se rebajara por
+        # debajo de la version minima del contenido, se falla cerrado en vez de
+        # persistir un documento que ocultaria/reinterpretaria la operacion.
+        has_non_open = any(
+            i.operation != OPERATION_OPEN for i in self._intents.values()
+        )
+        has_reduce = any(
+            i.operation in (OPERATION_CLOSE, OPERATION_REDUCE)
+            for i in self._intents.values()
+        )
+        if has_non_open and SCHEMA_VERSION < SCHEMA_VERSION_V2:
             raise IntentJournalError(
-                "operacion CANCEL requiere schema v2; el writer declara "
+                "operacion != OPEN requiere schema >= v2; el writer declara "
+                f"v{SCHEMA_VERSION} (fail-closed)"
+            )
+        if has_reduce and SCHEMA_VERSION < 3:
+            raise IntentJournalError(
+                "operacion CLOSE/REDUCE requiere schema v3; el writer declara "
                 f"v{SCHEMA_VERSION} (fail-closed)"
             )
         return {
@@ -751,24 +893,43 @@ class IntentJournal:
             raise IntentJournalCorruptionError("bloque `intents` invalido")
         parsed: dict[str, OrderIntent] = {}
         for cid, payload in intents.items():
-            # La version declarada determina el contrato: un journal v1 NO puede
-            # contener campos exclusivos de v2 (seria un CANCEL oculto que un
-            # lector v1 interpretaria como OPEN).
-            if (
-                self._loaded_version == SCHEMA_VERSION_V1
-                and isinstance(payload, dict)
-                and any(key in payload for key in _V2_ONLY_FIELDS)
-            ):
-                present = [k for k in _V2_ONLY_FIELDS if k in payload]
+            # La version declarada DETERMINA el contrato: ningun registro puede
+            # declarar campos exclusivos de una version POSTERIOR a la del
+            # documento (seria una operacion oculta que un lector antiguo
+            # interpretaria mal).
+            forbidden = []
+            if isinstance(payload, dict):
+                if self._loaded_version == SCHEMA_VERSION_V1:
+                    forbidden = [
+                        k for k in (*_V2_ONLY_FIELDS, *_V3_ONLY_FIELDS) if k in payload
+                    ]
+                elif self._loaded_version == SCHEMA_VERSION_V2:
+                    forbidden = [k for k in _V3_ONLY_FIELDS if k in payload]
+                    op = payload.get("operation", OPERATION_OPEN)
+                    if op not in _V2_OPERATIONS:
+                        raise IntentJournalSchemaError(
+                            f"journal v2 inconsistente: el intent {cid!r} declara "
+                            f"operation {op!r} (solo OPEN/CANCEL en v2); fail-closed"
+                        )
+            if forbidden:
                 raise IntentJournalSchemaError(
-                    f"journal v1 inconsistente: el intent {cid!r} declara campos "
-                    f"exclusivos de v2 {present}; fail-closed (no se interpreta "
-                    "silenciosamente como OPEN)"
+                    f"journal v{self._loaded_version} inconsistente: el intent "
+                    f"{cid!r} declara campos exclusivos de una version posterior "
+                    f"{forbidden}; fail-closed"
                 )
             intent = OrderIntent.from_dict(payload)
             if intent.client_order_id != cid:
                 raise IntentJournalCorruptionError(
                     f"clave {cid!r} != client_order_id {intent.client_order_id!r}"
+                )
+            if (
+                self._loaded_version == SCHEMA_VERSION_V2
+                and intent.operation not in _V2_OPERATIONS
+            ):
+                raise IntentJournalSchemaError(
+                    f"journal v2 inconsistente: el intent {cid!r} declara "
+                    f"operation {intent.operation!r} (solo OPEN/CANCEL en v2); "
+                    "fail-closed"
                 )
             parsed[cid] = intent
         self._intents = parsed
@@ -797,9 +958,10 @@ def recover_pending_intents(
 
     outcomes: list[IntentRecoveryOutcome] = []
     for intent in journal.unresolved():
-        # 02A: la resolucion de cancelaciones es un flujo SEPARADO
-        # (`recover_pending_cancels`); aqui solo se resuelven intents de APERTURA.
-        if intent.operation != OPERATION_OPEN:
+        # 02A/02B: la resolucion de cancelaciones es un flujo SEPARADO
+        # (`recover_pending_cancels`). Aqui se resuelven los intents que SON una
+        # orden de broker: OPEN, CLOSE y REDUCE (todos con cid<->ticket propio).
+        if intent.operation == OPERATION_CANCEL:
             continue
         cid = intent.client_order_id
         try:
@@ -967,9 +1129,13 @@ __all__ = [
     "IntentJournalStorageAmbiguousError",
     "IntentRecoveryOutcome",
     "OPERATION_CANCEL",
+    "OPERATION_CLOSE",
     "OPERATION_OPEN",
+    "OPERATION_REDUCE",
     "OrderIntent",
     "SCHEMA_VERSION",
+    "SCHEMA_VERSION_V1",
+    "SCHEMA_VERSION_V2",
     "recover_pending_cancels",
     "recover_pending_intents",
 ]

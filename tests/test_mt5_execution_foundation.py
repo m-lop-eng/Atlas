@@ -15,11 +15,14 @@ import pytest
 from execution.instrument import InstrumentSpec
 from execution.intent_journal import (
     OPERATION_CANCEL,
+    OPERATION_CLOSE,
+    OPERATION_REDUCE,
     IntentJournal,
     IntentJournalError,
     IntentJournalNotInitializedError,
     OrderIntent,
     recover_pending_cancels,
+    recover_pending_intents,
 )
 from execution.live_execution import (
     ACCOUNT_MARGIN_MODE_RETAIL_HEDGING,
@@ -31,7 +34,13 @@ from execution.live_execution import (
     UnresolvedIntentsError,
     UnsupportedAccountModeError,
 )
-from execution.order import Order, OrderSide, OrderType
+from execution.order import (
+    PURPOSE_CLOSE,
+    PURPOSE_REDUCE,
+    Order,
+    OrderSide,
+    OrderType,
+)
 from execution.order_manager import OrderManager
 from risk.types import AccountRiskState
 
@@ -50,6 +59,8 @@ from brokers.mt5 import (
     ORDER_STATE_FILLED,
     ORDER_STATE_PLACED,
     ORDER_TYPE_BUY,
+    ORDER_TYPE_SELL,
+    TRADE_ACTION_DEAL,
     TRADE_ACTION_REMOVE,
 )
 from reconciliation.models import ReconciliationStatus
@@ -85,6 +96,7 @@ class FakeMT5:
         self.send_count = 0
         self.cancel_count = 0
         self.check_count = 0
+        self.last_request: dict | None = None
         self._orders: dict = {}
         self._open_orders: dict = {}
         self._deals: dict = {}
@@ -119,6 +131,13 @@ class FakeMT5:
         self._deals[ticket] = SimpleNamespace(
             ticket=ticket, order=order, volume=volume, price=price,
             commission=commission, time=time,
+        )
+
+    def add_position(self, ticket, *, symbol=INSTRUMENT, volume=0.1, price_open=1.1,
+                     type=ORDER_TYPE_BUY, time=1_700_000_000) -> None:
+        self._positions[ticket] = SimpleNamespace(
+            ticket=ticket, symbol=symbol, volume=volume, price_open=price_open,
+            type=type, time=time,
         )
 
     # --- API MT5 simulada
@@ -159,6 +178,7 @@ class FakeMT5:
         )
 
     def order_send(self, request):
+        self.last_request = dict(request)
         if request.get("action") == TRADE_ACTION_REMOVE:
             return self._send_remove(request)
         self.send_count += 1
@@ -316,6 +336,7 @@ def _coord(
     account_currency="USD",
     instrument=INSTRUMENT,
     adapter=None,
+    spec=None,
 ):
     fake = fake or _fake()
     adapter = adapter or _adapter(fake)
@@ -330,7 +351,7 @@ def _coord(
         sessions=sessions,
         kill_switch=kill_switch,
         instrument=instrument,
-        instrument_spec=_spec(quote=quote),
+        instrument_spec=spec or _spec(quote=quote),
         account_id="MT5-DEMO-1",
         account_currency=account_currency,
         max_open_positions=3,
@@ -1158,3 +1179,299 @@ class TestLegacyCancelCompatibility:
         out = adapter.cancel_order("LEG-C")
         assert out.state is BrokerOrderState.CANCELLED
         assert fake.cancel_count == 1
+
+
+# ==========================================================================
+# 14. MT5-DEMO-EXECUTION-CONTROLS-02B: CLOSE/REDUCE coordinados (FakeMT5)
+# ==========================================================================
+
+
+def _spec_stepged(step=0.01, lo=0.01, hi=100.0):
+    return InstrumentSpec(
+        "EURUSD", contract_size=100000.0, quote_currency="USD",
+        quantity_min=lo, quantity_step=step, quantity_max=hi,
+    )
+
+
+def _long_order(cid, *, reduce_only=True, purpose=PURPOSE_REDUCE, side=OrderSide.SELL,
+                qty=0.1):
+    return Order(
+        strategy_id="s", strategy_version="1.0.0", account_id="A",
+        instrument=INSTRUMENT, side=side, quantity=qty, order_type=OrderType.MARKET,
+        client_order_id=cid, reduce_only=reduce_only, purpose=purpose,
+    )
+
+
+class TestCloseReduce:
+    def test_close_total_confirmed_netting_long(self, tmp_path):
+        journal = IntentJournal.initialize(tmp_path / "j.json")
+        coord, adapter, fake = _coord(journal=journal)
+        fake.add_position(600, volume=0.5, price_open=1.1, type=ORDER_TYPE_BUY)
+        out = coord.close_position()
+        assert out.allowed is True and out.stage == "closed"
+        assert fake.send_count == 1 and fake.cancel_count == 0
+        req = fake.last_request
+        assert req["action"] == TRADE_ACTION_DEAL
+        assert req["position"] == 600  # no-inversion: cierra la posicion exacta
+        assert req["type"] == ORDER_TYPE_SELL
+        assert req["volume"] == pytest.approx(0.5)
+        ci = journal.get("CLOSE:EURUSD")
+        assert ci.operation == OPERATION_CLOSE
+        assert ci.reduce_only is True
+        assert ci.available_quantity == pytest.approx(0.5)
+        # idempotente: repetir no envia de nuevo
+        assert coord.close_position().stage == "reduce_idempotent"
+        assert fake.send_count == 1
+
+    def test_close_short_uses_buy(self, tmp_path):
+        journal = IntentJournal.initialize(tmp_path / "j.json")
+        coord, adapter, fake = _coord(journal=journal)
+        fake.add_position(601, volume=0.3, price_open=1.1, type=ORDER_TYPE_SELL)
+        out = coord.close_position()
+        assert out.allowed and fake.send_count == 1
+        assert fake.last_request["type"] == ORDER_TYPE_BUY
+
+    def test_reduce_partial_confirmed(self, tmp_path):
+        journal = IntentJournal.initialize(tmp_path / "j.json")
+        coord, adapter, fake = _coord(journal=journal)
+        fake.add_position(602, volume=0.5, price_open=1.1, type=ORDER_TYPE_BUY)
+        out = coord.reduce_position(quantity=0.2)
+        assert out.allowed and out.stage == "reduced"
+        assert fake.last_request["volume"] == pytest.approx(0.2)
+        assert fake.last_request["position"] == 602
+        ri = journal.get("REDUCE:EURUSD:0.2")
+        assert ri.operation == OPERATION_REDUCE
+        assert ri.quantity == pytest.approx(0.2)
+        assert ri.available_quantity == pytest.approx(0.5)
+
+    def test_reduce_exceeds_exposure_blocked(self, tmp_path):
+        journal = IntentJournal.initialize(tmp_path / "j.json")
+        coord, adapter, fake = _coord(journal=journal)
+        fake.add_position(603, volume=0.1, price_open=1.1, type=ORDER_TYPE_BUY)
+        with pytest.raises(ExecutionBlockedError) as ei:
+            coord.reduce_position(quantity=0.5)
+        assert ei.value.stage == "quantity"
+        assert fake.send_count == 0
+
+    def test_reduce_zero_negative_blocked(self, tmp_path):
+        journal = IntentJournal.initialize(tmp_path / "j.json")
+        coord, adapter, fake = _coord(journal=journal)
+        fake.add_position(604, volume=0.5, price_open=1.1, type=ORDER_TYPE_BUY)
+        for bad in (0, -0.1):
+            with pytest.raises(ExecutionBlockedError) as ei:
+                coord.reduce_position(quantity=bad)
+            assert ei.value.stage == "quantity"
+        assert fake.send_count == 0
+
+    def test_reduce_step_mismatch_blocked(self, tmp_path):
+        journal = IntentJournal.initialize(tmp_path / "j.json")
+        coord, adapter, fake = _coord(journal=journal, spec=_spec_stepged(step=0.01))
+        fake.add_position(605, volume=0.5, price_open=1.1, type=ORDER_TYPE_BUY)
+        with pytest.raises(ExecutionBlockedError) as ei:
+            coord.reduce_position(quantity=0.015)
+        assert ei.value.stage == "quantity"
+        assert fake.send_count == 0
+        # cantidad alineada SI reduce
+        assert coord.reduce_position(quantity=0.02).allowed
+        assert fake.send_count == 1
+
+    def test_close_without_position_blocked(self, tmp_path):
+        journal = IntentJournal.initialize(tmp_path / "j.json")
+        coord, adapter, fake = _coord(journal=journal)
+        with pytest.raises(ExecutionBlockedError) as ei:
+            coord.close_position()
+        assert ei.value.stage == "position_evidence"
+        assert fake.send_count == 0
+
+    def test_ambiguous_positions_blocked(self, tmp_path):
+        journal = IntentJournal.initialize(tmp_path / "j.json")
+        coord, adapter, fake = _coord(journal=journal)
+        fake.add_position(606, volume=0.2, type=ORDER_TYPE_BUY)
+        fake.add_position(607, volume=0.3, type=ORDER_TYPE_BUY)
+        with pytest.raises(ExecutionBlockedError) as ei:
+            coord.close_position()
+        assert ei.value.stage == "position_evidence"
+        assert fake.send_count == 0
+
+    def test_hedging_blocks(self, tmp_path):
+        journal = IntentJournal.initialize(tmp_path / "j.json")
+        coord, adapter, fake = _coord(journal=journal, account_mode=2)
+        fake.add_position(608, volume=0.5, type=ORDER_TYPE_BUY)
+        with pytest.raises(UnsupportedAccountModeError):
+            coord.close_position()
+        assert fake.send_count == 0
+
+    def test_unknown_account_mode_blocks(self, tmp_path):
+        journal = IntentJournal.initialize(tmp_path / "j.json")
+        coord, adapter, fake = _coord(journal=journal, account_mode=None)
+        fake.add_position(609, volume=0.5, type=ORDER_TYPE_BUY)
+        with pytest.raises(UnsupportedAccountModeError):
+            coord.close_position()
+        assert fake.send_count == 0
+
+    def test_journal_write_ahead_failure_blocks(self, tmp_path, monkeypatch):
+        journal = IntentJournal.initialize(tmp_path / "j.json")
+        coord, adapter, fake = _coord(journal=journal)
+        fake.add_position(610, volume=0.5, type=ORDER_TYPE_BUY)
+
+        def boom(intent):
+            raise IntentJournalError("fallo de persistencia simulado")
+
+        monkeypatch.setattr(journal, "begin", boom)
+        with pytest.raises(ExecutionBlockedError) as ei:
+            coord.close_position()
+        assert ei.value.stage == "journal_persist"
+        assert fake.send_count == 0
+        assert journal.get("CLOSE:EURUSD") is None
+
+    def test_kill_switch_matrix(self, tmp_path):
+        # ALLOW permite
+        for state, can_trade, allowed in (
+            ("ALLOW", True, True),
+            ("BLOCK_NEW_ORDERS", False, True),
+            ("HALT", False, False),
+            ("EMERGENCY", False, False),
+        ):
+            journal = IntentJournal.initialize(tmp_path / f"j-{state}.json")
+            kill = FakeKillSwitch(can_trade=can_trade, state=state)
+            coord, adapter, fake = _coord(journal=journal, kill_switch=kill)
+            fake.add_position(620, volume=0.5, type=ORDER_TYPE_BUY)
+            if allowed:
+                assert coord.close_position().allowed
+                assert fake.send_count == 1
+            else:
+                with pytest.raises(ExecutionBlockedError) as ei:
+                    coord.close_position()
+                assert ei.value.stage == "kill_switch"
+                assert fake.send_count == 0
+
+    def test_session_closed_blocks(self, tmp_path):
+        journal = IntentJournal.initialize(tmp_path / "j.json")
+        sessions = FakeSessions(can_open=False, can_hold=True, state="CLOSED")
+        coord, adapter, fake = _coord(journal=journal, sessions=sessions)
+        fake.add_position(621, volume=0.5, type=ORDER_TYPE_BUY)
+        with pytest.raises(ExecutionBlockedError) as ei:
+            coord.close_position()
+        assert ei.value.stage == "session"
+        assert fake.send_count == 0
+
+    def test_reconciliation_blocked_blocks(self, tmp_path):
+        journal = IntentJournal.initialize(tmp_path / "j.json")
+        coord, adapter, fake = _coord(journal=journal)
+        fake.add_position(622, volume=0.5, type=ORDER_TYPE_BUY)
+        coord.update_reconciliation(ReconciliationStatus.RECONCILIATION_BLOCKED)
+        with pytest.raises(ExecutionBlockedError) as ei:
+            coord.close_position()
+        assert ei.value.stage == "reconciliation"
+        assert fake.send_count == 0
+
+    def test_stale_market_data_blocks(self, tmp_path):
+        journal = IntentJournal.initialize(tmp_path / "j.json")
+        stale = MarketDataReference(INSTRUMENT, 3600, OPEN_TIME, CLOSE_TIME - 10_000)
+        coord, adapter, fake = _coord(journal=journal, market_ref=stale)
+        fake.add_position(623, volume=0.5, type=ORDER_TYPE_BUY)
+        with pytest.raises(ExecutionBlockedError) as ei:
+            coord.close_position()
+        assert ei.value.stage == "market_data"
+        assert fake.send_count == 0
+
+    def test_unhealthy_broker_blocks(self, tmp_path):
+        journal = IntentJournal.initialize(tmp_path / "j.json")
+        coord, adapter, fake = _coord(journal=journal)
+        fake.add_position(624, volume=0.5, type=ORDER_TYPE_BUY)
+        adapter._state = "DISCONNECTED"
+        with pytest.raises(ExecutionBlockedError) as ei:
+            coord.close_position()
+        assert ei.value.stage == "broker_health"
+        assert fake.send_count == 0
+
+    def test_gate_open_permission_cannot_authorize_close(self, tmp_path):
+        journal = IntentJournal.initialize(tmp_path / "j.json")
+        coord, adapter, fake = _coord(journal=journal)
+        fake.add_position(625, volume=0.5, type=ORDER_TYPE_BUY)
+        coord._gate.approve("CLOSE-ADV", token=coord._token)  # permiso OPEN
+        with pytest.raises(ExecutionNotAuthorizedError):
+            adapter.submit_order(_long_order("CLOSE-ADV", purpose=PURPOSE_CLOSE))
+        assert fake.send_count == 0
+        # el coordinador (permiso CLOSE correcto) si cierra
+        assert coord.close_position().allowed
+        assert fake.send_count == 1
+
+    def test_gate_wrong_target_blocked(self, tmp_path):
+        journal = IntentJournal.initialize(tmp_path / "j.json")
+        coord, adapter, fake = _coord(journal=journal)
+        fake.add_position(626, volume=0.5, type=ORDER_TYPE_BUY)
+        coord._gate.approve_operation(
+            OPERATION_REDUCE, op_id="R-ADV", target="OTRO", token=coord._token
+        )
+        with pytest.raises(ExecutionNotAuthorizedError):
+            adapter.submit_order(
+                _long_order("R-ADV", purpose=PURPOSE_REDUCE)
+            )
+        assert fake.send_count == 0
+
+    def test_adapter_rejects_inverting_reduce(self, tmp_path):
+        journal = IntentJournal.initialize(tmp_path / "j.json")
+        coord, adapter, fake = _coord(journal=journal)
+        fake.add_position(627, volume=0.5, type=ORDER_TYPE_BUY)
+        # Mismo sentido que la posicion (BUY sobre long): invertiria.
+        coord._gate.approve_operation(
+            OPERATION_REDUCE, op_id="R-INV", target=INSTRUMENT, token=coord._token
+        )
+        with pytest.raises(BrokerError):
+            adapter.submit_order(
+                _long_order("R-INV", purpose=PURPOSE_REDUCE, side=OrderSide.BUY)
+            )
+        assert fake.send_count == 0
+
+    def test_reduce_id_reuse_with_other_quantity_blocked(self, tmp_path):
+        journal = IntentJournal.initialize(tmp_path / "j.json")
+        coord, adapter, fake = _coord(journal=journal)
+        fake.add_position(628, volume=0.5, type=ORDER_TYPE_BUY)
+        assert coord.reduce_position(quantity=0.2, operation_id="R-1").allowed
+        with pytest.raises(ExecutionBlockedError) as ei:
+            coord.reduce_position(quantity=0.3, operation_id="R-1")
+        assert ei.value.stage == "identity"
+
+    def test_reduce_unknown_then_lookup_resolves(self, tmp_path):
+        journal = IntentJournal.initialize(tmp_path / "j.json")
+        coord, adapter, fake = _coord(journal=journal)
+        fake.add_position(629, volume=0.5, type=ORDER_TYPE_BUY)
+        fake.send_mode = "none"  # respuesta perdida => UNKNOWN
+        out = coord.reduce_position(quantity=0.2, operation_id="R-UNK")
+        assert out.submission.status is SubmitStatus.UNKNOWN
+        assert journal.get("R-UNK").state == "UNKNOWN"
+        # repetir: sin resolver => no repite
+        with pytest.raises(ExecutionBlockedError) as ei:
+            coord.reduce_position(quantity=0.2, operation_id="R-UNK")
+        assert ei.value.stage == "reduce_pending"
+        send_after = fake.send_count
+        # lookup: el broker SI conoce la orden (se planta el estado real)
+        fake._orders[900] = SimpleNamespace(
+            ticket=900, symbol=INSTRUMENT, magic=adapter._magic_for("R-UNK"),
+            comment=adapter._comment_for("R-UNK"), type=ORDER_TYPE_SELL,
+            state=ORDER_STATE_FILLED, volume_initial=0.2, volume_current=0.0,
+            price_open=1.1,
+        )
+        fake.add_deal(9001, 900, volume=0.2, price=1.1)
+        outcomes = coord.resolve_pending()
+        assert any(o.client_order_id == "R-UNK" for o in outcomes)
+        assert journal.get("R-UNK").state == "FILLED"  # adoptado del broker
+        assert fake.send_count == send_after  # lookup NO reenvia
+        # fills registrados una sola vez (idempotente por (cid, seq))
+        assert journal.get("R-UNK").fills_applied == (9001,)
+        coord.resolve_pending()
+        assert journal.get("R-UNK").fills_applied == (9001,)
+
+    def test_reduce_recovery_not_found_stays_pending(self, tmp_path):
+        journal = IntentJournal.initialize(tmp_path / "j.json")
+        journal.begin(
+            OrderIntent.for_reduce(
+                operation_id="R-NF", instrument=INSTRUMENT, side="SELL",
+                quantity=0.1, available_quantity=0.5,
+            )
+        )
+        adapter = _adapter(_fake())
+        outcomes = recover_pending_intents(journal, adapter)
+        assert outcomes[0].result == "NOT_FOUND"
+        assert journal.get("R-NF").terminal is False

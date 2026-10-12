@@ -30,7 +30,7 @@ from brokers import (
     PaperBrokerAdapter,
     SubmitStatus,
 )
-from brokers.models import BrokerOrder, Position
+from brokers.models import BrokerInvalidOrderError, BrokerOrder, Position
 from brokers.reconcile import is_uncertain, resolve_order
 from execution.order import Order, OrderSide, OrderType
 
@@ -47,6 +47,7 @@ def _order(
     quantity: float = 1.0,
     order_type: OrderType = OrderType.MARKET,
     limit_price: float | None = None,
+    reduce_only: bool = False,
 ) -> Order:
     return Order(
         strategy_id="strat-1",
@@ -58,6 +59,7 @@ def _order(
         order_type=order_type,
         client_order_id=client_order_id,
         limit_price=limit_price,
+        reduce_only=reduce_only,
     )
 
 
@@ -584,6 +586,58 @@ class TestDeterminism:
         adapter = _paper()
         adapter.submit_order(_order("NO-NET"))
         assert adapter.health() is True
+
+
+class TestPaperReduceOnly:
+    """02B: PaperBrokerAdapter NO ignora `reduce_only` (no inversion)."""
+
+    def test_reduce_only_without_position_rejected(self) -> None:
+        adapter = _paper()
+        with pytest.raises(BrokerInvalidOrderError):
+            adapter.submit_order(_order(
+                "R-NOPOS", side=OrderSide.SELL, quantity=1.0, reduce_only=True,
+            ))
+        assert adapter.get_positions() == []
+
+    def test_reduce_only_exceeding_exposure_no_inversion(self) -> None:
+        adapter = _paper(price=50_000.0)
+        adapter.submit_order(_order("LONG-1", side=OrderSide.BUY, quantity=1.0))
+        with pytest.raises(BrokerInvalidOrderError):
+            adapter.submit_order(_order(
+                "R-BIG", side=OrderSide.SELL, quantity=2.0, reduce_only=True,
+            ))
+        # El ledger/posicion NO se invierte por una reduccion invalida.
+        positions = adapter.get_positions()
+        assert len(positions) == 1
+        assert positions[0].quantity == pytest.approx(1.0)
+
+    def test_reduce_only_wrong_side_rejected(self) -> None:
+        adapter = _paper(price=50_000.0)
+        adapter.submit_order(_order("LONG-2", side=OrderSide.BUY, quantity=1.0))
+        with pytest.raises(BrokerInvalidOrderError):
+            adapter.submit_order(_order(
+                "R-SAME", side=OrderSide.BUY, quantity=1.0, reduce_only=True,
+            ))
+        assert adapter.get_positions()[0].quantity == pytest.approx(1.0)
+
+    def test_reduce_only_valid_partial(self) -> None:
+        adapter = _paper(price=50_000.0)
+        adapter.submit_order(_order("LONG-3", side=OrderSide.BUY, quantity=1.0))
+        sub = adapter.submit_order(_order(
+            "R-OK", side=OrderSide.SELL, quantity=0.4, reduce_only=True,
+        ))
+        assert sub.status == SubmitStatus.CONFIRMED
+        positions = adapter.get_positions()
+        assert len(positions) == 1
+        assert positions[0].quantity == pytest.approx(0.6)
+
+    def test_reduce_only_full_close_ok(self) -> None:
+        adapter = _paper(price=50_000.0)
+        adapter.submit_order(_order("LONG-4", side=OrderSide.BUY, quantity=1.0))
+        adapter.submit_order(_order(
+            "R-FULL", side=OrderSide.SELL, quantity=1.0, reduce_only=True,
+        ))
+        assert adapter.get_positions() == []
 
 
 if __name__ == "__main__":  # pragma: no cover

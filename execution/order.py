@@ -10,6 +10,13 @@ from datetime import datetime, timezone
 from enum import Enum
 from itertools import count
 
+# MT5-DEMO-EXECUTION-CONTROLS-02B: PROPOSITO tipado de ejecucion de una orden de
+# broker. NO se infiere CLOSE frente a REDUCE solo por `reduce_only=True`.
+PURPOSE_OPEN = "OPEN"
+PURPOSE_CLOSE = "CLOSE"
+PURPOSE_REDUCE = "REDUCE"
+_KNOWN_PURPOSES = frozenset({PURPOSE_OPEN, PURPOSE_CLOSE, PURPOSE_REDUCE})
+
 _order_seq = count(1)
 
 
@@ -90,6 +97,9 @@ class Order:
     stop_price: float | None = None
     time_in_force: str = "GTC"
     reduce_only: bool = False
+    # 02B: proposito de ejecucion (OPEN/CLOSE/REDUCE). CLOSE y REDUCE son
+    # tipados distintos aunque ambos viajen con `reduce_only=True`.
+    purpose: str = PURPOSE_OPEN
     status: OrderStatus = OrderStatus.CREATED
     fill_quantity: int | float = 0
     average_fill_price: float | None = None
@@ -107,6 +117,15 @@ class Order:
             raise ValueError("strategy_id, account_id e instrument son obligatorios")
         if self.quantity <= 0:
             raise ValueError(f"quantity debe ser positivo, recibido {self.quantity}")
+        purpose = str(self.purpose)
+        if purpose not in _KNOWN_PURPOSES:
+            raise ValueError(f"purpose desconocido: {self.purpose!r}")
+        object.__setattr__(self, "purpose", purpose)
+        # CLOSE/REDUCE son operaciones explicitamente reductoras.
+        if purpose in (PURPOSE_CLOSE, PURPOSE_REDUCE) and not self.reduce_only:
+            raise ValueError(
+                f"purpose {purpose} requiere reduce_only=True (no inversion)"
+            )
 
 
 @dataclass(frozen=True, slots=True)
