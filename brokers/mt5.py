@@ -80,6 +80,7 @@ ORDER_FILLING_IOC = 1
 ORDER_FILLING_RETURN = 2
 
 SYMBOL_TRADE_MODE_FULL = 4
+ACCOUNT_MARGIN_MODE_RETAIL_NETTING = 0
 ACCOUNT_MARGIN_MODE_RETAIL_HEDGING = 2
 
 ORDER_STATE_PLACED = 1
@@ -438,6 +439,11 @@ class MT5BrokerAdapter(BrokerAdapter):
         self._cid_to_ticket: dict[str, int] = {}
         self._ticket_to_cid: dict[int, str] = {}
         self._specs: dict[str, MT5SymbolSpec] = {}
+        # MT5-DEMO-EXECUTION-FOUNDATION-01: gate de capacidad OPCIONAL. Si se
+        # enlaza (`bind_execution_gate`), `submit_order` exige que el gate
+        # conozca el `client_order_id` (lo aprueba SOLO el coordinador de
+        # ejecucion). Sin gate (default) el comportamiento LIVE-09 es intacto.
+        self._execution_gate = None
         self._reverse_symbol_map = {
             mt5_symbol: atlas for atlas, mt5_symbol in config.symbol_map.items()
         }
@@ -532,6 +538,61 @@ class MT5BrokerAdapter(BrokerAdapter):
 
     def health(self) -> bool:
         return self._state == "READY"
+
+    # ------------------------------------------- ejecucion coordinada (aditivo)
+
+    def bind_execution_gate(self, gate) -> None:
+        """Enlaza (una sola vez) un `ExecutionGate` obligatorio para `submit_order`.
+
+        Endurecido (H1): el enlace es una operacion de API PUBLICA de una sola
+        asignacion; no permite desactivar ni sustituir el gate de forma
+        accidental:
+
+          * `None` se rechaza: no existe "desenlazar" por API publica.
+          * un objeto sin `check(client_order_id)` llamable se rechaza.
+          * si YA hay un gate enlazado, un segundo enlace falla SIN reemplazarlo
+            (una llamada fallida nunca muta el estado).
+
+        Sin gate enlazado el comportamiento LIVE-09 es intacto (compatibilidad
+        heredada); ese modo NO esta autorizado para la ruta coordinada y no debe
+        activarse desde un runner de ejecucion. Con gate, `submit_order` rechaza
+        cualquier `client_order_id` que el coordinador (poseedor del token) no
+        haya aprobado; no cambia la semantica de submit.
+        """
+        if gate is None:
+            raise BrokerError(
+                "bind_execution_gate rechaza None: no se puede desenlazar el "
+                "gate por API publica (fail-closed)"
+            )
+        if not callable(getattr(gate, "check", None)):
+            raise BrokerError(
+                "bind_execution_gate exige un gate con check(client_order_id) "
+                "llamable (interfaz de comprobacion esperada)"
+            )
+        if self._execution_gate is not None:
+            raise BrokerError(
+                "ya existe un ExecutionGate enlazado: el enlace es de una sola "
+                "asignacion (no se sustituye)"
+            )
+        self._execution_gate = gate
+
+    def remember_identity(self, client_order_id: str, broker_order_id: int | str) -> None:
+        """Prima la correlacion `cid<->ticket` desde una fuente fiable (journal).
+
+        Usado en recovery para NO reconstruir `client_order_id` desde comentarios
+        MT5 (posiblemente truncados). No inventa tickets: exige un id ya conocido.
+        """
+        self._remember(str(client_order_id), int(broker_order_id))
+
+    def margin_mode(self) -> int | None:
+        """`margin_mode` de la cuenta (0=NETTING, 2=HEDGING) o `None` si no READY."""
+        if self._state != "READY":
+            return None
+        info = self._module().account_info()
+        if info is None:
+            return None
+        value = getattr(info, "margin_mode", None)
+        return int(value) if isinstance(value, int) else None
 
     def _classify_connect_error(self) -> BrokerError:
         try:
@@ -671,6 +732,10 @@ class MT5BrokerAdapter(BrokerAdapter):
         cid = order.client_order_id
         if not cid:
             raise BrokerInvalidOrderError("client_order_id obligatorio")
+        # MT5-DEMO-EXECUTION-FOUNDATION-01: solo envia si el gate de capacidad
+        # enlazado autoriza este cid. Sin gate (default) => LIVE-09 intacto.
+        if self._execution_gate is not None:
+            self._execution_gate.check(cid)
         if order.order_type is not OrderType.MARKET:
             raise BrokerInvalidOrderError(
                 f"tipo de orden no soportado por MT5 en LIVE-09: {order.order_type}"
@@ -890,6 +955,16 @@ class MT5BrokerAdapter(BrokerAdapter):
         return self._clock()
 
     def cancel_order(self, client_order_id: str) -> BrokerOrder:
+        """Cancela una orden existente (NO coordinado — LIVE-09 heredado).
+
+        ALCANCE EXPLICITO (H2): `cancel_order` NO esta integrado en
+        `LiveExecutionCoordinator`. Las cancelaciones coordinadas permanecen
+        FUERA DE ALCANCE. La futura ruta de ejecucion no debe invocar
+        cancelaciones directamente al margen de una autorizacion y una politica
+        de recuperacion; no se autorizara una prueba de orden hasta resolver
+        explicitamente esta capacidad. Este metodo no participa del
+        `ExecutionGate` de submit.
+        """
         self._require_demo()
         self._require_ready()
         ticket = self._cid_to_ticket.get(client_order_id)
