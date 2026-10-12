@@ -234,10 +234,11 @@ class FakeMT5:
             rows = [o for o in rows if o.ticket == ticket]
         return tuple(rows)
 
-    def history_deals_get(self, order=None):
+    def history_deals_get(self, ticket=None):
+        # Firma REAL de la API MT5: `ticket` = ticket de ORDEN (DEAL_ORDER).
         rows = list(self._deals.values())
-        if order is not None:
-            rows = [d for d in rows if d.order == order]
+        if ticket is not None:
+            rows = [d for d in rows if d.order == ticket]
         return tuple(rows)
 
     def positions_get(self, symbol=None, ticket=None):

@@ -421,6 +421,35 @@ def read_mt5_symbol_spec(
     return spec
 
 
+# MT5-DEMO-LIVE-READINESS-03A: estado EXPLICITO de una lectura de historial.
+# Distingue historial completo, vacio confirmado y consulta incompleta/no
+# disponible, para que un error historico NUNCA se confunda con "no hay fills".
+HISTORY_COMPLETE = "COMPLETE"
+HISTORY_EMPTY_CONFIRMED = "EMPTY_CONFIRMED"
+HISTORY_INCOMPLETE = "INCOMPLETE"
+
+
+@dataclass(frozen=True, slots=True)
+class OrderHistoryLookup:
+    """Resultado explicito de reconstruir la historia de UNA orden.
+
+    `status`:
+      * `COMPLETE`: la orden y TODOS sus fills se leyeron del broker.
+      * `EMPTY_CONFIRMED`: el broker (consulta limpia) no conoce la orden.
+      * `INCOMPLETE`: la consulta fallo, fue ambigua o no pudo confirmarse el
+        detalle de fills: NO se puede contabilizar ni afirmar ausencia.
+    """
+
+    client_order_id: str
+    status: str
+    order: "BrokerOrder | None" = None
+    detail: str = ""
+
+    @property
+    def complete(self) -> bool:
+        return self.status == HISTORY_COMPLETE
+
+
 class MT5BrokerAdapter(BrokerAdapter):
     """Adapter real MT5 (DEMO-only en LIVE-09).
 
@@ -705,10 +734,15 @@ class MT5BrokerAdapter(BrokerAdapter):
                 "(contract gap: falta broker_position_id inequivoco); no se envia"
             )
         try:
-            rows = list(mt5.positions_get(symbol=spec.name) or ())
+            rows = self._rows_or_raise(
+                mt5.positions_get(symbol=spec.name), "positions_get(symbol)"
+            )
+        except BrokerConnectionError:
+            raise
         except Exception as exc:  # noqa: BLE001
             raise BrokerConnectionError(
-                f"positions_get fallo ({type(exc).__name__})"
+                f"positions_get fallo ({type(exc).__name__}; "
+                f"{self._last_error_text()})"
             ) from exc
         if not rows:
             raise BrokerInvalidOrderError(
@@ -897,6 +931,51 @@ class MT5BrokerAdapter(BrokerAdapter):
             return self._indeterminate_broker_order(client_order_id)
         return order
 
+    def lookup_order_history(self, client_order_id: str) -> OrderHistoryLookup:
+        """Reconstruye la historia de una orden con estado EXPLICITO (03A).
+
+        A diferencia de `get_order` (que devuelve `None` para NOT_FOUND y un
+        `BrokerOrder` UNKNOWN para ambiguedad), este metodo NUNCA convierte un
+        fallo de consulta historica en "sin fills": devuelve `INCOMPLETE`. Asi el
+        runtime puede decidir reconstruir (COMPLETE) o fallar de forma cerrada.
+        """
+        self._require_ready()
+        cid = str(client_order_id)
+        ticket = self._cid_to_ticket.get(cid)
+        if ticket is None:
+            try:
+                matches = self._discover_tickets(cid)
+            except BrokerConnectionError as exc:
+                return OrderHistoryLookup(cid, HISTORY_INCOMPLETE, detail=str(exc))
+            if not matches:
+                return OrderHistoryLookup(cid, HISTORY_EMPTY_CONFIRMED)
+            if len(matches) > 1:
+                return OrderHistoryLookup(
+                    cid, HISTORY_INCOMPLETE,
+                    detail="correlacion ambigua (multiples tickets)",
+                )
+            ticket = matches[0]
+            self._remember(cid, ticket)
+        try:
+            order = self._build_broker_order(cid, ticket)
+        except BrokerConnectionError as exc:
+            return OrderHistoryLookup(cid, HISTORY_INCOMPLETE, detail=str(exc))
+        if order is None:
+            return OrderHistoryLookup(
+                cid, HISTORY_INCOMPLETE, detail="sin fila de orden/pocision en broker"
+            )
+        # Una orden terminalmente ejecutada DEBE traer detalle de fills; su
+        # ausencia indica historial de deals incompleto (no "0 fills").
+        if order.state in (
+            BrokerOrderState.FILLED,
+            BrokerOrderState.PARTIALLY_FILLED,
+        ) and not order.fills:
+            return OrderHistoryLookup(
+                cid, HISTORY_INCOMPLETE, order=order,
+                detail="estado con fills pero sin detalle de deals",
+            )
+        return OrderHistoryLookup(cid, HISTORY_COMPLETE, order=order)
+
     def _discover_tickets(self, client_order_id: str) -> list[int]:
         magic = self._magic_for(client_order_id)
         comment = self._comment_for(client_order_id)
@@ -936,10 +1015,15 @@ class MT5BrokerAdapter(BrokerAdapter):
         self._require_ready()
         mt5 = self._module()
         try:
-            raw_positions = list(mt5.positions_get() or ())
+            raw_positions = self._rows_or_raise(
+                mt5.positions_get(), "positions_get"
+            )
+        except BrokerConnectionError:
+            raise
         except Exception as exc:  # noqa: BLE001
             raise BrokerConnectionError(
-                f"positions_get fallo ({type(exc).__name__})"
+                f"positions_get fallo ({type(exc).__name__}; "
+                f"{self._last_error_text()})"
             ) from exc
         # Deteccion hedging: multiples posiciones por simbolo no soportadas aun.
         account = mt5.account_info()
@@ -1050,44 +1134,109 @@ class MT5BrokerAdapter(BrokerAdapter):
 
     # ------------------------------------------------------- construccion vista
 
+    def _last_error_text(self) -> str:
+        """Diagnostico SANITIZADO de `last_error()` (nunca credenciales)."""
+        try:
+            err = self._module().last_error()
+        except Exception:  # noqa: BLE001 - diagnostico best-effort
+            return "last_error no disponible"
+        if isinstance(err, (tuple, list)) and err:
+            code = err[0]
+            desc = err[1] if len(err) > 1 else ""
+            # Solo codigo + descripcion corta; jamas datos de cuenta/credenciales.
+            return f"last_error={code}:{str(desc)[:80]}"
+        return f"last_error={err!r}"
+
+    def _rows_or_raise(self, rows, what: str) -> list[Any]:
+        """MetaTrader5 devuelve `None` en error. Un `None` es FALLO, no vacio.
+
+        Distingue explicitamente: `None` (error de la API, diagnostico via
+        `last_error()`) y retorno no iterable (fallo) se convierten en
+        `BrokerConnectionError`; una coleccion vacia SIN error se preserva como
+        vacia (nunca se confunde con un fallo).
+        """
+        if rows is None:
+            raise BrokerConnectionError(
+                f"{what} devolvio None (fallo de la API; {self._last_error_text()})"
+            )
+        try:
+            return list(rows)
+        except TypeError as exc:
+            raise BrokerConnectionError(
+                f"{what} retorno no iterable ({type(exc).__name__}; "
+                f"{self._last_error_text()})"
+            ) from exc
+
     def _safe_orders_get(self) -> list[Any]:
         try:
-            return list(self._module().orders_get() or ())
+            return self._rows_or_raise(self._module().orders_get(), "orders_get")
+        except BrokerConnectionError:
+            raise
         except Exception as exc:  # noqa: BLE001
             raise BrokerConnectionError(
-                f"orders_get fallo ({type(exc).__name__})"
+                f"orders_get fallo ({type(exc).__name__}; {self._last_error_text()})"
             ) from exc
 
     def _safe_history_orders_get(self) -> list[Any]:
+        # 03A: un fallo de consulta historica NO se convierte en `[]`. Un `[]`
+        # silencioso haria que `get_order`/`lookup_order_history` interpretasen
+        # un error (None/excepcion) como "el broker no conoce la orden"
+        # (NOT_FOUND), perdiendo fills reales. Se propaga LOOKUP_UNCERTAIN.
         try:
-            return list(self._module().history_orders_get() or ())
-        except Exception:  # noqa: BLE001 - historial opcional para discovery
-            return []
+            return self._rows_or_raise(
+                self._module().history_orders_get(), "history_orders_get"
+            )
+        except BrokerConnectionError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise BrokerConnectionError(
+                f"history_orders_get fallo ({type(exc).__name__}; "
+                f"{self._last_error_text()})"
+            ) from exc
 
     def _open_order(self, ticket: int) -> Any | None:
         try:
-            rows = self._module().orders_get(ticket=ticket) or ()
+            rows = self._rows_or_raise(
+                self._module().orders_get(ticket=ticket), "orders_get(ticket)"
+            )
+        except BrokerConnectionError:
+            raise
         except Exception as exc:  # noqa: BLE001
             raise BrokerConnectionError(
-                f"orders_get(ticket) fallo ({type(exc).__name__})"
+                f"orders_get(ticket) fallo ({type(exc).__name__}; "
+                f"{self._last_error_text()})"
             ) from exc
         return rows[0] if rows else None
 
     def _history_order(self, ticket: int) -> Any | None:
         try:
-            rows = self._module().history_orders_get(ticket=ticket) or ()
+            rows = self._rows_or_raise(
+                self._module().history_orders_get(ticket=ticket),
+                "history_orders_get(ticket)",
+            )
+        except BrokerConnectionError:
+            raise
         except Exception as exc:  # noqa: BLE001
             raise BrokerConnectionError(
-                f"history_orders_get fallo ({type(exc).__name__})"
+                f"history_orders_get fallo ({type(exc).__name__}; "
+                f"{self._last_error_text()})"
             ) from exc
         return rows[-1] if rows else None
 
     def _deals_for(self, ticket: int) -> list[Any]:
         try:
-            rows = self._module().history_deals_get(order=ticket) or ()
+            # API MT5: el filtro por ticket de ORDEN (DEAL_ORDER) es `ticket=`
+            # (no existe `order=`). None/error => fallo, nunca historial vacio.
+            rows = self._rows_or_raise(
+                self._module().history_deals_get(ticket=ticket),
+                "history_deals_get(ticket)",
+            )
+        except BrokerConnectionError:
+            raise
         except Exception as exc:  # noqa: BLE001
             raise BrokerConnectionError(
-                f"history_deals_get fallo ({type(exc).__name__})"
+                f"history_deals_get(ticket) fallo ({type(exc).__name__}; "
+                f"{self._last_error_text()})"
             ) from exc
         return sorted(
             rows,

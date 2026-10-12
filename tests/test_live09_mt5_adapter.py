@@ -21,6 +21,9 @@ from execution.order import Order, OrderSide, OrderType
 from reconciliation.orchestrator import broker_state_from_adapter
 
 from brokers.mt5 import (
+    HISTORY_COMPLETE,
+    HISTORY_EMPTY_CONFIRMED,
+    HISTORY_INCOMPLETE,
     MT5BrokerAdapter,
     MT5Config,
     MT5ConfigError,
@@ -86,6 +89,13 @@ class FakeMT5:
         self.fail_orders_get = False
         self.fail_history_orders_get = False
         self.fail_deals = False
+        # Contratos de retorno reales de MetaTrader5: `None` = error (detalle en
+        # last_error()); coleccion vacia = sin resultados.
+        self.none_orders_get = False
+        self.none_history_orders_get = False
+        self.none_history_deals_get = False
+        self.none_positions_get = False
+        self.last_deals_kwargs: dict | None = None
         self._orders: dict = {}
         self._open_orders: dict = {}
         self._deals: dict = {}
@@ -255,6 +265,9 @@ class FakeMT5:
         )
 
     def orders_get(self, ticket=None):
+        if self.none_orders_get:
+            self.last_error_value = (1, "orders_get failed")
+            return None
         if self.fail_orders_get:
             raise RuntimeError("orders_get transport")
         rows = list(self._open_orders.values())
@@ -263,6 +276,9 @@ class FakeMT5:
         return tuple(rows)
 
     def positions_get(self, symbol=None, ticket=None):
+        if self.none_positions_get:
+            self.last_error_value = (4, "positions_get failed")
+            return None
         rows = list(self._positions.values())
         if symbol is not None:
             rows = [p for p in rows if p.symbol == symbol]
@@ -271,6 +287,9 @@ class FakeMT5:
         return tuple(rows)
 
     def history_orders_get(self, ticket=None):
+        if self.none_history_orders_get:
+            self.last_error_value = (2, "history_orders_get failed")
+            return None
         if self.fail_history_orders_get:
             raise RuntimeError("history_orders_get transport")
         rows = list(self._orders.values())
@@ -278,12 +297,18 @@ class FakeMT5:
             rows = [o for o in rows if o.ticket == ticket]
         return tuple(rows)
 
-    def history_deals_get(self, order=None):
+    def history_deals_get(self, ticket=None):
+        # Firma REAL de la API MT5: `ticket` filtra por ticket de ORDEN
+        # (DEAL_ORDER). No se admite `order=` (rechazado por TypeError).
+        self.last_deals_kwargs = {"ticket": ticket}
+        if self.none_history_deals_get:
+            self.last_error_value = (3, "history_deals_get failed")
+            return None
         if self.fail_deals:
             raise RuntimeError("history_deals_get transport")
         rows = list(self._deals.values())
-        if order is not None:
-            rows = [d for d in rows if d.order == order]
+        if ticket is not None:
+            rows = [d for d in rows if d.order == ticket]
         return tuple(rows)
 
 
@@ -984,3 +1009,114 @@ class TestPaperDefaultUnchanged:
     def test_mt5_adapter_has_no_price_source(self):
         # El engine paper exige `price_source`: MT5 nunca entra como paper.
         assert not hasattr(MT5BrokerAdapter, "price_source")
+
+
+# --------------------------------------------------------------------------
+# 03A: historial explicito (COMPLETE / EMPTY_CONFIRMED / INCOMPLETE)
+# --------------------------------------------------------------------------
+
+
+class TestOrderHistoryLookup:
+    def test_history_complete(self):
+        adapter, _ = _ready()
+        adapter.submit_order(_order(cid="H-OK"))
+        result = adapter.lookup_order_history("H-OK")
+        assert result.status == HISTORY_COMPLETE
+        assert result.order is not None
+        assert result.order.state is BrokerOrderState.FILLED
+        assert len(result.order.fills) == 1
+
+    def test_history_empty_confirmed(self):
+        adapter, _ = _ready()
+        result = adapter.lookup_order_history("H-NONE")
+        assert result.status == HISTORY_EMPTY_CONFIRMED
+        assert result.order is None
+
+    def test_history_error_is_not_empty_confirmed(self):
+        # Un fallo de consulta historica NO se convierte en EMPTY_CONFIRMED.
+        adapter, fake = _ready()
+        fake.fail_history_orders_get = True
+        result = adapter.lookup_order_history("H-ERR")
+        assert result.status == HISTORY_INCOMPLETE
+        assert result.status != HISTORY_EMPTY_CONFIRMED
+
+    def test_get_order_raises_on_history_transport(self):
+        # get_order NUNCA interpreta un fallo de historial como NOT_FOUND.
+        adapter, fake = _ready()
+        fake.fail_history_orders_get = True
+        with pytest.raises(BrokerConnectionError):
+            adapter.get_order("H-ERR2")
+
+    def test_history_orders_none_is_incomplete_not_empty(self):
+        # MetaTrader5 devuelve None en error (detalle en last_error()).
+        adapter, fake = _ready()
+        fake.none_history_orders_get = True
+        result = adapter.lookup_order_history("H-NONE-ERR")
+        assert result.status == HISTORY_INCOMPLETE
+        assert result.status != HISTORY_EMPTY_CONFIRMED
+
+    def test_history_orders_empty_is_empty_confirmed(self):
+        # Coleccion vacia SIN error = sin resultados (si, ademas, no hay orden).
+        adapter, _ = _ready()
+        result = adapter.lookup_order_history("H-EMPTY")
+        assert result.status == HISTORY_EMPTY_CONFIRMED
+
+    def test_orders_get_none_not_silenced(self):
+        # Un fallo de consulta ABIERTA que impide el discovery no se silencia.
+        adapter, fake = _ready()
+        fake.none_orders_get = True
+        result = adapter.lookup_order_history("H-OPEN-ERR")
+        assert result.status == HISTORY_INCOMPLETE
+        with pytest.raises(BrokerConnectionError):
+            adapter.get_order("H-OPEN-ERR")
+
+    def test_deals_none_for_filled_is_incomplete(self):
+        adapter, fake = _ready()
+        adapter.submit_order(_order(cid="D-NONE"))  # FILLED con 1 deal
+        fake.none_history_deals_get = True
+        result = adapter.lookup_order_history("D-NONE")
+        assert result.status == HISTORY_INCOMPLETE
+
+    def test_deals_empty_for_filled_is_incomplete(self):
+        # FILLED sin detalle de deals necesario para contabilizar => incompleto.
+        adapter, fake = _ready()
+        adapter._remember("D-EMPTY", 4242)
+        fake._orders[4242] = SimpleNamespace(
+            ticket=4242, symbol=MT5_SYMBOL, magic=adapter._magic_for("D-EMPTY"),
+            comment=adapter._comment_for("D-EMPTY"), type=0, state=ORDER_STATE_FILLED,
+            volume_initial=0.1, volume_current=0.0, price_open=50_000.0,
+        )
+        result = adapter.lookup_order_history("D-EMPTY")
+        assert result.status == HISTORY_INCOMPLETE
+
+    def test_last_error_text_is_sanitized(self):
+        adapter, fake = _ready()
+        fake.last_error_value = (4756, "Invalid params")
+        text = adapter._last_error_text()
+        assert "4756" in text
+        assert "password" not in text.lower()
+
+    def test_positions_get_none_not_flat(self):
+        # positions_get() None (error) NO se interpreta como "sin posiciones".
+        adapter, fake = _ready()
+        fake.none_positions_get = True
+        with pytest.raises(BrokerConnectionError):
+            adapter.get_positions()
+
+    def test_deals_for_uses_ticket_kwarg(self):
+        # _deals_for DEBE invocar history_deals_get(ticket=...) (firma real) y
+        # recuperar los deals de la orden.
+        adapter, fake = _ready()
+        adapter.submit_order(_order(cid="DK-1"))
+        fake.last_deals_kwargs = None
+        order = adapter.get_order("DK-1")
+        assert len(order.fills) == 1
+        assert fake.last_deals_kwargs is not None
+        assert set(fake.last_deals_kwargs) == {"ticket"}
+        assert fake.last_deals_kwargs["ticket"] == int(order.broker_order_id)
+
+    def test_fake_rejects_order_kwarg(self):
+        # El fake NO admite `order=` (ni **kwargs): reproduce la firma real.
+        _, fake = _ready()
+        with pytest.raises(TypeError):
+            fake.history_deals_get(order=1)
