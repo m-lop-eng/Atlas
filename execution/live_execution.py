@@ -58,6 +58,7 @@ from execution.order_manager import OrderManager, OrderStateError
 
 from brokers.models import (
     BrokerConnectionError,
+    BrokerError,
     BrokerOrder,
     BrokerOrderState,
     OrderNotFoundError,
@@ -288,6 +289,7 @@ class LiveExecutionCoordinator:
         reconciliation: ReconciliationEngine | None = None,
         clock: Callable[[], datetime] = lambda: datetime.now(_UTC),
         run_id: str = "LIVE-EXEC",
+        allow_restricted_hedging: bool = False,
     ) -> None:
         if not isinstance(journal, IntentJournal):
             raise TypeError(
@@ -328,6 +330,9 @@ class LiveExecutionCoordinator:
         self._projected_gate = projected_exposure_gate
         self._clock = clock
         self._run_id = run_id
+        # ATLAS-MT5-HEDGING-01: HEDGING SOLO con opt-in explicito restringido
+        # (una posicion propiedad de Atlas por simbolo). Por defecto False.
+        self._allow_restricted_hedging = bool(allow_restricted_hedging)
 
         self._recon_engine = reconciliation or ReconciliationEngine()
         self._reconciliation_blocked = False
@@ -459,15 +464,22 @@ class LiveExecutionCoordinator:
             raise UnsupportedAccountModeError(
                 "semantica de cuenta NO verificada (margin_mode ausente)"
             )
+        if mode == ACCOUNT_MARGIN_MODE_RETAIL_NETTING:
+            return
         if mode == ACCOUNT_MARGIN_MODE_RETAIL_HEDGING:
+            # ATLAS-MT5-HEDGING-01: HEDGING admitido SOLO bajo politica explicita
+            # restringida (opt-in). NO se acepta por el simple margin_mode; el
+            # cierre/reduccion dirigido y la verificacion de propiedad se aplican
+            # en `_observe_target_position` y en el adapter.
+            if self._allow_restricted_hedging:
+                return
             raise UnsupportedAccountModeError(
-                "cuenta HEDGING sin procedimiento seguro de cierre: "
-                "ninguna apertura permitida"
+                "cuenta HEDGING sin opt-in restringido "
+                "(allow_restricted_hedging=False): ninguna operacion permitida"
             )
-        if mode != ACCOUNT_MARGIN_MODE_RETAIL_NETTING:
-            raise UnsupportedAccountModeError(
-                f"margin_mode no soportado/verificado: {mode}"
-            )
+        raise UnsupportedAccountModeError(
+            f"margin_mode no soportado/verificado: {mode}"
+        )
 
     def _assert_position_limit(self) -> None:
         state = self._risk_state_provider()
@@ -528,6 +540,362 @@ class LiveExecutionCoordinator:
             raise ExecutionBlockedError("position_evidence", "posicion neta nula")
         return pos
 
+    # ------------------------------------ HEDGING restringido (MT5-HEDGING-01)
+
+    def _broker_positions_for_instrument(self) -> list:
+        try:
+            positions = list(self._broker.get_positions())
+        except BrokerError as exc:
+            # El adaptador falla cerrado (p.ej. HEDGING con multiples posiciones
+            # por simbolo) => se propaga como bloqueo del coordinador.
+            raise ExecutionBlockedError(
+                "position_evidence",
+                f"posiciones del broker no determinables ({type(exc).__name__})",
+            ) from exc
+        return [p for p in positions if p.instrument == self._instrument]
+
+    def _position_is_owned(self, position_id) -> bool:
+        """True si el POSITION_IDENTIFIER esta vinculado a un intent de Atlas."""
+        if position_id is None:
+            return False
+        return bool(
+            self._journal.find_by_position_id(str(position_id))
+        )
+
+    def _assert_no_open_position_for_entry(self) -> None:
+        """Politica restringida: una sola posicion por simbolo.
+
+        Con HEDGING restringido, una APERTURA exige que NO exista ya ninguna
+        posicion del instrumento (propia o externa) => sin LONG+SHORT
+        simultaneos ni multiples posiciones.
+        """
+        if not self._allow_restricted_hedging:
+            return
+        existing = self._broker_positions_for_instrument()
+        if existing:
+            raise ExecutionBlockedError(
+                "position_evidence",
+                "ya existe una posicion para el instrumento (politica HEDGING "
+                "restringida: una sola posicion por simbolo)",
+            )
+
+    def _observe_target_position(self, target_position_id: str | None):
+        """Posicion objetivo para CLOSE/REDUCE.
+
+        NETTING: la posicion neta unica del instrumento (sin target explicito).
+        HEDGING restringido: exige `target_position_id` (POSITION_IDENTIFIER),
+        verificando PROPIEDAD (vinculo durable en el journal) y unicidad. Nunca
+        selecciona por indice ni por ticket minimo.
+        """
+        if not self._allow_restricted_hedging:
+            return self._observe_net_position()
+        if not target_position_id or not str(target_position_id).strip():
+            raise ExecutionBlockedError(
+                "position_target",
+                "HEDGING restringido exige target_position_id explicito "
+                "(POSITION_IDENTIFIER); no se selecciona posicion por indice",
+            )
+        target = str(target_position_id)
+        if not self._position_is_owned(target):
+            raise ExecutionBlockedError(
+                "position_ownership",
+                "POSITION_IDENTIFIER objetivo no vinculado a Atlas "
+                "(propiedad desconocida/externa)",
+            )
+        matching = [
+            p
+            for p in self._broker_positions_for_instrument()
+            if p.position_id is not None and str(p.position_id) == target
+        ]
+        if len(matching) != 1:
+            raise ExecutionBlockedError(
+                "position_evidence",
+                f"identidad de posicion ambigua/ausente para el objetivo "
+                f"(coincidencias={len(matching)})",
+            )
+        pos = matching[0]
+        if abs(float(pos.quantity)) <= 1e-12:
+            raise ExecutionBlockedError("position_evidence", "posicion objetivo nula")
+        return pos
+
+    # ------------------- identidad de operacion CLOSE/REDUCE (H-2)
+
+    def _base_operation_id(self, operation: str, requested_q) -> str:
+        """Identificador BASE determinista (compatibilidad NETTING)."""
+        if operation == OPERATION_CLOSE:
+            return f"CLOSE:{self._instrument}"
+        return f"REDUCE:{self._instrument}:{requested_q}"
+
+    def _next_free_operation_id(self, base_id: str) -> str:
+        """Identificador UNICO derivado del base para una operacion NUEVA.
+
+        El primer sufijo libre evita reutilizar la identidad de una operacion ya
+        resuelta sobre el mismo instrumento/cantidad (p.ej. tras cerrar y volver
+        a abrir, o una segunda reduccion del mismo tamano).
+        """
+        if self._journal.get(base_id) is None:
+            return base_id
+        n = 2
+        while self._journal.get(f"{base_id}#{n}") is not None:
+            n += 1
+        return f"{base_id}#{n}"
+
+    def _target_present(self, target_position_id: str | None) -> bool:
+        """True si el OBJETIVO de la operacion sigue vivo en el broker.
+
+        NETTING: una posicion neta del instrumento. HEDGING restringido: la
+        posicion con el `POSITION_IDENTIFIER` indicado. No lanza por ausencia.
+        """
+        positions = self._broker_positions_for_instrument()
+        if self._allow_restricted_hedging:
+            if not target_position_id or not str(target_position_id).strip():
+                return False
+            target = str(target_position_id)
+            return any(
+                p.position_id is not None and str(p.position_id) == target
+                for p in positions
+            )
+        return len(positions) == 1
+
+    def _assert_no_unresolved_reduce(self, target_position_id: str | None) -> None:
+        """Bloquea una operacion nueva que eludiria un cierre/reduccion pendiente.
+
+        Si existe un intent CLOSE/REDUCE SIN RESOLVER sobre el MISMO objetivo
+        (mismo instrumento y, en HEDGING, misma identidad de posicion), ninguna
+        solicitud nueva sobre ese objetivo puede enviarse --ni con otro
+        `operation_id`-- hasta resolverlo por lookup.
+        """
+        for intent in self._journal.unresolved():
+            if intent.operation not in (OPERATION_CLOSE, OPERATION_REDUCE):
+                continue
+            if intent.instrument != self._instrument:
+                continue
+            if (
+                self._allow_restricted_hedging
+                and target_position_id is not None
+                and intent.target_position_id is not None
+                and str(intent.target_position_id) != str(target_position_id)
+            ):
+                continue
+            raise ExecutionBlockedError(
+                "reduce_pending",
+                "existe un cierre/reduccion sin resolver sobre el objetivo; "
+                "resolver por lookup antes de enviar otra orden",
+            )
+
+    def _resolve_reduce_identity(
+        self,
+        operation: str,
+        operation_id: str | None,
+        requested_q,
+        target_position_id: str | None,
+    ):
+        """Resuelve el `operation_id` de la operacion.
+
+        Devuelve `(op_id, None)` para enviar una operacion (nueva o reintento con
+        id explicito) o `(None, intent_terminal)` para una repeticion ya resuelta
+        sin nada que enviar (idempotencia). Lanza en conflicto/pendiente.
+        """
+        instrument = self._instrument
+        if operation_id is not None:
+            op_id = str(operation_id)
+            existing = self._journal.get(op_id)
+            if existing is None:
+                return op_id, None
+            if existing.operation != operation or existing.instrument != instrument:
+                raise ExecutionBlockedError(
+                    "identity", "operation_id reutilizado con identidad distinta"
+                )
+            if (
+                operation == OPERATION_REDUCE
+                and abs(float(existing.quantity) - requested_q) > 1e-9
+            ):
+                raise ExecutionBlockedError(
+                    "identity", "operation_id reutilizado con cantidad distinta"
+                )
+            if existing.terminal:
+                return None, existing
+            raise ExecutionBlockedError(
+                "reduce_pending",
+                "operacion previa sin resolver: resolver por lookup (no repetir)",
+            )
+        base_id = self._base_operation_id(operation, requested_q)
+        existing = self._journal.get(base_id)
+        if existing is None:
+            return base_id, None
+        if existing.operation != operation or existing.instrument != instrument:
+            return self._next_free_operation_id(base_id), None
+        if not existing.terminal:
+            raise ExecutionBlockedError(
+                "reduce_pending",
+                "operacion previa sin resolver: resolver por lookup (no repetir)",
+            )
+        # Base TERMINAL: si queda objetivo vivo es una operacion NUEVA (p.ej. se
+        # cerro y se volvio a abrir, o segunda reduccion); si no, no-op.
+        if self._target_present(target_position_id):
+            return self._next_free_operation_id(base_id), None
+        return None, existing
+
+    # Tolerancia de volumen para comparar ejecutado vs residual de posicion.
+    _RESIDUAL_EPS = 1e-6
+
+    def _observe_position_after_send(
+        self, operation: str, target_position_id: str | None
+    ):
+        """Re-consulta la POSICION OBJETIVO tras el envio (evidencia de posicion).
+
+        Devuelve `(position_or_None, reason_or_None)`:
+          * `(None, None)` -> ausencia observada de la posicion objetivo.
+          * `(pos, None)`  -> posicion viva, resuelta por POSITION_IDENTIFIER
+                              (HEDGING; nunca por indice/primera fila).
+          * `(None, motivo)` -> consulta NO concluyente (error/None/ambiguedad):
+                              no autoriza a declarar exito.
+        """
+        try:
+            positions = self._broker_positions_for_instrument()
+        except ExecutionBlockedError as exc:
+            return None, f"posiciones no consultables ({exc.reason})"
+        except Exception as exc:  # noqa: BLE001 - consulta incierta => sin resolver
+            return None, f"posiciones no consultables ({type(exc).__name__})"
+        if self._allow_restricted_hedging:
+            if not target_position_id or not str(target_position_id).strip():
+                return None, "objetivo HEDGING sin POSITION_IDENTIFIER"
+            target = str(target_position_id)
+            matching = [
+                p
+                for p in positions
+                if p.position_id is not None and str(p.position_id) == target
+            ]
+            if len(matching) > 1:
+                return None, "identidad de posicion ambigua tras el envio"
+            if not matching:
+                return None, None
+            pos = matching[0]
+            if pos.ticket is None:
+                return None, "posicion objetivo sin POSITION_TICKET actual"
+            return pos, None
+        # NETTING: una unica posicion neta del instrumento.
+        if len(positions) > 1:
+            return None, "multiples posiciones del instrumento tras el envio"
+        return (positions[0] if positions else None), None
+
+    def _confirm_close_reduce(self, operation: str, op_id: str) -> str | None:
+        """Confirma con evidencia AUTORITATIVA de orden + fills + POSICION ACTUAL.
+
+        Combina el estado/fills de la propia orden (`lookup_order_history`) con la
+        re-consulta del estado ACTUAL de la posicion objetivo, y compara volumen
+        inicial, ejecutado y residual. Devuelve:
+          * "full"     -> orden ejecutada por el volumen esperado Y residual
+                          observado coherente (cierre: posicion ausente;
+                          reduccion: residual == disponible - ejecutado).
+          * "partial"  -> ejecucion parcial con residual coherente.
+          * "rejected" -> el broker no ejecuto la operacion.
+          * None       -> sin evidencia suficiente o discrepancia: SIN RESOLVER.
+        La ausencia AISLADA de la posicion NO demuestra que esta orden la cerro.
+        """
+        intent = self._journal.get(op_id)
+        if intent is None:
+            return None
+        lookup = getattr(self._broker, "lookup_order_history", None)
+        if not callable(lookup):
+            return None
+        try:
+            result = lookup(op_id)
+        except Exception:  # noqa: BLE001 - consulta incierta => sin resolver
+            return None
+        if not bool(getattr(result, "complete", False)):
+            return None
+        order = getattr(result, "order", None)
+        if order is None:
+            return None
+        state = getattr(order, "state", None)
+        if state in (
+            BrokerOrderState.REJECTED,
+            BrokerOrderState.EXPIRED,
+            BrokerOrderState.CANCELLED,
+        ):
+            return "rejected"
+
+        requested = float(intent.quantity)
+        available_before = float(
+            intent.available_quantity
+            if intent.available_quantity is not None
+            else requested
+        )
+        filled = float(getattr(order, "filled_quantity", 0.0) or 0.0)
+
+        # 2) Estado ACTUAL de la posicion objetivo (no sustituible por existe/no existe).
+        position, reason = self._observe_position_after_send(
+            operation, intent.target_position_id
+        )
+        if reason is not None:
+            return None  # consulta no concluyente => sin resolver
+        observed_residual = 0.0 if position is None else abs(float(position.quantity))
+        expected_residual = max(0.0, available_before - filled)
+        eps = self._RESIDUAL_EPS
+
+        # Sin fills atribuibles: la ausencia de posicion NO prueba exito.
+        if filled <= eps:
+            return None
+
+        if filled + eps < requested:
+            # PARCIAL: el residual observado debe ser coherente con lo ejecutado.
+            if abs(observed_residual - expected_residual) <= eps:
+                return "partial"
+            return None
+
+        # Ejecutado por el volumen solicitado: residual debe ser el esperado.
+        if abs(observed_residual - expected_residual) <= eps:
+            return "full"
+        return None
+
+    def _reflect_close_reduce(
+        self, operation: str, op_id: str, submission: OrderSubmission, order: Order
+    ) -> str:
+        """Fija el estado del intent segun la evidencia autoritativa y devuelve
+        el `stage`. NUNCA declara exito sin confirmacion completa."""
+        prefix = "close" if operation == OPERATION_CLOSE else "reduce"
+        broker_id = (
+            None
+            if submission.broker_order is None
+            else (submission.broker_order.broker_order_id or None)
+        )
+        if submission.status is SubmitStatus.UNKNOWN:
+            try:
+                self._order_manager.mark_unknown(order.order_id)
+            except OrderStateError:
+                pass
+            self._journal.mark_state(op_id, "UNKNOWN")
+            return f"{prefix}_unknown"
+        if submission.status is SubmitStatus.REJECTED:
+            try:
+                self._order_manager.reject(order.order_id, submission.detail or "rechazada")
+            except OrderStateError:
+                pass
+            self._journal.mark_state(op_id, "REJECTED")
+            raise ExecutionBlockedError(
+                f"{prefix}_rejected", submission.detail or "rechazada por el broker"
+            )
+        if submission.broker_order is not None:
+            self._record_broker_identity(op_id, submission.broker_order)
+        verdict = self._confirm_close_reduce(operation, op_id)
+        if verdict == "full":
+            self._journal.mark_state(op_id, "FILLED", broker_order_id=broker_id)
+            return "closed" if operation == OPERATION_CLOSE else "reduced"
+        if verdict == "partial":
+            self._journal.mark_state(
+                op_id, "PARTIALLY_FILLED", broker_order_id=broker_id
+            )
+            return f"{prefix}_partial"
+        if verdict == "rejected":
+            self._journal.mark_state(op_id, "REJECTED", broker_order_id=broker_id)
+            raise ExecutionBlockedError(
+                f"{prefix}_rejected", "el broker no ejecuto la operacion"
+            )
+        # Sin evidencia autoritativa suficiente: SIN RESOLVER (no falso exito).
+        self._journal.mark_state(op_id, "UNKNOWN", broker_order_id=broker_id)
+        return f"{prefix}_unknown"
+
     def _validate_reduce_quantity(self, quantity) -> float:
         try:
             q = float(quantity)
@@ -584,6 +952,10 @@ class LiveExecutionCoordinator:
         self._assert_currency()
         self._assert_account_mode(is_entry=is_entry)
         self._assert_position_limit()
+        # HEDGING restringido: una sola posicion por simbolo; una APERTURA exige
+        # que no exista ya posicion del instrumento.
+        if is_entry:
+            self._assert_no_open_position_for_entry()
 
         # OrderManager: identidad estable + idempotencia.
         try:
@@ -934,46 +1306,29 @@ class LiveExecutionCoordinator:
         target_position_id: str | None,
     ) -> ExecutionOutcome:
         instrument = self._instrument
-        if operation == OPERATION_CLOSE:
-            op_id = str(operation_id) if operation_id else f"CLOSE:{instrument}"
-        else:
-            op_id = (
-                str(operation_id)
-                if operation_id
-                else f"REDUCE:{instrument}:{requested}"
-            )
         kind = OPERATION_CLOSE if operation == OPERATION_CLOSE else OPERATION_REDUCE
         purpose = PURPOSE_CLOSE if operation == OPERATION_CLOSE else PURPOSE_REDUCE
         requested_q = None
         if operation == OPERATION_REDUCE:
             requested_q = self._validate_reduce_quantity(requested)
 
-        # 1) Idempotencia + no reutilizar el mismo op_id para otra operacion
-        #    (chequeo barato ANTES de tocar el broker).
-        existing = self._journal.get(op_id)
-        if existing is not None:
-            if existing.operation != operation or existing.instrument != instrument:
-                raise ExecutionBlockedError(
-                    "identity", "operation_id reutilizado con identidad distinta"
-                )
-            if (
-                operation == OPERATION_REDUCE
-                and abs(float(existing.quantity) - requested_q) > 1e-9
-            ):
-                raise ExecutionBlockedError(
-                    "identity", "operation_id reutilizado con cantidad distinta"
-                )
-            if existing.terminal:
-                return ExecutionOutcome(
-                    allowed=True,
-                    stage="reduce_idempotent",
-                    reason="operacion ya resuelta; sin segunda llamada al broker",
-                    intent=existing,
-                )
-            raise ExecutionBlockedError(
-                "reduce_pending",
-                "operacion previa sin resolver: resolver por lookup (no repetir)",
+        # 1) Identidad de la operacion (H-2): explicita => reintento idempotente;
+        #    derivada => NUEVA operacion con identificador UNICO (no colisiona
+        #    tras cerrar/abrir de nuevo ni entre reducciones del mismo tamano).
+        op_id, resolved = self._resolve_reduce_identity(
+            operation, operation_id, requested_q, target_position_id
+        )
+        if op_id is None:
+            return ExecutionOutcome(
+                allowed=True,
+                stage="reduce_idempotent",
+                reason="operacion ya resuelta; sin segunda llamada al broker",
+                intent=resolved,
             )
+
+        # 1b) Ninguna operacion nueva puede eludir un cierre/reduccion PENDIENTE
+        #     sobre el MISMO objetivo (ni con otro identificador).
+        self._assert_no_unresolved_reduce(target_position_id)
 
         # 2) Gates obligatorios (NO se pasa por el limite de NUEVAS posiciones).
         now = self._clock()
@@ -985,8 +1340,9 @@ class LiveExecutionCoordinator:
         self._assert_market_data(now)
         self._assert_currency()
 
-        # 3) Identidad/exposicion efectiva: posicion neta del BROKER.
-        pos = self._observe_net_position()
+        # 3) Identidad/exposicion efectiva: posicion del BROKER (NETTING: neta;
+        #    HEDGING restringido: dirigida por POSITION_IDENTIFIER + propiedad).
+        pos = self._observe_target_position(target_position_id)
         available = abs(float(pos.quantity))
         net = float(pos.quantity)
         side = OrderSide.SELL if net > 0 else OrderSide.BUY  # lado reductor
@@ -1022,6 +1378,7 @@ class LiveExecutionCoordinator:
                 signal_id=op_id,
                 reduce_only=True,
                 purpose=purpose,
+                target_position_id=target_position_id,
             )
         except OrderStateError as exc:
             raise ExecutionBlockedError("order_manager", str(exc)) from exc
@@ -1070,10 +1427,12 @@ class LiveExecutionCoordinator:
                 kind, op_id=op_id, target=instrument, token=self._token
             )
 
-        self._reflect_submission(order, intent, submission)
+        # 8) Resultado basado en evidencia AUTORITATIVA (H-1): un UNKNOWN o una
+        #    ejecucion parcial NUNCA se declara como cierre/reduccion confirmada.
+        stage = self._reflect_close_reduce(operation, op_id, submission, order)
         return ExecutionOutcome(
             allowed=True,
-            stage="closed" if operation == OPERATION_CLOSE else "reduced",
+            stage=stage,
             reason="operacion reductora enviada",
             order=order,
             submission=submission,

@@ -476,7 +476,7 @@ class TestA4IntentAuthority:
 
 
 def _v1_record(cid: str) -> dict:
-    """Registro v1: intent OPEN serializado SIN los campos de v2/v3."""
+    """Registro v1: intent OPEN serializado SIN los campos de v2/v3/v4."""
     d = OrderIntent.from_order(_order(cid)).to_dict()
     for key in (
         "operation",
@@ -484,6 +484,7 @@ def _v1_record(cid: str) -> dict:
         "target_broker_order_id",
         "target_position_id",
         "available_quantity",
+        "position_id",
     ):
         d.pop(key, None)
     return d
@@ -606,7 +607,7 @@ class TestSchemaCompatibilityV2:
         j = IntentJournal.initialize(p_new)
         j.begin(OrderIntent.from_order(_order("C-NEW")))
         raw = json.loads(p_new.read_text(encoding="utf-8"))
-        assert raw["schema_version"] == SCHEMA_VERSION == 3
+        assert raw["schema_version"] == SCHEMA_VERSION == 4
 
         def _old_v1_loader(path):
             data = json.loads(path.read_text(encoding="utf-8"))
@@ -687,10 +688,11 @@ class TestSchemaCompatibilityV2:
 
 def _v2_record(cid: str, *, operation: str | None = None,
                target_cid: str | None = None) -> dict:
-    """Registro v2: intent serializado SIN campos exclusivos de v3."""
+    """Registro v2: intent serializado SIN campos exclusivos de v3/v4."""
     d = OrderIntent.from_order(_order(cid)).to_dict()
     d.pop("target_position_id", None)
     d.pop("available_quantity", None)
+    d.pop("position_id", None)
     if operation is not None:
         d["operation"] = operation
     if target_cid is not None:
@@ -751,7 +753,7 @@ class TestSchemaCompatibilityV3:
             quantity=0.2, available_quantity=0.5,
         ))
         raw = json.loads(path.read_text(encoding="utf-8"))
-        assert raw["schema_version"] == SCHEMA_VERSION == 3
+        assert raw["schema_version"] == SCHEMA_VERSION == 4
 
         j2 = IntentJournal(path)
         assert j2.get("CLOSE:X").operation == OPERATION_CLOSE
@@ -788,7 +790,7 @@ class TestSchemaCompatibilityV3:
             available_quantity=0.5,
         ))
         raw = json.loads(path.read_text(encoding="utf-8"))
-        assert raw["schema_version"] == 3
+        assert raw["schema_version"] == SCHEMA_VERSION
 
         def _old_v2_loader(path):
             data = json.loads(path.read_text(encoding="utf-8"))

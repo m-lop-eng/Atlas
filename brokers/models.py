@@ -163,15 +163,30 @@ class OrderSubmission:
 
 @dataclass(frozen=True, slots=True)
 class Position:
-    """Posición neta reportada por el broker (fuente externa de verdad).
+    """Posición reportada por el broker (fuente externa de verdad).
 
     `quantity` es dirigida: positivo = larga, negativo = corta.
+
+    ATLAS-MT5-HEDGING-01: identidad de posición (campos ADITIVOS, opcionales).
+    Se distinguen EXPLÍCITAMENTE los identificadores MT5:
+      * `ticket`      -> POSITION_TICKET (ticket ACTUAL; es lo que MT5 exige en
+        `MqlTradeRequest.position`; PUEDE cambiar por operaciones de servicio).
+      * `position_id` -> POSITION_IDENTIFIER (identidad ESTABLE durante todo el
+        ciclo de vida; es la que se persiste para atribuir la posición a Atlas).
+      * `magic`/`comment` -> atributos AUXILIARES de atribución (nunca única
+        prueba de propiedad).
+    En NETTING pueden quedar en None (una posición neta por símbolo no requiere
+    identidad separada).
     """
 
     instrument: str
     quantity: float
     avg_entry_price: float
     updated_at: datetime
+    ticket: str | None = None
+    position_id: str | None = None
+    magic: int | None = None
+    comment: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

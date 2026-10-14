@@ -199,6 +199,19 @@ class FakeMT5:
             ticket=deal_ticket, order=ticket, volume=request["volume"],
             price=request["price"], commission=0.0, time=1_700_000_000,
         )
+        # Reduccion/cierre: refleja el efecto sobre las posiciones (la posicion
+        # objetivo se reduce y desaparece al agotarse). Necesario para que la
+        # confirmacion autoritativa y la identidad CLOSE/REDUCE operen sobre el
+        # estado REAL del broker, no sobre una posicion estatica.
+        pos_ticket = request.get("position")
+        if pos_ticket is not None:
+            held = self._positions.get(int(pos_ticket))
+            if held is not None:
+                remaining = float(held.volume) - float(request["volume"])
+                if remaining <= 1e-9:
+                    self._positions.pop(int(pos_ticket), None)
+                else:
+                    held.volume = remaining
         return SimpleNamespace(
             retcode=10009, order=ticket, deal=deal_ticket,
             volume=request["volume"], price=request["price"],

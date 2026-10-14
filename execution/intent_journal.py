@@ -87,11 +87,12 @@ from execution.order import PURPOSE_CLOSE, PURPOSE_OPEN, PURPOSE_REDUCE
 # `operation` y confundir una operacion con otra.
 # La version declarada DETERMINA el contrato: ningun documento puede contener
 # campos exclusivos de una version posterior a la declarada (fail-closed).
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 SCHEMA_VERSION_V1 = 1
 SCHEMA_VERSION_V2 = 2
+SCHEMA_VERSION_V3 = 3
 _READABLE_SCHEMA_VERSIONS = frozenset(
-    {SCHEMA_VERSION_V1, SCHEMA_VERSION_V2, SCHEMA_VERSION}
+    {SCHEMA_VERSION_V1, SCHEMA_VERSION_V2, SCHEMA_VERSION_V3, SCHEMA_VERSION}
 )
 
 # Campos exclusivos del esquema v2: NO pueden aparecer en un documento v1.
@@ -105,6 +106,10 @@ _V3_ONLY_FIELDS = (
     "target_position_id",
     "available_quantity",
 )
+# Campos exclusivos del esquema v4 (ATLAS-MT5-HEDGING-01): NO pueden aparecer
+# en v1/v2/v3. `position_id` = POSITION_IDENTIFIER resultante de una APERTURA
+# (vinculacion durable cid -> posicion).
+_V4_ONLY_FIELDS = ("position_id",)
 
 # MT5-DEMO-EXECUTION-CONTROLS-02A/02B: tipo de operacion del intent.
 OPERATION_OPEN = "OPEN"
@@ -216,6 +221,9 @@ class OrderIntent:
     # observada en el broker cuando se decidio la operacion (evidencia).
     target_position_id: str | None = None
     available_quantity: float | None = None
+    # v4 (HEDGING-01): POSITION_IDENTIFIER resultante de una APERTURA (identidad
+    # estable de la posicion propiedad de Atlas). NO es `target_position_id`.
+    position_id: str | None = None
 
     @property
     def terminal(self) -> bool:
@@ -397,6 +405,7 @@ class OrderIntent:
             "target_broker_order_id": self.target_broker_order_id,
             "target_position_id": self.target_position_id,
             "available_quantity": self.available_quantity,
+            "position_id": self.position_id,
         }
 
     @staticmethod
@@ -455,6 +464,16 @@ class OrderIntent:
                 raise IntentJournalCorruptionError(
                     f"available_quantity invalida: {available!r}"
                 )
+        # H-5 (ATLAS-MT5-HEDGING-02B): `position_id` es la identidad estable de
+        # la posicion (v4). Ausente/None = sin vinculo (valido). Si esta
+        # presente DEBE ser str no vacio; un numero, lista, objeto o cadena vacia
+        # NO se normaliza ni se acepta como identidad valida (fail-closed).
+        position_id = d.get("position_id")
+        if position_id is not None:
+            if not isinstance(position_id, str) or not position_id.strip():
+                raise IntentJournalCorruptionError(
+                    f"position_id invalido: {position_id!r} (requiere str no vacio)"
+                )
         return OrderIntent(
             client_order_id=cid,
             order_id=order_id,
@@ -480,6 +499,7 @@ class OrderIntent:
             target_broker_order_id=target_bid,
             target_position_id=target_pos,
             available_quantity=available,
+            position_id=position_id,
         )
 
 
@@ -729,6 +749,38 @@ class IntentJournal:
         self._persist()
         return True
 
+    def link_position(self, client_order_id: str, position_id: str) -> OrderIntent:
+        """Vincula DURADERAMENTE una APERTURA con su POSITION_IDENTIFIER (v4).
+
+        Idempotente: repetir con el MISMO `position_id` es no-op; un
+        `position_id` distinto para el mismo `client_order_id` es conflicto
+        (fail-closed). No depende de magic/comment. Fuente de verdad única de la
+        propiedad `client_order_id -> POSITION_IDENTIFIER`.
+        """
+        cid = str(client_order_id)
+        pid = str(position_id)
+        if not pid:
+            raise IntentJournalError("position_id no puede estar vacio")
+        current = self._intents.get(cid)
+        if current is None:
+            raise IntentJournalError(f"intent desconocido: {cid!r}")
+        if current.position_id is not None:
+            if current.position_id == pid:
+                return current
+            raise IntentJournalDuplicateError(
+                f"intent {cid!r} ya vinculado a position_id "
+                f"{current.position_id!r} != {pid!r}"
+            )
+        updated = self._stamp(current, position_id=pid)
+        self._intents[cid] = updated
+        self._persist()
+        return updated
+
+    def find_by_position_id(self, position_id: str) -> tuple[OrderIntent, ...]:
+        """Intents vinculados a un POSITION_IDENTIFIER (para verificar propiedad)."""
+        pid = str(position_id)
+        return tuple(i for i in self.all() if i.position_id == pid)
+
     def cleanup(self, *, retention=None) -> int:
         """Compactacion SEGURA. Sin politica explicita NO elimina nada.
 
@@ -799,6 +851,7 @@ class IntentJournal:
             target_broker_order_id=intent.target_broker_order_id,
             target_position_id=intent.target_position_id,
             available_quantity=intent.available_quantity,
+            position_id=base.get("position_id", intent.position_id),
         )
 
     def to_dict(self) -> dict:
@@ -821,6 +874,14 @@ class IntentJournal:
         if has_reduce and SCHEMA_VERSION < 3:
             raise IntentJournalError(
                 "operacion CLOSE/REDUCE requiere schema v3; el writer declara "
+                f"v{SCHEMA_VERSION} (fail-closed)"
+            )
+        has_position_id = any(
+            i.position_id is not None for i in self._intents.values()
+        )
+        if has_position_id and SCHEMA_VERSION < 4:
+            raise IntentJournalError(
+                "position_id requiere schema v4; el writer declara "
                 f"v{SCHEMA_VERSION} (fail-closed)"
             )
         return {
@@ -901,16 +962,22 @@ class IntentJournal:
             if isinstance(payload, dict):
                 if self._loaded_version == SCHEMA_VERSION_V1:
                     forbidden = [
-                        k for k in (*_V2_ONLY_FIELDS, *_V3_ONLY_FIELDS) if k in payload
+                        k
+                        for k in (*_V2_ONLY_FIELDS, *_V3_ONLY_FIELDS, *_V4_ONLY_FIELDS)
+                        if k in payload
                     ]
                 elif self._loaded_version == SCHEMA_VERSION_V2:
-                    forbidden = [k for k in _V3_ONLY_FIELDS if k in payload]
+                    forbidden = [
+                        k for k in (*_V3_ONLY_FIELDS, *_V4_ONLY_FIELDS) if k in payload
+                    ]
                     op = payload.get("operation", OPERATION_OPEN)
                     if op not in _V2_OPERATIONS:
                         raise IntentJournalSchemaError(
                             f"journal v2 inconsistente: el intent {cid!r} declara "
                             f"operation {op!r} (solo OPEN/CANCEL en v2); fail-closed"
                         )
+                elif self._loaded_version == SCHEMA_VERSION_V3:
+                    forbidden = [k for k in _V4_ONLY_FIELDS if k in payload]
             if forbidden:
                 raise IntentJournalSchemaError(
                     f"journal v{self._loaded_version} inconsistente: el intent "

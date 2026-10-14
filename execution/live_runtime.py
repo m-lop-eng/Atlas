@@ -97,6 +97,9 @@ class LiveExecutionRuntime:
     reconciliation_engine: Any | None = None
     clock: Callable[[], datetime] = lambda: datetime.now(_UTC)
     run_id: str = "LIVE-RUNTIME"
+    # ATLAS-MT5-HEDGING-01: opt-in explicito restringido (una posicion Atlas por
+    # simbolo). Por defecto False: HEDGING no se habilita solo por margin_mode.
+    allow_restricted_hedging: bool = False
 
     _coordinator: LiveExecutionCoordinator = field(init=False, default=None)
     _applier: LedgerApplier = field(init=False, default=None)
@@ -105,6 +108,7 @@ class LiveExecutionRuntime:
     _commission_unverified: float = field(init=False, default=0.0)
     _history_incomplete: bool = field(init=False, default=False)
     _snapshot_present: bool = field(init=False, default=False)
+    _ownership_unverified: bool = field(init=False, default=False)
 
     def __post_init__(self) -> None:
         # La economia del instrumento queda registrada en el ledger (autoridad de
@@ -130,6 +134,7 @@ class LiveExecutionRuntime:
             reconciliation=self.reconciliation_engine,
             clock=self.clock,
             run_id=self.run_id,
+            allow_restricted_hedging=self.allow_restricted_hedging,
         )
         self._applier = LedgerApplier(
             ledger=self.ledger,
@@ -175,9 +180,17 @@ class LiveExecutionRuntime:
         mode = self.account_mode_provider()
         if mode is None:
             return self._not_ready("account_mode", "margin_mode no verificable")
-        if int(mode) != 0:
+        mode_int = int(mode)
+        if mode_int == 2:  # HEDGING
+            if not self.allow_restricted_hedging:
+                return self._not_ready(
+                    "account_mode",
+                    "cuenta HEDGING sin opt-in restringido "
+                    "(allow_restricted_hedging=False)",
+                )
+        elif mode_int != 0:  # no NETTING ni HEDGING restringido
             return self._not_ready(
-                "account_mode", f"cuenta no NETTING (margin_mode={mode})"
+                "account_mode", f"margin_mode no soportado ({mode_int})"
             )
 
         # 2) journal: validar/migrar de forma no destructiva
@@ -222,6 +235,16 @@ class LiveExecutionRuntime:
         if not bool(self.broker.health()):
             self.kill_switch.set_source(KillSource.BROKER, KillSwitchState.HALT, "broker no sano")
             return self._not_ready("broker", "broker no sano", primed, tuple(resolved))
+
+        # 5b) HEDGING restringido: verificacion de PROPIEDAD de posiciones.
+        #     Una sola posicion por simbolo; toda posicion debe estar vinculada a
+        #     un intent de Atlas (journal). Externas/multiples/ambiguas => block.
+        if self.allow_restricted_hedging:
+            ownership_reason = self._ownership_ready()
+            if ownership_reason is not None:
+                return self._not_ready(
+                    "ownership", ownership_reason, primed, tuple(resolved)
+                )
 
         # 6) reconstruir/reconciliar ledger esperado vs observado
         try:
@@ -349,6 +372,69 @@ class LiveExecutionRuntime:
             account=account,
         )
 
+    def _ownership_ready(self) -> str | None:
+        """HEDGING restringido: comprueba PROPIEDAD de todas las posiciones.
+
+        Devuelve un motivo de bloqueo (str) o None si es coherente:
+          * >1 posicion por simbolo -> block (politica restringida);
+          * posicion sin POSITION_IDENTIFIER -> block (identidad no verificable);
+          * posicion no vinculada a Atlas -> block (externa/sin propietario);
+          * posicion vinculada a un intent NO terminal pero ausente en broker ->
+            block (divergencia journal/broker).
+        """
+        try:
+            positions = list(self.broker.get_positions())
+        except Exception as exc:  # noqa: BLE001
+            return f"posiciones no determinables ({type(exc).__name__})"
+        by_symbol: dict[str, int] = {}
+        for p in positions:
+            by_symbol[p.instrument] = by_symbol.get(p.instrument, 0) + 1
+        if any(count > 1 for count in by_symbol.values()):
+            return "multiples posiciones por simbolo (politica restringida)"
+        broker_ids: set[str] = set()
+        for p in positions:
+            if p.position_id is None:
+                return "posicion sin POSITION_IDENTIFIER (identidad no verificable)"
+            pid = str(p.position_id)
+            broker_ids.add(pid)
+            if not self.journal.find_by_position_id(pid):
+                return f"posicion externa/sin propietario ({p.instrument})"
+        for intent in self.journal.all():
+            if intent.position_id is not None and intent.position_id not in broker_ids:
+                if not intent.terminal:
+                    return "posicion vinculada ausente en broker (intent no terminal)"
+        return None
+
+    def _link_open_position(self, out: ExecutionOutcome) -> None:
+        """Vincula durablemente la posicion creada por una APERTURA (HEDGING)."""
+        if not self.allow_restricted_hedging:
+            return
+        order = getattr(out, "order", None)
+        if order is None or str(getattr(order, "purpose", "OPEN")) != "OPEN":
+            return
+        sub = getattr(out, "submission", None)
+        if sub is None or sub.broker_order is None:
+            return
+        cid = getattr(order, "client_order_id", None)
+        if not cid:
+            return
+        current = self.journal.get(cid)
+        if current is not None and current.position_id is not None:
+            return  # ya vinculada (idempotente)
+        try:
+            matching = [
+                p for p in self.broker.get_positions()
+                if p.instrument == self.instrument
+            ]
+        except Exception:  # noqa: BLE001
+            self._ownership_unverified = True
+            return
+        if len(matching) != 1 or matching[0].position_id is None:
+            # No se puede probar la propiedad de forma inequivoca: fail-closed.
+            self._ownership_unverified = True
+            return
+        self.journal.link_position(cid, matching[0].position_id)
+
     def _apply_known_fills(self) -> None:
         """Aplica (idempotente) los fills que el broker reporta para cada orden
         conocida por el journal (OPEN/CLOSE/REDUCE), con estado EXPLICITO de
@@ -407,6 +493,10 @@ class LiveExecutionRuntime:
             raise RuntimeNotReadyError(
                 "comision no valorable pendiente: runtime bloqueado (fail-safe)"
             )
+        if self._ownership_unverified:
+            raise RuntimeNotReadyError(
+                "propiedad de posicion no verificable: runtime bloqueado (fail-safe)"
+            )
         if self._last_report is not None and not self._last_report.trading_allowed:
             raise RuntimeNotReadyError(
                 f"reconciliacion {self._last_report.status.value}: operacion bloqueada"
@@ -419,6 +509,8 @@ class LiveExecutionRuntime:
             outcome = self._applier.apply_broker_order(cid, submission.broker_order)
             self._commission_unverified += outcome.unverified_commission
             self.ledger_store.persist(self.ledger)
+        # HEDGING restringido: vincula durablemente cid -> POSITION_IDENTIFIER.
+        self._link_open_position(out)
         report = self.reconcile_now()
         return out
 

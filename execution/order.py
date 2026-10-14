@@ -97,6 +97,11 @@ class Order:
     stop_price: float | None = None
     time_in_force: str = "GTC"
     reduce_only: bool = False
+    # ATLAS-MT5-HEDGING-01: objetivo de posicion para CLOSE/REDUCE dirigidos
+    # (POSITION_IDENTIFIER). OBLIGATORIO en HEDGING restringido; None en NETTING
+    # (la posicion neta se resuelve por simbolo). NO representa el resultado de
+    # una apertura.
+    target_position_id: str | None = None
     # 02B: proposito de ejecucion (OPEN/CLOSE/REDUCE). CLOSE y REDUCE son
     # tipados distintos aunque ambos viajen con `reduce_only=True`.
     purpose: str = PURPOSE_OPEN

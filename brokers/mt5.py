@@ -201,6 +201,10 @@ class MT5Config:
     # (controlado por el terminal). No se inventa socket timeout para las
     # operaciones posteriores: la API MT5 no lo expone.
     connection_timeout_ms: int | None = None
+    # ATLAS-MT5-HEDGING-01: opt-in EXPLICITO para HEDGING restringido (una sola
+    # posicion propiedad de Atlas por simbolo; sin LONG+SHORT simultaneos). Por
+    # defecto DESHABILITADO; HEDGING NO se habilita solo por margin_mode.
+    allow_restricted_hedging: bool = False
 
     def __post_init__(self) -> None:
         if self.provider != "mt5":
@@ -247,6 +251,7 @@ class MT5Config:
                 if data.get("connection_timeout_ms") is None
                 else int(data["connection_timeout_ms"])
             ),
+            allow_restricted_hedging=bool(data.get("allow_restricted_hedging", False)),
         )
 
 
@@ -635,6 +640,41 @@ class MT5BrokerAdapter(BrokerAdapter):
         value = getattr(info, "margin_mode", None)
         return int(value) if isinstance(value, int) else None
 
+    def _verified_account_margin_mode(self) -> int:
+        """Modo de cuenta VERIFICADO antes de autorizar un envio (fail-closed).
+
+        ATLAS-MT5-HEDGING-02E: NUNCA asume NETTING ni ningun modo compatible como
+        valor por defecto. Si `account_info()` es `None`, lanza, no expone
+        `margin_mode`, o el valor es ausente/no entero/no reconocido, se rechaza
+        la operacion ANTES de `order_check`/`order_send`.
+        """
+        try:
+            info = self._module().account_info()
+        except BrokerError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - transporte/consulta incierta
+            raise BrokerConnectionError(
+                f"account_info fallo ({type(exc).__name__}): modo no verificable"
+            ) from exc
+        if info is None:
+            raise BrokerConnectionError(
+                "account_info() sin respuesta: modo de cuenta no verificable"
+            )
+        raw = getattr(info, "margin_mode", None)
+        if raw is None:
+            raise BrokerPermissionError(
+                "cuenta sin margin_mode: modo de cuenta no verificable"
+            )
+        if not isinstance(raw, int) or isinstance(raw, bool):
+            raise BrokerPermissionError(f"margin_mode no entero: {raw!r}")
+        mode = int(raw)
+        if mode not in (
+            ACCOUNT_MARGIN_MODE_RETAIL_NETTING,
+            ACCOUNT_MARGIN_MODE_RETAIL_HEDGING,
+        ):
+            raise BrokerPermissionError(f"margin_mode no reconocido: {mode}")
+        return mode
+
     def _classify_connect_error(self) -> BrokerError:
         try:
             error = self._module().last_error()
@@ -729,10 +769,11 @@ class MT5BrokerAdapter(BrokerAdapter):
         account = mt5.account_info()
         margin_mode = int(getattr(account, "margin_mode", 0)) if account is not None else 0
         if margin_mode == ACCOUNT_MARGIN_MODE_RETAIL_HEDGING:
-            raise BrokerPermissionError(
-                "LIVE-09: reduce_only no soportado en cuentas HEDGING "
-                "(contract gap: falta broker_position_id inequivoco); no se envia"
-            )
+            # ATLAS-MT5-HEDGING-01: HEDGING SOLO con opt-in restringido y
+            # objetivo de posicion explicito (identidad estable), verificando
+            # simbolo/direccion/volumen contra la posicion VIVA y usando su
+            # POSITION_TICKET actual. Sin opt-in o sin objetivo => fail-closed.
+            return self._prepare_reduce_only_hedging(order, spec)
         try:
             rows = self._rows_or_raise(
                 mt5.positions_get(symbol=spec.name), "positions_get(symbol)"
@@ -772,12 +813,90 @@ class MT5BrokerAdapter(BrokerAdapter):
             )
         return int(getattr(rows[0], "ticket", 0))
 
+    def _prepare_reduce_only_hedging(self, order: Order, spec: MT5SymbolSpec) -> int:
+        """Cierre/reduccion DIRIGIDO en HEDGING restringido (opt-in).
+
+        Exige `allow_restricted_hedging`, un `target_position_id` explicito
+        (POSITION_IDENTIFIER) y valida contra la POSICION VIVA: simbolo,
+        direccion contraria y volumen <= volumen de la posicion objetivo. Usa el
+        POSITION_TICKET ACTUAL en el campo `position`. Nunca selecciona filas
+        por indice ni por ticket minimo. Fail-closed ante ambiguedad.
+        """
+        if not self.config.allow_restricted_hedging:
+            raise BrokerPermissionError(
+                "HEDGING rechazado: requiere opt-in explicito "
+                "(allow_restricted_hedging=True)"
+            )
+        target = order.target_position_id
+        if not target or not str(target).strip():
+            raise BrokerInvalidOrderError(
+                "HEDGING restringido exige target_position_id explicito "
+                "(POSITION_IDENTIFIER); no se selecciona posicion por indice"
+            )
+        mt5 = self._module()
+        try:
+            rows = self._rows_or_raise(
+                mt5.positions_get(symbol=spec.name), "positions_get(symbol)"
+            )
+        except BrokerConnectionError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise BrokerConnectionError(
+                f"positions_get fallo ({type(exc).__name__}; "
+                f"{self._last_error_text()})"
+            ) from exc
+        matching = [
+            p for p in rows
+            if getattr(p, "identifier", None) is not None
+            and str(getattr(p, "identifier")) == str(target)
+        ]
+        if not matching:
+            raise BrokerInvalidOrderError(
+                "posicion objetivo (POSITION_IDENTIFIER) no existe en el broker"
+            )
+        if len(matching) > 1:
+            raise BrokerInvalidOrderError(
+                "POSITION_IDENTIFIER ambiguo: multiples posiciones coinciden"
+            )
+        pos = matching[0]
+        volume = _finite(getattr(pos, "volume"))
+        ptype = int(getattr(pos, "type", ORDER_TYPE_BUY))
+        required = OrderSide.SELL if ptype == ORDER_TYPE_BUY else OrderSide.BUY
+        if order.side is not required:
+            raise BrokerInvalidOrderError(
+                "reduce_only debe ser contrario a la posicion objetivo "
+                "(no convertir en apertura opuesta)"
+            )
+        if float(order.quantity) > volume + 1e-9:
+            raise BrokerInvalidOrderError(
+                "reduce_only excede el volumen de la posicion objetivo"
+            )
+        ticket = getattr(pos, "ticket", None)
+        if ticket is None:
+            raise BrokerInvalidOrderError(
+                "posicion objetivo sin POSITION_TICKET actual determinable"
+            )
+        return int(ticket)
+
     def submit_order(self, order: Order) -> OrderSubmission:
         self._require_demo()
         self._require_ready()
         cid = order.client_order_id
         if not cid:
             raise BrokerInvalidOrderError("client_order_id obligatorio")
+        # ATLAS-MT5-HEDGING-02B/02E (H-3): el modo de cuenta se VERIFICA antes de
+        # cualquier envio. Modo no verificable (account_info None/excepcion/ausente)
+        # o no reconocido => fail-closed (nunca se asume NETTING). La ruta DIRECTA
+        # tampoco elude el opt-in HEDGING, con independencia del ExecutionGate.
+        mode = self._verified_account_margin_mode()
+        if (
+            mode == ACCOUNT_MARGIN_MODE_RETAIL_HEDGING
+            and not self.config.allow_restricted_hedging
+        ):
+            raise BrokerPermissionError(
+                "cuenta HEDGING sin opt-in restringido "
+                "(allow_restricted_hedging=False): operacion rechazada"
+            )
         # MT5-DEMO-EXECUTION-FOUNDATION-01 / 02B: solo envia si el gate de
         # capacidad enlazado autoriza esta operacion. El TIPO se deriva del
         # `purpose` tipado (NO de reduce_only): OPEN usa target=cid; CLOSE/REDUCE
@@ -1039,19 +1158,64 @@ class MT5BrokerAdapter(BrokerAdapter):
                 )
         positions: list[Position] = []
         for p in raw_positions:
-            symbol = str(getattr(p, "symbol", ""))
-            volume = _finite(getattr(p, "volume"))
-            ptype = int(getattr(p, "type", 0))
-            sign = 1.0 if ptype == ORDER_TYPE_BUY else -1.0
-            positions.append(
-                Position(
-                    instrument=self._reverse_symbol_map.get(symbol, symbol),
-                    quantity=sign * volume,
-                    avg_entry_price=_finite(getattr(p, "price_open")),
-                    updated_at=self._position_time(getattr(p, "time", 0)),
-                )
-            )
+            positions.append(self._position_view(p))
         return positions
+
+    def _position_view(self, p: Any) -> Position:
+        """Vista de posicion con identidad MT5 EXPLICITA (03/HEDGING-01).
+
+        `ticket`=POSITION_TICKET (actual), `position_id`=POSITION_IDENTIFIER
+        (estable), `magic`/`comment` auxiliares. NO se confunden entre si.
+        """
+        symbol = str(getattr(p, "symbol", ""))
+        volume = _finite(getattr(p, "volume"))
+        ptype = int(getattr(p, "type", 0))
+        sign = 1.0 if ptype == ORDER_TYPE_BUY else -1.0
+        ticket = getattr(p, "ticket", None)
+        identifier = getattr(p, "identifier", None)
+        return Position(
+            instrument=self._reverse_symbol_map.get(symbol, symbol),
+            quantity=sign * volume,
+            avg_entry_price=_finite(getattr(p, "price_open")),
+            updated_at=self._position_time(getattr(p, "time", 0)),
+            ticket=None if ticket is None else str(ticket),
+            position_id=(
+                None
+                if identifier is None
+                else str(identifier)
+            ),
+            magic=(
+                int(getattr(p, "magic"))
+                if getattr(p, "magic", None) is not None
+                else None
+            ),
+            comment=str(getattr(p, "comment", "") or ""),
+        )
+
+    def resolve_position(self, position_id: str) -> Position | None:
+        """Devuelve la POSICION VIVA por su POSITION_IDENTIFIER estable.
+
+        Consulta `positions_get()` y empareja por `POSITION_IDENTIFIER` (nunca
+        por indice ni ticket minimo). `None` si no existe. Falla cerrado ante
+        consulta incompleta (`BrokerConnectionError`).
+        """
+        target = str(position_id)
+        try:
+            rows = self._rows_or_raise(
+                self._module().positions_get(), "positions_get"
+            )
+        except BrokerConnectionError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise BrokerConnectionError(
+                f"positions_get fallo ({type(exc).__name__}; "
+                f"{self._last_error_text()})"
+            ) from exc
+        for p in rows:
+            ident = getattr(p, "identifier", None)
+            if ident is not None and str(ident) == target:
+                return self._position_view(p)
+        return None
 
     def _position_time(self, epoch: Any) -> datetime:
         try:
