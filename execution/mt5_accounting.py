@@ -40,6 +40,8 @@ from datetime import datetime, timedelta
 from enum import Enum
 
 MT5_ACCOUNTING_SCHEMA_VERSION = 1
+# Version del payload de ESTADO serializable (snapshot del ledger).
+MT5_ACCOUNTING_STATE_VERSION = 1
 
 # Constantes oficiales MQL5 (ENUM_DEAL_TYPE / ENUM_DEAL_ENTRY), definidas localmente
 # para no depender del paquete MetaTrader5 (import perezoso innecesario offline).
@@ -456,6 +458,316 @@ def classify_deal(deal: MT5Deal) -> DealEvent:
     return DealEvent(DealEventKind.UNSUPPORTED, deal, f"tipo de deal desconocido: {t}")
 
 
+# --------------------------------------------------------------------------
+# Serializacion estricta de estado (para persistencia/restauracion offline).
+# NO se usa reflexion sobre atributos privados desde fuera del modelo: estas
+# funciones y los metodos `to_snapshot`/`from_snapshot` son la interfaz publica.
+# --------------------------------------------------------------------------
+
+
+def _require_number(value: object, field: str) -> float:
+    """Numero finito real (rechaza bool/str/None/NaN/Inf)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise MT5AccountingError(f"{field} debe ser numerico")
+    f = float(value)
+    if not math.isfinite(f):
+        raise MT5AccountingError(f"{field} no finito")
+    return f
+
+
+def _parse_utc(value: object, field: str) -> datetime:
+    if not isinstance(value, str):
+        raise MT5AccountingError(f"{field} debe ser str ISO-8601")
+    try:
+        dt = datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise MT5AccountingError(f"{field} ISO-8601 invalido") from exc
+    if dt.tzinfo is None or dt.utcoffset() is None:
+        raise MT5AccountingError(f"{field} sin zona horaria")
+    return dt
+
+
+def _baseline_to_dict(baseline: MT5AccountBaseline) -> dict:
+    return {
+        "schema_version": baseline.schema_version,
+        "account_fingerprint": baseline.account_fingerprint,
+        "server": baseline.server,
+        "account_currency": baseline.account_currency,
+        "baseline_at": baseline.baseline_at.isoformat(),
+        "coverage_from": baseline.coverage_from.isoformat(),
+        "balance": baseline.balance,
+        "credit": baseline.credit,
+        "login_masked": baseline.login_masked,
+        "leverage": baseline.leverage,
+        "trade_mode": baseline.trade_mode,
+        "margin_mode": baseline.margin_mode,
+    }
+
+
+def _baseline_from_dict(d: object) -> MT5AccountBaseline:
+    if not isinstance(d, dict):
+        raise MT5AccountingError("baseline del snapshot no es dict")
+    required = (
+        "schema_version", "account_fingerprint", "server", "account_currency",
+        "baseline_at", "coverage_from", "balance", "credit", "login_masked",
+    )
+    missing = [k for k in required if k not in d]
+    if missing:
+        raise MT5AccountingError(f"baseline sin campos: {missing}")
+    return MT5AccountBaseline(
+        schema_version=d["schema_version"],
+        account_fingerprint=d["account_fingerprint"],
+        server=d["server"],
+        account_currency=d["account_currency"],
+        baseline_at=_parse_utc(d["baseline_at"], "baseline_at"),
+        coverage_from=_parse_utc(d["coverage_from"], "coverage_from"),
+        balance=d["balance"],
+        credit=d["credit"],
+        login_masked=d["login_masked"],
+        leverage=d.get("leverage"),
+        trade_mode=d.get("trade_mode", 0),
+        margin_mode=d.get("margin_mode", 0),
+    )
+
+
+def _deal_to_dict(deal: MT5Deal) -> dict:
+    return {
+        "account_fingerprint": deal.account_fingerprint,
+        "ticket": deal.ticket,
+        "order": deal.order,
+        "type": deal.type,
+        "entry": deal.entry,
+        "position_id": deal.position_id,
+        "symbol": deal.symbol,
+        "volume": deal.volume,
+        "price": deal.price,
+        "profit": deal.profit,
+        "commission": deal.commission,
+        "swap": deal.swap,
+        "fee": deal.fee,
+        "time": deal.time.isoformat(),
+    }
+
+
+def _deal_from_dict(d: object) -> MT5Deal:
+    if not isinstance(d, dict):
+        raise MT5AccountingError("deal del snapshot no es dict")
+    required = (
+        "account_fingerprint", "ticket", "order", "type", "volume", "price",
+        "profit", "commission", "swap", "fee", "time",
+    )
+    missing = [k for k in required if k not in d]
+    if missing:
+        raise MT5AccountingError(f"deal sin campos: {missing}")
+    deal = MT5Deal(
+        account_fingerprint=d["account_fingerprint"],
+        ticket=d["ticket"],
+        order=d["order"],
+        type=d["type"],
+        entry=d.get("entry"),
+        position_id=d.get("position_id"),
+        symbol=d.get("symbol"),
+        volume=d["volume"],
+        price=d["price"],
+        profit=d["profit"],
+        commission=d["commission"],
+        swap=d["swap"],
+        fee=d["fee"],
+        time=_parse_utc(d["time"], "deal.time"),
+    )
+    _validate_deal(deal)
+    return deal
+
+
+# Allowlist de clases de evento persistibles (H3). Un evento NO comercial,
+# no soportado o incompleto NUNCA puede restaurarse como aplicado.
+_ALLOWED_PROCESSED_KINDS = frozenset(
+    {
+        DealEventKind.TRADING_FILL,
+        DealEventKind.BALANCE_MOVEMENT,
+        DealEventKind.CREDIT_MOVEMENT,
+    }
+)
+_ALLOWED_MOVEMENT_KINDS = frozenset(
+    {DealEventKind.BALANCE_MOVEMENT, DealEventKind.CREDIT_MOVEMENT}
+)
+
+# Tolerancias deterministas para la verificacion de estado derivado (H4).
+_STATE_ABS_EPS = 1e-9
+_STATE_REL_EPS = 1e-9
+
+
+def _approx_equal(a: float, b: float) -> bool:
+    return math.isclose(
+        float(a), float(b), rel_tol=_STATE_REL_EPS, abs_tol=_STATE_ABS_EPS
+    )
+
+
+def _parse_state_positions(raw: object) -> dict[int, MT5Position]:
+    if not isinstance(raw, (list, tuple)):
+        raise MT5AccountingError("positions debe ser lista")
+    positions: dict[int, MT5Position] = {}
+    for p in raw:
+        if not isinstance(p, dict):
+            raise MT5AccountingError("posicion no es dict")
+        pid = p.get("position_id")
+        if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+            raise MT5AccountingError("position_id invalido")
+        if pid in positions:
+            raise MT5AccountingError(f"position_id duplicado: {pid}")
+        symbol = p.get("symbol")
+        if not isinstance(symbol, str) or not symbol.strip():
+            raise MT5AccountingError("posicion sin simbolo")
+        quantity = _require_number(p.get("quantity"), "quantity")
+        if abs(quantity) <= _VOL_EPS:
+            raise MT5AccountingError("posicion con cantidad nula")
+        avg_price = _require_number(p.get("avg_price"), "avg_price")
+        if avg_price <= 0.0:
+            raise MT5AccountingError("posicion con avg_price invalido")
+        positions[pid] = MT5Position(pid, symbol, quantity, avg_price)
+    return positions
+
+
+def _parse_state_movements(
+    raw: object,
+) -> tuple[list[MovementRecord], dict[tuple[str, int], MovementRecord]]:
+    if not isinstance(raw, (list, tuple)):
+        raise MT5AccountingError("movements debe ser lista")
+    movements: list[MovementRecord] = []
+    by_key: dict[tuple[str, int], MovementRecord] = {}
+    for m in raw:
+        if not isinstance(m, dict):
+            raise MT5AccountingError("movimiento no es dict")
+        dk = m.get("deal_key")
+        if not isinstance(dk, (list, tuple)) or len(dk) != 2:
+            raise MT5AccountingError("movimiento con deal_key invalido")
+        fp, ticket = dk[0], dk[1]
+        if not isinstance(fp, str) or isinstance(ticket, bool) or not isinstance(
+            ticket, int
+        ):
+            raise MT5AccountingError("movimiento con deal_key mal tipado")
+        key = (fp, ticket)
+        if key in by_key:
+            raise MT5AccountingError("movimiento duplicado")
+        try:
+            kind = DealEventKind(m.get("kind"))
+        except ValueError as exc:
+            raise MT5AccountingError("movimiento con kind invalido") from exc
+        if kind not in _ALLOWED_MOVEMENT_KINDS:
+            raise MT5AccountingError(
+                "movimiento con clase no admisible (H3)"
+            )
+        amount = _require_number(m.get("amount"), "movement.amount")
+        time = _parse_utc(m.get("time"), "movement.time")
+        rec = MovementRecord(key, kind, amount, time)
+        movements.append(rec)
+        by_key[key] = rec
+    return movements, by_key
+
+
+def _parse_state_processed(
+    raw: object, fingerprint: str
+) -> tuple[list[tuple[MT5Deal, DealEventKind]], dict[tuple[str, int], tuple[MT5Deal, DealEventKind]]]:
+    if not isinstance(raw, (list, tuple)):
+        raise MT5AccountingError("processed debe ser lista")
+    ordered: list[tuple[MT5Deal, DealEventKind]] = []
+    mapping: dict[tuple[str, int], tuple[MT5Deal, DealEventKind]] = {}
+    for entry in raw:
+        if not isinstance(entry, dict):
+            raise MT5AccountingError("entrada processed no es dict")
+        try:
+            kind = DealEventKind(entry.get("kind"))
+        except ValueError as exc:
+            raise MT5AccountingError("processed con kind invalido") from exc
+        if kind not in _ALLOWED_PROCESSED_KINDS:
+            raise MT5AccountingError("evento procesado con clase no admisible (H3)")
+        deal = _deal_from_dict(entry.get("deal"))
+        if deal.account_fingerprint != fingerprint:
+            raise MT5AccountingError("deal procesado de otra cuenta")
+        if classify_deal(deal).kind is not kind:
+            raise MT5AccountingError("kind de deal procesado incoherente")
+        key = (fingerprint, deal.ticket)
+        if key in mapping:
+            raise MT5AccountingError("ticket de deal procesado duplicado")
+        mapping[key] = (deal, kind)
+        ordered.append((deal, kind))
+    return ordered, mapping
+
+
+def _check_movement_event_consistency(
+    movements: list[MovementRecord],
+    by_key: dict[tuple[str, int], MovementRecord],
+    processed: dict[tuple[str, int], tuple[MT5Deal, DealEventKind]],
+) -> None:
+    """Biyeccion movimiento <-> evento BALANCE/CREDIT procesado (H3)."""
+    for key, rec in by_key.items():
+        pe = processed.get(key)
+        if pe is None:
+            raise MT5AccountingError("movimiento sin evento procesado correspondiente")
+        pdeal, pkind = pe
+        if pkind is not rec.kind:
+            raise MT5AccountingError("clase de movimiento no coincide con el evento")
+        if not _approx_equal(_require_money(pdeal.profit, "profit"), rec.amount):
+            raise MT5AccountingError("importe de movimiento no coincide con el evento")
+        if pdeal.time != rec.time:
+            raise MT5AccountingError("timestamp de movimiento no coincide con el evento")
+    for key, (pdeal, pkind) in processed.items():
+        if pkind in _ALLOWED_MOVEMENT_KINDS and key not in by_key:
+            raise MT5AccountingError("evento BALANCE/CREDIT sin movimiento asociado")
+
+
+def _replay_and_compare(
+    ledger: "MT5AccountLedger",
+    *,
+    baseline: MT5AccountBaseline,
+    balance: float,
+    credit: float,
+    realized: float,
+    positions: dict[int, MT5Position],
+    movements: list[MovementRecord],
+) -> None:
+    """Reproduce el estado aplicando los deals con las reglas del modelo y lo
+    compara con el persistido (H4). Determinista, no mutante sobre el resultado."""
+    replay = MT5AccountLedger(baseline)
+    for deal, _kind in ledger.processed_deals_in_order():
+        try:
+            replay.apply_deal(deal)
+        except MT5AccountingError as exc:
+            raise MT5AccountingError(
+                f"estado persistido no reproducible: {exc}"
+            ) from exc
+    if not _approx_equal(replay.balance, balance):
+        raise MT5AccountingError("balance persistido no reproducible (H4)")
+    if not _approx_equal(replay.credit, credit):
+        raise MT5AccountingError("credito persistido no reproducible (H4)")
+    if not _approx_equal(replay.realized_pnl, realized):
+        raise MT5AccountingError("realized_pnl persistido no reproducible (H4)")
+    derived_pos = {p.position_id: p for p in replay.positions()}
+    if set(derived_pos) != set(positions):
+        raise MT5AccountingError("posiciones persistidas no reproducibles (H4)")
+    for pid, dp in derived_pos.items():
+        ep = positions[pid]
+        if dp.symbol != ep.symbol or not _approx_equal(
+            dp.quantity, ep.quantity
+        ) or not _approx_equal(dp.avg_price, ep.avg_price):
+            raise MT5AccountingError(
+                f"posicion {pid} persistida no reproducible (H4)"
+            )
+    derived_mov = replay.movement_records()
+    if len(derived_mov) != len(movements):
+        raise MT5AccountingError("movimientos persistidos no reproducibles (H4)")
+    for dm, pm in zip(derived_mov, movements):
+        if (
+            dm.deal_key != pm.deal_key
+            or dm.kind is not pm.kind
+            or not _approx_equal(dm.amount, pm.amount)
+            or dm.time != pm.time
+        ):
+            raise MT5AccountingError(
+                "movimiento persistido no reproducible (H4)"
+            )
+
+
 class MT5AccountLedger:
     """Ledger contable MT5 apalancado (Forex/CFD), separado del ledger spot."""
 
@@ -542,6 +854,118 @@ class MT5AccountLedger:
 
     def processed_deal_count(self) -> int:
         return len(self._processed)
+
+    def processed_deals(self) -> tuple[tuple[MT5Deal, DealEventKind], ...]:
+        """Deals aplicados (payload, clase) ordenados por clave `(fp, ticket)`."""
+        return tuple(self._processed[k] for k in sorted(self._processed))
+
+    def processed_deals_in_order(self) -> tuple[tuple[MT5Deal, DealEventKind], ...]:
+        """Deals aplicados en ORDEN DE APLICACION (relevante para el replay)."""
+        return tuple(self._processed.values())
+
+    # ------------------------------------------------- serializacion/estado
+
+    def to_snapshot(self) -> dict:
+        """Payload de estado serializable (sin credenciales ni id completo)."""
+        return {
+            "state_version": MT5_ACCOUNTING_STATE_VERSION,
+            "baseline": _baseline_to_dict(self._baseline),
+            "balance": self._balance,
+            "credit": self._credit,
+            "realized_pnl": self._realized_pnl,
+            "positions": [
+                {
+                    "position_id": p.position_id,
+                    "symbol": p.symbol,
+                    "quantity": p.quantity,
+                    "avg_price": p.avg_price,
+                }
+                for p in self.positions()
+            ],
+            "movements": [
+                {
+                    "deal_key": [m.deal_key[0], m.deal_key[1]],
+                    "kind": m.kind.value,
+                    "amount": m.amount,
+                    "time": m.time.isoformat(),
+                }
+                for m in self._movements
+            ],
+            # En ORDEN DE APLICACION (el replay depende de la secuencia).
+            "processed": [
+                {"kind": kind.value, "deal": _deal_to_dict(deal)}
+                for deal, kind in self._processed.values()
+            ],
+            "is_complete": self._complete,
+            "incomplete_reason": self._incomplete_reason,
+        }
+
+    @classmethod
+    def from_snapshot(cls, snapshot: object) -> "MT5AccountLedger":
+        """Reconstruye un ledger desde un payload de estado VALIDADO.
+
+        Verifica (H3) la allowlist de clases de evento y la biyeccion
+        movimiento<->evento, y (H4) recompone el estado derivado reaplicando los
+        deals en su orden con las MISMAS reglas del modelo. Todo se valida en
+        locales ANTES de construir/exponer el ledger restaurado: un snapshot
+        invalido no produce objeto parcial ni muta nada.
+        """
+        if not isinstance(snapshot, dict):
+            raise MT5AccountingError("snapshot no es dict")
+        if snapshot.get("state_version") != MT5_ACCOUNTING_STATE_VERSION:
+            raise MT5AccountingError(
+                f"state_version no soportada: {snapshot.get('state_version')!r}"
+            )
+        baseline = _baseline_from_dict(snapshot.get("baseline"))
+
+        balance = _require_number(snapshot.get("balance"), "balance")
+        credit = _require_number(snapshot.get("credit"), "credit")
+        if credit < 0.0:
+            raise MT5AccountingError("credit restaurado negativo (fuera de dominio)")
+        realized = _require_number(snapshot.get("realized_pnl"), "realized_pnl")
+
+        positions = _parse_state_positions(snapshot.get("positions", []))
+        movements, movements_by_key = _parse_state_movements(
+            snapshot.get("movements", [])
+        )
+        ordered, processed = _parse_state_processed(
+            snapshot.get("processed", []), baseline.account_fingerprint
+        )
+        _check_movement_event_consistency(movements, movements_by_key, processed)
+
+        complete = snapshot.get("is_complete")
+        if not isinstance(complete, bool):
+            raise MT5AccountingError("is_complete debe ser bool")
+        reason = snapshot.get("incomplete_reason")
+        if reason is not None and not isinstance(reason, str):
+            raise MT5AccountingError("incomplete_reason debe ser str o None")
+        if complete and reason is not None:
+            raise MT5AccountingError("is_complete=True con incomplete_reason")
+        if not complete and not reason:
+            raise MT5AccountingError("is_complete=False sin motivo")
+
+        # H4: recomputar el estado desde los eventos aceptados (mismas reglas).
+        result = cls(baseline)
+        result._processed = dict(processed)  # orden de insercion = orden persistido
+        _replay_and_compare(
+            result,
+            baseline=baseline,
+            balance=balance,
+            credit=credit,
+            realized=realized,
+            positions=positions,
+            movements=movements,
+        )
+
+        # Solo tras validar todo se confirma el estado restaurado.
+        result._balance = balance
+        result._credit = credit
+        result._realized_pnl = realized
+        result._positions = positions
+        result._movements = movements
+        result._complete = complete
+        result._incomplete_reason = reason
+        return result
 
     # -------------------------------------------------------------- apply
 
@@ -647,7 +1071,13 @@ class MT5AccountLedger:
             movement = MovementRecord(key, event.kind, amount, deal.time)
         elif event.kind is DealEventKind.CREDIT_MOVEMENT:
             amount = _require_money(deal.profit, "profit")
-            credit += amount
+            new_credit = credit + amount
+            if new_credit < 0.0:
+                # Dominio del modelo: el credito no puede quedar negativo.
+                raise AccountingIncompleteError(
+                    "movimiento de credito deja credito negativo"
+                )
+            credit = new_credit
             movement = MovementRecord(key, event.kind, amount, deal.time)
         else:  # pragma: no cover - el llamante filtra los demas tipos
             raise AccountingIncompleteError(f"evento no aplicable: {event.kind}")
