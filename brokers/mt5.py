@@ -72,6 +72,7 @@ from brokers.models import (
     BrokerOrderState,
     BrokerPermissionError,
     BrokerRateLimitError,
+    HistoricalDeal,
     OrderNotFoundError,
     OrderRejectedError,
     OrderSubmission,
@@ -448,6 +449,38 @@ class OrderHistoryLookup:
     client_order_id: str
     status: str
     order: "BrokerOrder | None" = None
+    detail: str = ""
+
+    @property
+    def complete(self) -> bool:
+        return self.status == HISTORY_COMPLETE
+
+
+class MT5DealHistoryError(ValueError):
+    """Intervalo temporal invalido para la consulta de deals historicos."""
+
+
+@dataclass(frozen=True, slots=True)
+class DealHistoryResult:
+    """Resultado explicito de consultar deals historicos por INTERVALO temporal.
+
+    `status`:
+      * `COMPLETE`: la consulta se valido; `deals` es el conjunto de deals del
+        intervalo solicitado (posiblemente no vacio).
+      * `EMPTY_CONFIRMED`: la consulta fue correcta y no devolvio ningun deal.
+      * `INCOMPLETE`: la consulta fallo (None/excepcion) o el resultado no pudo
+        validarse/completarse; `deals` queda vacio y NUNCA debe interpretarse
+        como "sin deals".
+
+    IMPORTANTE: `COMPLETE` describe SOLO la consulta del intervalo solicitado; no
+    afirma completitud historica global. La API subyacente no ofrece paginacion y
+    los deals pueden aparecer con retraso.
+    """
+
+    date_from: datetime
+    date_to: datetime
+    status: str
+    deals: tuple[HistoricalDeal, ...] = ()
     detail: str = ""
 
     @property
@@ -1095,6 +1128,151 @@ class MT5BrokerAdapter(BrokerAdapter):
             )
         return OrderHistoryLookup(cid, HISTORY_COMPLETE, order=order)
 
+    def deal_history(
+        self, date_from: datetime, date_to: datetime
+    ) -> DealHistoryResult:
+        """Deals historicos por intervalo temporal (SOLO LECTURA).
+
+        Contrato:
+          * Valida que `date_from`/`date_to` sean datetimes con zona horaria y
+            los convierte a UTC de forma EXPLICITA (nunca reinterpreta naive);
+            exige `date_from <= date_to`.
+          * Consulta `history_deals_get(date_from, date_to)` SIN filtro de
+            simbolo ni de orden (no excluye movimientos de cuenta ni `order == 0`).
+          * `None`/excepcion => `INCOMPLETE` (nunca "vacio"). La coleccion vacia
+            confirmada => `EMPTY_CONFIRMED`.
+          * Valida cada registro antes de emitir `COMPLETE`; un registro
+            malformado => `INCOMPLETE`. NO descarta deals por `type` desconocido
+            (no clasifica economicamente aqui).
+          * Deduplica por `ticket`: identico => colapsa; contradictorio =>
+            `INCOMPLETE`.
+          * Orden determinista por `(time, time_msc, ticket)`.
+
+        NO afirma paginacion ni completitud historica global; la futura ingestion
+        debera admitir intervalos SOLAPADOS y deduplicar por identidad de deal.
+        """
+        self._require_ready()
+        frm = self._require_utc_datetime(date_from, "date_from")
+        to = self._require_utc_datetime(date_to, "date_to")
+        if frm > to:
+            raise MT5DealHistoryError("date_from no puede ser posterior a date_to")
+
+        mt5 = self._module()
+        try:
+            rows = mt5.history_deals_get(frm, to)
+        except Exception as exc:  # noqa: BLE001 - transporte/consulta incierta
+            return DealHistoryResult(
+                frm, to, HISTORY_INCOMPLETE, (),
+                f"consulta fallo ({type(exc).__name__})",
+            )
+        if rows is None:
+            return DealHistoryResult(
+                frm, to, HISTORY_INCOMPLETE, (),
+                f"sin respuesta ({self._last_error_text()})",
+            )
+        try:
+            raw = list(rows)
+        except TypeError:
+            return DealHistoryResult(
+                frm, to, HISTORY_INCOMPLETE, (), "resultado no iterable"
+            )
+
+        by_ticket: dict[int, HistoricalDeal] = {}
+        for row in raw:
+            try:
+                deal = self._historical_deal(row)
+            except MT5DealHistoryError as exc:
+                return DealHistoryResult(
+                    frm, to, HISTORY_INCOMPLETE, (), f"registro invalido: {exc}"
+                )
+            prev = by_ticket.get(deal.ticket)
+            if prev is None:
+                by_ticket[deal.ticket] = deal
+            elif prev != deal:
+                return DealHistoryResult(
+                    frm, to, HISTORY_INCOMPLETE, (),
+                    "ticket duplicado contradictorio",
+                )
+            # ticket identico repetido => colapsa (no se elige variante).
+        if not by_ticket:
+            return DealHistoryResult(frm, to, HISTORY_EMPTY_CONFIRMED, ())
+        ordered = tuple(
+            sorted(by_ticket.values(), key=lambda d: (d.time, d.time_msc, d.ticket))
+        )
+        return DealHistoryResult(frm, to, HISTORY_COMPLETE, ordered)
+
+    @staticmethod
+    def _require_utc_datetime(value: object, field: str) -> datetime:
+        """Exige datetime con zona y lo normaliza a UTC (sin reinterpretar naive)."""
+        if (
+            not isinstance(value, datetime)
+            or value.tzinfo is None
+            or value.utcoffset() is None
+        ):
+            raise MT5DealHistoryError(
+                f"{field} debe ser datetime con zona horaria (UTC), no naive"
+            )
+        return value.astimezone(timezone.utc)
+
+    @staticmethod
+    def _historical_deal(row: Any) -> HistoricalDeal:
+        """Normaliza/valida UN registro de `history_deals_get` (fail-closed)."""
+
+        def _int(name: str) -> int:
+            # OBLIGATORIO y ESTRICTO: solo `int` real. Rechaza ausencia/None,
+            # bool (subtipo de int), float (aunque sea 5.0: no se trunca ni se
+            # pierde identidad) y str: no hay coercion implicita ni defaults.
+            if not hasattr(row, name):
+                raise MT5DealHistoryError(f"{name} ausente")
+            v = getattr(row, name)
+            if v is None:
+                raise MT5DealHistoryError(f"{name} ausente")
+            if isinstance(v, bool) or not isinstance(v, int):
+                raise MT5DealHistoryError(f"{name} no entero (tipo {type(v).__name__})")
+            return v
+
+        def _num(name: str) -> float:
+            # Importe OBLIGATORIO: ausente/None => error (nunca 0.0 por defecto).
+            v = getattr(row, name, None)
+            if v is None:
+                raise MT5DealHistoryError(f"{name} ausente")
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                raise MT5DealHistoryError(f"{name} no numerico")
+            f = float(v)
+            if not math.isfinite(f):
+                raise MT5DealHistoryError(f"{name} no finito")
+            return f
+
+        ticket = _int("ticket")
+        if ticket <= 0:
+            raise MT5DealHistoryError("ticket invalido")
+        order = _int("order")  # obligatorio (0 = movimiento sin orden: legitimo)
+        time_raw = _int("time")  # obligatorio
+        if time_raw <= 0:
+            raise MT5DealHistoryError("time invalido")
+        time_msc = _int("time_msc")  # obligatorio
+        deal_type = _int("type")  # obligatorio
+        entry = _int("entry")  # obligatorio (0 = entrada: legitimo)
+        position_id = _int("position_id")  # obligatorio (0 = sin posicion: legitimo)
+        symbol_raw = getattr(row, "symbol", None)
+        symbol = None if symbol_raw is None or not str(symbol_raw).strip() else str(symbol_raw)
+        return HistoricalDeal(
+            ticket=ticket,
+            order=order,
+            time=datetime.fromtimestamp(time_raw, tz=timezone.utc),
+            time_msc=time_msc,
+            type=deal_type,
+            entry=entry,
+            position_id=position_id,
+            symbol=symbol,
+            volume=_num("volume"),
+            price=_num("price"),
+            profit=_num("profit"),
+            commission=_num("commission"),
+            swap=_num("swap"),
+            fee=_num("fee"),
+        )
+
     def _discover_tickets(self, client_order_id: str) -> list[int]:
         magic = self._magic_for(client_order_id)
         comment = self._comment_for(client_order_id)
@@ -1511,10 +1689,12 @@ class MT5BrokerAdapter(BrokerAdapter):
 
 
 __all__ = [
+    "DealHistoryResult",
     "MT5BrokerAdapter",
     "MT5Config",
     "MT5ConfigError",
     "MT5Credentials",
+    "MT5DealHistoryError",
     "MT5Environment",
     "MT5SymbolSpec",
     "instrument_spec_from_mt5",

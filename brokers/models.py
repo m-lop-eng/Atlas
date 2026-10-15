@@ -190,6 +190,35 @@ class Position:
 
 
 @dataclass(frozen=True, slots=True)
+class HistoricalDeal:
+    """Deal historico crudo reportado por el broker (capa broker, solo lectura).
+
+    Representacion INTERMEDIA entre el adaptador y cualquier ledger contable: NO
+    acopla el adaptador a `MT5AccountLedger`. Preserva los campos relevantes para
+    contabilidad/trazabilidad SIN clasificar economicamente el deal.
+
+    Identidad: `ticket` es unico por cuenta y estable. `order` PUEDE ser 0
+    (depositos/retiradas/creditos) y NO identifica por si solo un fill. `time_msc`
+    aporta resolucion de milisegundos para ordenar deals del mismo segundo.
+    """
+
+    ticket: int
+    order: int
+    time: datetime
+    time_msc: int
+    type: int
+    entry: int | None
+    position_id: int | None
+    symbol: str | None
+    volume: float
+    price: float
+    profit: float
+    commission: float
+    swap: float
+    fee: float
+
+
+@dataclass(frozen=True, slots=True)
 class AccountState:
     """Estado de cuenta reportado por el broker."""
 
