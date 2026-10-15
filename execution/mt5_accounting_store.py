@@ -37,9 +37,12 @@ from enum import Enum
 from pathlib import Path
 
 from execution.mt5_accounting import (
+    AccountingEpoch,
+    BaselineOrigin,
     MT5AccountBaseline,
     MT5AccountLedger,
     MT5AccountingError,
+    MT5AccountStateVersionError,
 )
 
 STORE_SCHEMA_VERSION = 1
@@ -130,17 +133,29 @@ class MT5AccountingStore:
         *,
         overwrite: bool = False,
         destructive: bool = False,
+        origin: BaselineOrigin = BaselineOrigin.DECLARED,
+        continuity_verified: bool = False,
     ) -> MT5AccountLedger:
         """Crea un ledger VACIO desde una baseline validada y lo persiste.
 
-        `overwrite=True` sobre un snapshot existente de la MISMA cuenta exige
-        ademas `destructive=True` si dicho snapshot contiene estado. Nunca
-        sobrescribe un snapshot corrupto ni de otra cuenta. No declara readiness.
+        Declara la EPOCA contable: `origin=DECLARED` (estado inicial declarado,
+        NO reconstruccion historica) y `continuity_verified=False` (la creacion y
+        persistencia NO demuestran continuidad). `BASELINE` se marca como
+        declarada. `overwrite=True` sobre un snapshot de la MISMA cuenta exige
+        `destructive=True` si contiene estado. No declara readiness operativa.
         """
         if not isinstance(baseline, MT5AccountBaseline):
             raise MT5AccountingStoreError(
                 "create exige una MT5AccountBaseline ya validada (no se infiere)"
             )
+        if origin is not BaselineOrigin.DECLARED:
+            raise MT5AccountingStoreError(
+                "create solo produce epocas DECLARED; la reconstruccion historica "
+                "no esta soportada (no se declara un origen no demostrable)"
+            )
+        epoch = AccountingEpoch(
+            origin=origin, continuity_verified=continuity_verified
+        )
         if self.path.exists():
             if not overwrite:
                 raise SnapshotExistsError(f"snapshot ya existe: {self.path}")
@@ -154,7 +169,7 @@ class MT5AccountingStore:
                     "el snapshot existente contiene estado: requiere "
                     "destructive=True para reemplazarlo por una baseline vacia"
                 )
-        ledger = MT5AccountLedger(baseline)
+        ledger = MT5AccountLedger(baseline, epoch=epoch)
         self._save(ledger, baseline_declared=True, overwrite=overwrite)
         return ledger
 
@@ -240,6 +255,12 @@ class MT5AccountingStore:
             raise SnapshotCorruptError("snapshot sin bloque `accounting`")
         try:
             ledger = MT5AccountLedger.from_snapshot(accounting)
+        except MT5AccountStateVersionError as exc:
+            # Version de estado incompatible/antigua: rechazo explicito (nunca se
+            # interpreta con defaults).
+            raise SnapshotVersionError(
+                f"accounting state_version no soportada: {exc}"
+            ) from exc
         except MT5AccountingError as exc:
             raise SnapshotCorruptError(f"snapshot invalido: {exc}") from exc
         if (

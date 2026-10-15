@@ -41,7 +41,9 @@ from enum import Enum
 
 MT5_ACCOUNTING_SCHEMA_VERSION = 1
 # Version del payload de ESTADO serializable (snapshot del ledger).
-MT5_ACCOUNTING_STATE_VERSION = 1
+# v2 (05B): anade la metadata de EPOCA contable (`epoch`). Los payloads v1 NO se
+# interpretan con defaults: se rechazan con `MT5AccountStateVersionError`.
+MT5_ACCOUNTING_STATE_VERSION = 2
 
 # Constantes oficiales MQL5 (ENUM_DEAL_TYPE / ENUM_DEAL_ENTRY), definidas localmente
 # para no depender del paquete MetaTrader5 (import perezoso innecesario offline).
@@ -120,6 +122,14 @@ class DealIdentityCollisionError(MT5AccountingError):
     """Mismo ticket de deal con contenido distinto (identidad inconsistente)."""
 
 
+class MT5AccountStateVersionError(MT5AccountingError):
+    """`state_version` del payload de estado no soportada (incompatible)."""
+
+
+class AccountingEpochError(MT5AccountingError):
+    """Metadata de epoca contable ausente, mal formada o contradictoria."""
+
+
 class DealEventKind(str, Enum):
     """Clasificacion explicita de un deal MT5."""
 
@@ -185,6 +195,55 @@ def account_fingerprint(*, server: str, account_id: int | str) -> str:
         raise MT5AccountingError("account_id vacio para la huella de cuenta")
     material = f"{server.strip()}|{raw}"
     return hashlib.sha256(material.encode("utf-8")).hexdigest()[:32]
+
+
+class BaselineOrigin(str, Enum):
+    """Origen del estado inicial de una epoca contable."""
+
+    # Estado inicial DECLARADO por observacion puntual de la cuenta: NO es una
+    # reconstruccion del historial anterior.
+    DECLARED = "DECLARED"
+    # Reconstruccion historica completa: NO disponible con las APIs actuales.
+    RECONSTRUCTED = "RECONSTRUCTED"
+
+
+@dataclass(frozen=True, slots=True)
+class AccountingEpoch:
+    """Epoca contable: origen del estado inicial y estado de continuidad.
+
+    `continuity_verified` es SIEMPRE `False` por defecto: crear y persistir una
+    baseline NO demuestra continuidad historica desde el corte. Una baseline
+    `DECLARED` no puede declararse con continuidad verificada (fail-closed).
+    """
+
+    origin: BaselineOrigin
+    continuity_verified: bool = False
+
+    def __post_init__(self) -> None:
+        origin = self.origin
+        if not isinstance(origin, BaselineOrigin):
+            try:
+                origin = BaselineOrigin(origin)
+            except ValueError:
+                raise AccountingEpochError(
+                    f"BaselineOrigin invalido: {origin!r}"
+                ) from None
+            object.__setattr__(self, "origin", origin)
+        if not isinstance(self.continuity_verified, bool):
+            raise AccountingEpochError("continuity_verified debe ser bool")
+        if origin is BaselineOrigin.RECONSTRUCTED:
+            # RESERVADO: no existe reconstruccion historica verificable en el
+            # contrato actual. Se rechaza en TODA la superficie publica (constructor,
+            # serializacion y restauracion) con independencia de continuity_verified.
+            raise AccountingEpochError(
+                "BaselineOrigin.RECONSTRUCTED esta reservado: requiere una "
+                "reconstruccion historica verificable (no disponible); no se infiere "
+                "a partir de un snapshot"
+            )
+        if origin is BaselineOrigin.DECLARED and self.continuity_verified:
+            raise AccountingEpochError(
+                "una baseline DECLARED no puede declarar continuidad verificada"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -487,6 +546,31 @@ def _parse_utc(value: object, field: str) -> datetime:
     return dt
 
 
+def _epoch_to_dict(epoch: AccountingEpoch) -> dict:
+    return {
+        "origin": epoch.origin.value,
+        "continuity_verified": epoch.continuity_verified,
+    }
+
+
+def _epoch_from_dict(d: object) -> AccountingEpoch:
+    if not isinstance(d, dict):
+        raise AccountingEpochError("epoch del snapshot no es dict")
+    if "origin" not in d:
+        raise AccountingEpochError("epoch sin `origin`")
+    if "continuity_verified" not in d:
+        raise AccountingEpochError("epoch sin `continuity_verified`")
+    try:
+        origin = BaselineOrigin(d["origin"])
+    except ValueError as exc:
+        raise AccountingEpochError(f"epoch origin invalido: {d['origin']!r}") from exc
+    if not isinstance(d["continuity_verified"], bool):
+        raise AccountingEpochError("continuity_verified debe ser bool")
+    return AccountingEpoch(
+        origin=origin, continuity_verified=d["continuity_verified"]
+    )
+
+
 def _baseline_to_dict(baseline: MT5AccountBaseline) -> dict:
     return {
         "schema_version": baseline.schema_version,
@@ -775,11 +859,18 @@ class MT5AccountLedger:
         self,
         baseline: MT5AccountBaseline,
         *,
+        epoch: AccountingEpoch | None = None,
         reconciliation_tolerance_abs: float = _DEFAULT_MONEY_EPS,
         reconciliation_tolerance_rel: float = _DEFAULT_MONEY_EPS,
     ) -> None:
         if not isinstance(baseline, MT5AccountBaseline):
             raise BaselineError("MT5AccountLedger exige una MT5AccountBaseline explicita")
+        if epoch is None:
+            # Default seguro: epoca DECLARADA y continuidad NO verificada. Nunca
+            # DECLARED+verified ni RECONSTRUCTED por defecto.
+            epoch = AccountingEpoch(BaselineOrigin.DECLARED)
+        elif not isinstance(epoch, AccountingEpoch):
+            raise AccountingEpochError("epoch debe ser AccountingEpoch")
         for name, value in (
             ("reconciliation_tolerance_abs", reconciliation_tolerance_abs),
             ("reconciliation_tolerance_rel", reconciliation_tolerance_rel),
@@ -787,6 +878,7 @@ class MT5AccountLedger:
             if not _finite(value) or float(value) < 0.0:
                 raise MT5AccountingError(f"{name} debe ser finito y >= 0")
         self._baseline = baseline
+        self._epoch = epoch
         self._balance = float(baseline.balance)
         self._credit = float(baseline.credit)
         self._realized_pnl = 0.0
@@ -812,6 +904,18 @@ class MT5AccountLedger:
     @property
     def account_currency(self) -> str:
         return self._baseline.account_currency
+
+    @property
+    def epoch(self) -> AccountingEpoch:
+        return self._epoch
+
+    @property
+    def origin(self) -> BaselineOrigin:
+        return self._epoch.origin
+
+    @property
+    def continuity_verified(self) -> bool:
+        return self._epoch.continuity_verified
 
     @property
     def balance(self) -> float:
@@ -870,6 +974,7 @@ class MT5AccountLedger:
         return {
             "state_version": MT5_ACCOUNTING_STATE_VERSION,
             "baseline": _baseline_to_dict(self._baseline),
+            "epoch": _epoch_to_dict(self._epoch),
             "balance": self._balance,
             "credit": self._credit,
             "realized_pnl": self._realized_pnl,
@@ -913,10 +1018,12 @@ class MT5AccountLedger:
         if not isinstance(snapshot, dict):
             raise MT5AccountingError("snapshot no es dict")
         if snapshot.get("state_version") != MT5_ACCOUNTING_STATE_VERSION:
-            raise MT5AccountingError(
-                f"state_version no soportada: {snapshot.get('state_version')!r}"
+            raise MT5AccountStateVersionError(
+                f"state_version no soportada: {snapshot.get('state_version')!r} "
+                f"(esperada {MT5_ACCOUNTING_STATE_VERSION}); no se interpreta con defaults"
             )
         baseline = _baseline_from_dict(snapshot.get("baseline"))
+        epoch = _epoch_from_dict(snapshot.get("epoch"))
 
         balance = _require_number(snapshot.get("balance"), "balance")
         credit = _require_number(snapshot.get("credit"), "credit")
@@ -965,6 +1072,7 @@ class MT5AccountLedger:
         result._movements = movements
         result._complete = complete
         result._incomplete_reason = reason
+        result._epoch = epoch
         return result
 
     # -------------------------------------------------------------- apply

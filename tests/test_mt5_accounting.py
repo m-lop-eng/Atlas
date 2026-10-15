@@ -23,6 +23,7 @@ from execution.mt5_accounting import (
     DEAL_TYPE_CREDIT,
     DEAL_TYPE_SELL,
     MT5_ACCOUNTING_SCHEMA_VERSION,
+    MT5_ACCOUNTING_STATE_VERSION,
     MT5AccountBaseline,
     MT5AccountLedger,
     MT5AccountingError,
@@ -36,6 +37,10 @@ from execution.mt5_accounting import (
     UnsupportedDealError,
     account_fingerprint,
     classify_deal,
+    AccountingEpoch,
+    AccountingEpochError,
+    BaselineOrigin,
+    MT5AccountStateVersionError,
 )
 from papertrading.ledger import AccountLedger
 
@@ -118,6 +123,73 @@ class TestBaseline:
     def test_ledger_requires_explicit_baseline(self):
         with pytest.raises(BaselineError):
             MT5AccountLedger(None)  # type: ignore[arg-type]
+
+    def test_default_epoch_is_declared_unverified(self):
+        ledger = _ledger()
+        assert ledger.origin is BaselineOrigin.DECLARED
+        assert ledger.continuity_verified is False
+        assert ledger.epoch.continuity_verified is False
+
+    def test_declared_cannot_claim_verified(self):
+        with pytest.raises(AccountingEpochError):
+            AccountingEpoch(BaselineOrigin.DECLARED, continuity_verified=True)
+
+    def test_epoch_origin_coercion_and_validation(self):
+        assert AccountingEpoch("DECLARED").origin is BaselineOrigin.DECLARED
+        with pytest.raises(AccountingEpochError):
+            AccountingEpoch("NOPE")
+        with pytest.raises(AccountingEpochError):
+            AccountingEpoch(BaselineOrigin.DECLARED, continuity_verified="yes")  # type: ignore[arg-type]
+
+    def test_snapshot_roundtrip_preserves_epoch_and_baseline_state(self):
+        ledger = _ledger()
+        snap = ledger.to_snapshot()
+        assert snap["state_version"] == MT5_ACCOUNTING_STATE_VERSION
+        assert snap["epoch"] == {"origin": "DECLARED", "continuity_verified": False}
+        restored = MT5AccountLedger.from_snapshot(snap)
+        assert restored.origin is BaselineOrigin.DECLARED
+        assert restored.continuity_verified is False
+        assert restored.balance == pytest.approx(ledger.balance)
+        assert restored.credit == pytest.approx(ledger.credit)
+        assert restored.account_fingerprint == ledger.account_fingerprint
+        assert restored.account_currency == ledger.account_currency
+        assert restored.baseline.baseline_at == ledger.baseline.baseline_at
+
+    def test_snapshot_missing_epoch_rejected(self):
+        snap = _ledger().to_snapshot()
+        del snap["epoch"]
+        with pytest.raises(AccountingEpochError):
+            MT5AccountLedger.from_snapshot(snap)
+
+    def test_old_state_version_rejected(self):
+        snap = _ledger().to_snapshot()
+        snap["state_version"] = 1
+        with pytest.raises(MT5AccountStateVersionError):
+            MT5AccountLedger.from_snapshot(snap)
+
+    def test_is_complete_semantics_independent_of_epoch(self):
+        ledger = _ledger()
+        assert ledger.is_complete is True
+        with pytest.raises(UnsupportedDealError):
+            ledger.apply_deal(_deal(ticket=1, type=99))
+        assert ledger.is_complete is False
+        assert ledger.origin is BaselineOrigin.DECLARED
+        assert ledger.continuity_verified is False
+
+    def test_reconstructed_rejected_regardless_of_continuity(self):
+        with pytest.raises(AccountingEpochError):
+            AccountingEpoch(BaselineOrigin.RECONSTRUCTED, continuity_verified=False)
+        with pytest.raises(AccountingEpochError):
+            AccountingEpoch(BaselineOrigin.RECONSTRUCTED, continuity_verified=True)
+
+    def test_from_snapshot_reconstructed_rejected(self):
+        snap = _ledger().to_snapshot()
+        snap["epoch"] = {"origin": "RECONSTRUCTED", "continuity_verified": False}
+        with pytest.raises(AccountingEpochError):
+            MT5AccountLedger.from_snapshot(snap)
+        snap["epoch"] = {"origin": "RECONSTRUCTED", "continuity_verified": True}
+        with pytest.raises(AccountingEpochError):
+            MT5AccountLedger.from_snapshot(snap)
 
     @pytest.mark.parametrize("over", [
         {"schema_version": 99},

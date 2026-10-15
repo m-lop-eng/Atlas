@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 from datetime import datetime, timezone
+from types import SimpleNamespace
 
 import pytest
 
@@ -25,6 +26,8 @@ from execution.mt5_accounting import (
     MT5AccountBaseline,
     MT5AccountLedger,
     MT5Deal,
+    AccountingEpochError,
+    BaselineOrigin,
     DealIdentityCollisionError,
     UnsupportedDealError,
     account_fingerprint,
@@ -673,3 +676,103 @@ class TestSeparationAndNoReadiness:
         assert not hasattr(restored, "ready")
         assert restored.valuation_available() is False
         assert restored.floating_pnl is None
+
+
+# --------------------------------------------------------------------------
+# 05B: epoca contable declarada (origen + continuidad no verificada)
+# --------------------------------------------------------------------------
+
+
+class TestAccountingEpochPersistence:
+    def test_create_declares_epoch_and_persists(self, tmp_path):
+        store = _store(tmp_path)
+        ledger = store.create(_baseline())
+        assert ledger.origin is BaselineOrigin.DECLARED
+        assert ledger.continuity_verified is False
+        assert store.baseline_declared() is True
+        loaded = store.load()
+        assert loaded.origin is BaselineOrigin.DECLARED
+        assert loaded.continuity_verified is False
+        assert loaded.balance == pytest.approx(10000.0)
+        assert loaded.account_currency == "USD"
+        assert loaded.baseline.baseline_at == AT
+
+    def test_declared_not_auto_verified_after_save_load(self, tmp_path):
+        store = _store(tmp_path)
+        ledger = store.create(_baseline())
+        store.save(ledger, overwrite=True)
+        loaded = store.load()
+        assert loaded.origin is BaselineOrigin.DECLARED
+        assert loaded.continuity_verified is False
+
+    def test_create_declared_verified_rejected(self, tmp_path):
+        with pytest.raises(AccountingEpochError):
+            _store(tmp_path).create(_baseline(), continuity_verified=True)
+
+    def test_create_reconstructed_rejected(self, tmp_path):
+        store = _store(tmp_path)
+        with pytest.raises(MT5AccountingStoreError):
+            store.create(_baseline(), origin=BaselineOrigin.RECONSTRUCTED)
+        assert not store.exists  # no se crea snapshot para un origen no soportado
+
+    def test_load_reconstructed_snapshot_rejected_unverified(self, tmp_path):
+        store = _store(tmp_path)
+        store.create(_baseline())
+        raw = _read(store)
+        raw["accounting"]["epoch"] = {
+            "origin": "RECONSTRUCTED", "continuity_verified": False,
+        }
+        store.path.write_text(json.dumps(raw), encoding="utf-8")
+        with pytest.raises(SnapshotCorruptError):  # estado de epoca no permitido
+            store.load()
+        assert store.path.read_text(encoding="utf-8") != ""  # sin ledger vacio
+
+    def test_load_reconstructed_snapshot_rejected_verified(self, tmp_path):
+        store = _store(tmp_path)
+        store.create(_baseline())
+        raw = _read(store)
+        raw["accounting"]["epoch"] = {
+            "origin": "RECONSTRUCTED", "continuity_verified": True,
+        }
+        store.path.write_text(json.dumps(raw), encoding="utf-8")
+        with pytest.raises(SnapshotCorruptError):
+            store.load()
+
+    def test_save_revalidates_and_rejects_reconstructed_epoch(self, tmp_path):
+        store = _store(tmp_path)
+        ledger = store.create(_baseline())
+        # Mutacion via API normal: save() debe REVALIDAR (round-trip) el estado.
+        ledger._epoch = SimpleNamespace(
+            origin=BaselineOrigin.RECONSTRUCTED, continuity_verified=False
+        )
+        with pytest.raises(MT5AccountingStoreError):
+            store.save(ledger, overwrite=True)
+        # El snapshot en disco conserva el estado DECLARED valido.
+        assert store.load().origin is BaselineOrigin.DECLARED
+
+    def test_epoch_preserved_through_roundtrip(self, tmp_path):
+        store = _store(tmp_path)
+        store.create(_baseline())
+        raw = _read(store)
+        assert raw["accounting"]["epoch"] == {
+            "origin": "DECLARED",
+            "continuity_verified": False,
+        }
+
+    def test_old_accounting_state_version_rejected_as_version(self, tmp_path):
+        store = _store(tmp_path)
+        store.create(_baseline())
+        raw = _read(store)
+        raw["accounting"]["state_version"] = 1
+        store.path.write_text(json.dumps(raw), encoding="utf-8")
+        with pytest.raises(SnapshotVersionError):
+            store.load()
+
+    def test_snapshot_missing_epoch_rejected(self, tmp_path):
+        store = _store(tmp_path)
+        store.create(_baseline())
+        raw = _read(store)
+        del raw["accounting"]["epoch"]
+        store.path.write_text(json.dumps(raw), encoding="utf-8")
+        with pytest.raises(SnapshotCorruptError):
+            store.load()
