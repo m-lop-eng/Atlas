@@ -16,12 +16,26 @@ Contrato (fail-closed):
     estado parcial).
   * `HISTORY_INCOMPLETE`/`None`/excepciones/estados desconocidos/incoherentes NO
     avanzan el cursor.
+  * Un ledger contable INCOMPLETO (`is_complete == False`) BLOQUEA toda nueva
+    consulta: NO se reconstruye ni se avanza el cursor, y se conserva el
+    `incomplete_reason`. La reparacion es un procedimiento EXTERNO explicito y
+    separado; confirmar durabilidad NO repara la contabilidad.
   * Una consulta exitosa NO demuestra cobertura historica global ni descarta
-    huecos o eventos tardios.
+    huecos o eventos tardios. El cursor registra SOLO el ultimo intervalo
+    consultado con exito.
   * Si la persistencia NO confirma durabilidad, se BLOQUEAN nuevas ingestiones
     hasta una confirmacion durable posterior explicita.
 
 Un solo escritor por ruta: el store no coordina escritores concurrentes.
+
+Procedencia de la identidad (`account_fingerprint`): el valor DEBE proceder de un
+contexto llamante que haya verificado la identidad de la cuenta y del servidor.
+Este componente solo comprueba que el valor es admisible y COINCIDE con la huella
+de la baseline; esa comparacion, por si sola, NO demuestra que el historial
+devuelto por el broker proceda de esa cuenta. Los deals historicos NO incluyen una
+prueba independiente de procedencia aportada por este componente. La futura
+integracion debera derivar la huella a partir de una observacion FIABLE de cuenta,
+servidor, divisa y modo de cuenta, y bloquear ante discrepancias.
 """
 
 from __future__ import annotations
@@ -131,6 +145,14 @@ class MT5AccountIngestor:
     CONFIRMARSE explicitamente (`confirm_durability`) antes de aceptar nuevas
     ingestiones; una instancia nueva (p. ej. tras un reinicio) empieza sin
     durabilidad confirmada.
+
+    Requisitos previos: durabilidad CONFIRMADA y un ledger COMPLETO
+    (`is_complete == True`). Un ledger INCOMPLETO bloquea toda consulta (la
+    contabilidad NO se repara aqui; la reparacion es externa y explicita).
+
+    `account_fingerprint` debe proceder de una verificacion FIABLE del llamante:
+    la coincidencia con la huella de la baseline NO demuestra por si sola que el
+    historial pertenezca a esa cuenta.
     """
 
     def __init__(
@@ -205,16 +227,27 @@ class MT5AccountIngestor:
 
         La identidad de cuenta verificada (`account_fingerprint`) es OBLIGATORIA
         y debe coincidir con la baseline; los deals historicos NO traen huella y
-        NO se infiere su pertenencia.
+        NO se infiere su pertenencia. La coincidencia de la huella SOLO valida el
+        valor frente a la baseline: NO demuestra la procedencia del historial.
 
         Fail-closed: valida y reconstruye el candidato ANTES de publicar; ante
         cualquier fallo el snapshot previo y el ledger activo quedan intactos y
-        el cursor NO avanza.
+        el cursor NO avanza. Un ledger INCOMPLETO (`is_complete == False`) bloquea
+        la operacion sin repararlo ni descartar su `incomplete_reason`.
         """
         if self._durability is not DurabilityState.CONFIRMED:
             raise IngestionBlockedError(
                 "durabilidad no confirmada: reestablezca la durabilidad antes de "
                 "aplicar nuevas ingestiones (fail-closed)"
+            )
+        # Precondicion de integridad contable: un ledger INCOMPLETO no se
+        # repara aqui. Se bloquea ANTES de validar la identidad, fusionar o
+        # reconstruir: no se descartan eventos ni se avanza el cursor.
+        if not self._ledger.is_complete:
+            raise IngestionBlockedError(
+                "ledger contable incompleto: no se reconstruye ni se avanza el "
+                "cursor; se requiere recuperacion explicita y separada "
+                f"(motivo: {self._ledger.incomplete_reason!r})"
             )
         fingerprint = self._require_identity(account_fingerprint)
         frm, to, status, new_deals = self._validate_result(result, fingerprint)
@@ -256,6 +289,13 @@ class MT5AccountIngestor:
     # ---------------------------------------------------------- validacion
 
     def _require_identity(self, account_fingerprint: object) -> str:
+        """Valida el formato y la coincidencia con la baseline de la huella.
+
+        LIMITE: esta comprobacion es SOLO una comparacion de cadenas contra la
+        huella de la baseline. NO verifica la procedencia del historial ni
+        demuestra que los deals pertenezcan a esa cuenta; el llamante DEBE
+        haber verificado la identidad de cuenta/servidor antes de invocar.
+        """
         if isinstance(account_fingerprint, bool) or not isinstance(
             account_fingerprint, str
         ):

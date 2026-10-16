@@ -30,6 +30,7 @@ from execution.mt5_accounting import (
     MT5_ACCOUNTING_SCHEMA_VERSION,
     MT5AccountBaseline,
     MT5AccountingError,
+    MT5Deal,
     account_fingerprint,
 )
 from execution.mt5_accounting_store import (
@@ -156,6 +157,28 @@ def _setup(tmp_path, monkeypatch, *, durable=True, baseline=None):
     assert ingestor.confirm_durability() is PersistenceResult.DURABLE
     assert ingestor.durability is DurabilityState.CONFIRMED
     return store, ingestor
+
+
+def _unsupported_deal(ticket=999):
+    """MT5Deal con `type` desconocido: al aplicarlo marca el ledger INCOMPLETO."""
+    t_msc = int(AT.timestamp()) * 1000
+    return MT5Deal(
+        account_fingerprint=FP,
+        ticket=ticket,
+        order=0,
+        type=99,
+        entry=None,
+        position_id=None,
+        symbol=None,
+        volume=0.0,
+        price=0.0,
+        profit=0.0,
+        commission=0.0,
+        swap=0.0,
+        fee=0.0,
+        time=AT,
+        time_msc=t_msc,
+    )
 
 
 # --------------------------------------------------------------------------
@@ -589,3 +612,121 @@ class TestIsolation:
         assert ingestor.ledger.ingestion.has_successful_scan is False
         ingestor.confirm_durability()
         assert ingestor.ledger.ingestion.has_successful_scan is False
+
+
+# --------------------------------------------------------------------------
+# 05F. Precondicion: ledger INCOMPLETO bloquea toda nueva consulta
+# --------------------------------------------------------------------------
+
+
+class TestIncompleteLedgerPrecondition:
+    def _incomplete(self, tmp_path, monkeypatch):
+        """Genera un ledger INCOMPLETO por una via REAL del modelo y lo persiste."""
+        store = MT5AccountingStore(tmp_path / "ledger.json")
+        ledger = store.create(_baseline())
+        monkeypatch.setattr(store, "_sync_dir", lambda: True)
+        with pytest.raises(MT5AccountingError):
+            ledger.apply_deal(_unsupported_deal())
+        assert ledger.is_complete is False
+        assert ledger.incomplete_reason
+        # El snapshot incompleto es persistible (valido segun el modelo).
+        store.save(ledger, overwrite=True)
+        ingestor = MT5AccountIngestor(store, ledger)
+        assert ingestor.confirm_durability() is PersistenceResult.DURABLE
+        assert ingestor.durability is DurabilityState.CONFIRMED
+        return store, ledger, ingestor
+
+    def test_incomplete_ledger_blocks_apply_scan(self, tmp_path, monkeypatch):
+        store, ledger, ingestor = self._incomplete(tmp_path, monkeypatch)
+        reason = ledger.incomplete_reason
+        snapshot_before = store.path.read_text(encoding="utf-8")
+        with pytest.raises(IngestionBlockedError):
+            ingestor.apply_scan(
+                _res(HISTORY_COMPLETE, [_deposit(1, 5.0, time=AT)]),
+                account_fingerprint=FP,
+            )
+        # Ledger activo: sigue incompleto y conserva el motivo.
+        assert ingestor.ledger.is_complete is False
+        assert ingestor.ledger.incomplete_reason == reason
+        # No se aplicaron deals ni avanzo el cursor.
+        assert ingestor.ledger.processed_deal_count() == 0
+        assert ingestor.ledger.ingestion.has_successful_scan is False
+        # Snapshot previo intacto (byte a byte).
+        assert store.path.read_text(encoding="utf-8") == snapshot_before
+
+    def test_durability_confirmation_does_not_repair(self, tmp_path, monkeypatch):
+        store, ledger, ingestor = self._incomplete(tmp_path, monkeypatch)
+        assert ingestor.durability is DurabilityState.CONFIRMED
+        assert ingestor.ledger.is_complete is False
+        # Reconfirmar durabilidad NO repara la contabilidad.
+        assert ingestor.confirm_durability() is PersistenceResult.DURABLE
+        assert ingestor.ledger.is_complete is False
+        with pytest.raises(IngestionBlockedError):
+            ingestor.apply_scan(_res(HISTORY_EMPTY_CONFIRMED, []), account_fingerprint=FP)
+        assert ingestor.ledger.is_complete is False
+        assert ingestor.ledger.ingestion.has_successful_scan is False
+
+    def test_from_store_restores_incomplete_and_blocks(self, tmp_path, monkeypatch):
+        store, ledger, ingestor = self._incomplete(tmp_path, monkeypatch)
+        reason = ledger.incomplete_reason
+        resumed = MT5AccountIngestor.from_store(store)
+        assert resumed.ledger.is_complete is False
+        assert resumed.ledger.incomplete_reason == reason
+        assert resumed.confirm_durability() is PersistenceResult.DURABLE
+        with pytest.raises(IngestionBlockedError):
+            resumed.apply_scan(
+                _res(HISTORY_COMPLETE, [_deposit(1, 5.0, time=AT)]),
+                account_fingerprint=FP,
+            )
+        assert resumed.ledger.processed_deal_count() == 0
+        assert resumed.ledger.ingestion.has_successful_scan is False
+
+
+# --------------------------------------------------------------------------
+# 05F. Identidad y resultados malformados
+# --------------------------------------------------------------------------
+
+
+class TestMalformedResultsAndIdentity:
+    @pytest.mark.parametrize("bad", ["", "   ", 123, 1.5, True, None, b"xx"])
+    def test_bad_fingerprints_rejected_without_state_change(
+        self, tmp_path, monkeypatch, bad
+    ):
+        store, ingestor = _setup(tmp_path, monkeypatch)
+        result = _res(HISTORY_COMPLETE, [_deposit(1, 5.0, time=AT)])
+        snapshot_before = store.path.read_text(encoding="utf-8")
+        with pytest.raises(AccountIdentityError):
+            ingestor.apply_scan(result, account_fingerprint=bad)  # type: ignore[arg-type]
+        assert ingestor.ledger.processed_deal_count() == 0
+        assert ingestor.ledger.ingestion.has_successful_scan is False
+        assert store.path.read_text(encoding="utf-8") == snapshot_before
+
+    def test_valid_fingerprint_admitted(self, tmp_path, monkeypatch):
+        store, ingestor = _setup(tmp_path, monkeypatch)
+        out = ingestor.apply_scan(
+            _res(HISTORY_COMPLETE, [_deposit(1, 5.0, time=AT)]),
+            account_fingerprint=FP,
+        )
+        assert out.status is IngestionStatus.APPLIED
+
+    def test_wrong_identity_does_not_advance_cursor(self, tmp_path, monkeypatch):
+        store, ingestor = _setup(tmp_path, monkeypatch)
+        other = account_fingerprint(server=SERVER, account_id="1000002")
+        with pytest.raises(AccountIdentityError):
+            ingestor.apply_scan(
+                _res(HISTORY_COMPLETE, [_deposit(1, 5.0, time=AT)]),
+                account_fingerprint=other,
+            )
+        assert ingestor.ledger.ingestion.has_successful_scan is False
+        assert store.load().ingestion.has_successful_scan is False
+
+    @pytest.mark.parametrize("status", [HISTORY_COMPLETE, HISTORY_EMPTY_CONFIRMED])
+    def test_deals_none_is_not_a_false_empty_confirmed(
+        self, tmp_path, monkeypatch, status
+    ):
+        store, ingestor = _setup(tmp_path, monkeypatch)
+        malformed = DealHistoryResult(AT, TO, status, None)
+        with pytest.raises(ScanRejectedError):
+            ingestor.apply_scan(malformed, account_fingerprint=FP)
+        assert ingestor.ledger.ingestion.has_successful_scan is False
+        assert store.load().ingestion.has_successful_scan is False

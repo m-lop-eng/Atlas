@@ -842,3 +842,9 @@ class TestDealTimeMsc:
         snap["state_version"] = 3
         with pytest.raises(MT5AccountStateVersionError):
             MT5AccountLedger.from_snapshot(snap)
+
+    def test_state_version_2_rejected(self):
+        snap = _ledger().to_snapshot()
+        snap["state_version"] = 2
+        with pytest.raises(MT5AccountStateVersionError):
+            MT5AccountLedger.from_snapshot(snap)
