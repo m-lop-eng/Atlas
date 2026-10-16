@@ -45,9 +45,12 @@ MT5_ACCOUNTING_SCHEMA_VERSION = 1
 #   * v3 (05C-INGESTION): anade el estado DURABLE de ingestion (`ingestion`:
 #     cursor `last_successful_scan_to` + intervalo y status de la ultima
 #     consulta exitosa).
+#   * v4 (05D-SCAN-APPLY): anade `time_msc` al deal contable (identidad/orden
+#     con resolucion de milisegundos). Cambia la ESTRUCTURA persistida de
+#     `MT5Deal`; los snapshots v1-v3 NO se migran (no se inventa `time_msc`).
 # Los payloads de versiones anteriores NO se interpretan con defaults: se
 # rechazan con `MT5AccountStateVersionError`.
-MT5_ACCOUNTING_STATE_VERSION = 3
+MT5_ACCOUNTING_STATE_VERSION = 4
 
 # Constantes oficiales MQL5 (ENUM_DEAL_TYPE / ENUM_DEAL_ENTRY), definidas localmente
 # para no depender del paquete MetaTrader5 (import perezoso innecesario offline).
@@ -463,6 +466,7 @@ class MT5Deal:
     swap: float
     fee: float
     time: datetime
+    time_msc: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -524,8 +528,22 @@ def _validate_deal(deal: MT5Deal) -> None:
         v = getattr(deal, name)
         if isinstance(v, bool) or not isinstance(v, (int, float)):
             raise InvalidDealError(f"{name} debe ser numerico")
-    if not isinstance(deal.time, datetime) or deal.time.tzinfo is None:
+    if (
+        not isinstance(deal.time, datetime)
+        or deal.time.tzinfo is None
+        or deal.time.utcoffset() is None
+    ):
         raise InvalidDealError("time debe ser datetime con zona horaria")
+    if isinstance(deal.time_msc, bool) or not isinstance(deal.time_msc, int):
+        raise InvalidDealError("time_msc debe ser int")
+    try:
+        expected = datetime.fromtimestamp(deal.time_msc // 1000, tz=timezone.utc)
+    except (OverflowError, OSError, ValueError) as exc:
+        raise InvalidDealError(f"time_msc fuera de rango: {deal.time_msc!r}") from exc
+    if deal.time.astimezone(timezone.utc) != expected:
+        # El segundo de `time` debe coincidir EXACTAMENTE con `time_msc // 1000`.
+        # NO se redondea ni se coerciona en silencio: un desajuste se rechaza.
+        raise InvalidDealError("time incoherente con time_msc (segundo distinto)")
 
 
 def classify_deal(deal: MT5Deal) -> DealEvent:
@@ -625,6 +643,13 @@ def _require_number(value: object, field: str) -> float:
     if not math.isfinite(f):
         raise MT5AccountingError(f"{field} no finito")
     return f
+
+
+def _require_int(value: object, field: str) -> int:
+    """Entero estricto (rechaza bool/float/str/None; sin coercion)."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise MT5AccountingError(f"{field} debe ser int")
+    return value
 
 
 def _parse_utc(value: object, field: str) -> datetime:
@@ -765,6 +790,7 @@ def _deal_to_dict(deal: MT5Deal) -> dict:
         "swap": deal.swap,
         "fee": deal.fee,
         "time": deal.time.isoformat(),
+        "time_msc": deal.time_msc,
     }
 
 
@@ -773,7 +799,7 @@ def _deal_from_dict(d: object) -> MT5Deal:
         raise MT5AccountingError("deal del snapshot no es dict")
     required = (
         "account_fingerprint", "ticket", "order", "type", "volume", "price",
-        "profit", "commission", "swap", "fee", "time",
+        "profit", "commission", "swap", "fee", "time", "time_msc",
     )
     missing = [k for k in required if k not in d]
     if missing:
@@ -793,6 +819,7 @@ def _deal_from_dict(d: object) -> MT5Deal:
         swap=d["swap"],
         fee=d["fee"],
         time=_parse_utc(d["time"], "deal.time"),
+        time_msc=_require_int(d["time_msc"], "deal.time_msc"),
     )
     _validate_deal(deal)
     return deal

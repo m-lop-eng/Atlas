@@ -95,12 +95,20 @@ class PersistenceResult(str, Enum):
 
 
 def _snapshot_is_empty(ledger: MT5AccountLedger) -> bool:
-    """True solo si el ledger no contiene ESTADO mas alla de su baseline."""
+    """True solo si el ledger no contiene ESTADO mas alla de su baseline.
+
+    El PROGRESO de ingestion (`ingestion.has_successful_scan`) ES estado: un
+    snapshot con una consulta exitosa registrada NO es vacio aunque no tenga
+    posiciones, movimientos ni deals procesados. Asi `create(overwrite=True)` no
+    puede destruir silenciosamente el progreso de ingestion sin `destructive=True`.
+    """
     if len(ledger.positions()) != 0:
         return False
     if ledger.processed_deal_count() != 0:
         return False
     if len(ledger.movement_records()) != 0:
+        return False
+    if ledger.ingestion.has_successful_scan:
         return False
     if abs(ledger.realized_pnl) > _EMPTY_EPS:
         return False

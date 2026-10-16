@@ -92,6 +92,11 @@ def _deal(**over):
         time=BASELINE_AT,
     )
     fields.update(over)
+    if "time_msc" not in fields:
+        t = fields.get("time")
+        fields["time_msc"] = (
+            int(t.timestamp()) * 1000 if isinstance(t, datetime) else 0
+        )
     return MT5Deal(**fields)
 
 
@@ -794,3 +799,46 @@ class TestModelSeparation:
             client_order_id="S-1", fill_sequence=0,
         )
         assert spot.cash == pytest.approx(9900.0)
+
+
+class TestDealTimeMsc:
+    """05D-SCAN-APPLY: `time_msc` en la identidad/estructura persistida del deal."""
+
+    _BASE_MS = int(BASELINE_AT.timestamp()) * 1000
+
+    def test_time_msc_roundtrip_and_equality(self):
+        deal = _deal(ticket=1, time=BASELINE_AT, time_msc=self._BASE_MS + 250)
+        ledger = _ledger()
+        ledger.apply_deal(deal)
+        snap = ledger.to_snapshot()
+        assert snap["processed"][0]["deal"]["time_msc"] == self._BASE_MS + 250
+        restored = MT5AccountLedger.from_snapshot(snap)
+        stored, _kind = restored.processed_deals_in_order()[0]
+        assert stored == deal
+        assert stored.time_msc == self._BASE_MS + 250
+
+    def test_incoherent_time_msc_rejected(self):
+        with pytest.raises(InvalidDealError):
+            _ledger().apply_deal(
+                _deal(time=BASELINE_AT, time_msc=self._BASE_MS + 1000)
+            )
+
+    def test_non_integer_time_msc_rejected(self):
+        with pytest.raises(InvalidDealError):
+            _ledger().apply_deal(_deal(time_msc=1.5))  # type: ignore[arg-type]
+        with pytest.raises(InvalidDealError):
+            _ledger().apply_deal(_deal(time_msc=True))  # type: ignore[arg-type]
+
+    def test_missing_time_msc_in_snapshot_rejected(self):
+        ledger = _ledger()
+        ledger.apply_deal(_deal(ticket=1))
+        snap = ledger.to_snapshot()
+        del snap["processed"][0]["deal"]["time_msc"]
+        with pytest.raises(MT5AccountingError):
+            MT5AccountLedger.from_snapshot(snap)
+
+    def test_state_version_3_rejected(self):
+        snap = _ledger().to_snapshot()
+        snap["state_version"] = 3
+        with pytest.raises(MT5AccountStateVersionError):
+            MT5AccountLedger.from_snapshot(snap)

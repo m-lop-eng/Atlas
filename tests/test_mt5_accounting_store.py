@@ -94,6 +94,9 @@ def _deal(**over):
         time=AT,
     )
     fields.update(over)
+    if "time_msc" not in fields:
+        t = fields.get("time")
+        fields["time_msc"] = int(t.timestamp()) * 1000 if isinstance(t, datetime) else 0
     return MT5Deal(**fields)
 
 
@@ -109,7 +112,7 @@ def _deal_dict(**over):
         account_fingerprint=FP, ticket=1, order=1, type=DEAL_TYPE_BUY,
         entry=DEAL_ENTRY_IN, position_id=100, symbol="EURUSD", volume=1.0,
         price=1.10, profit=0.0, commission=0.0, swap=0.0, fee=0.0,
-        time=AT.isoformat(),
+        time=AT.isoformat(), time_msc=int(AT.timestamp()) * 1000,
     )
     fields.update(over)
     return fields
