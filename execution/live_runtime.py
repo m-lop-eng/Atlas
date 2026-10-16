@@ -100,6 +100,11 @@ class LiveExecutionRuntime:
     # ATLAS-MT5-HEDGING-01: opt-in explicito restringido (una posicion Atlas por
     # simbolo). Por defecto False: HEDGING no se habilita solo por margin_mode.
     allow_restricted_hedging: bool = False
+    # ATLAS-MT5-ACCOUNTING-05G: autoridad de admision contable MT5 (fail-closed).
+    # Requerida para un broker que marque `requires_accounting_admission` (el
+    # adaptador MT5 lo hace). NO es un flag para desactivar la contabilidad: si el
+    # adaptador la exige y falta el componente, el arranque se BLOQUEA.
+    mt5_accounting: Any | None = None
 
     _coordinator: LiveExecutionCoordinator = field(init=False, default=None)
     _applier: LedgerApplier = field(init=False, default=None)
@@ -166,6 +171,10 @@ class LiveExecutionRuntime:
         env = getattr(self.broker, "environment", None)
         value = getattr(env, "value", env)
         return str(value).upper() == "DEMO"
+
+    def _mt5_accounting_required(self) -> bool:
+        """True si el broker EXIGE admision contable MT5 (adaptador MT5)."""
+        return bool(getattr(self.broker, "requires_accounting_admission", False))
 
     def initialize(self) -> ReadinessReport:
         """Secuencia de arranque fail-closed. Devuelve el informe de preparacion."""
@@ -288,6 +297,33 @@ class LiveExecutionRuntime:
             return self._not_ready(
                 "kill_switch", f"kill switch {ks_state.value}", primed, tuple(resolved), 0, report
             )
+
+        # 7b) admision contable MT5 (fail-closed; requerida por el adaptador MT5).
+        #     Se evalua DESPUES de la reconciliacion SPOT para que un exito previo
+        #     NO compense un fallo del ledger MT5.
+        if self._mt5_accounting_required() and self.mt5_accounting is None:
+            return self._not_ready(
+                "mt5_accounting",
+                "adaptador MT5 sin componente de admision contable (fail-closed)",
+                primed, tuple(resolved), 0, report,
+            )
+        if self.mt5_accounting is not None:
+            try:
+                admission = self.mt5_accounting.initialize(self.broker)
+            except Exception as exc:  # noqa: BLE001 - fail-closed
+                return self._not_ready(
+                    "mt5_accounting",
+                    f"admision contable MT5 fallo ({type(exc).__name__})",
+                    primed, tuple(resolved), 0, report,
+                )
+            if not bool(getattr(admission, "admitted", False)):
+                return self._not_ready(
+                    "mt5_accounting",
+                    "admision contable MT5: "
+                    f"{getattr(admission, 'stage', '?')}: "
+                    f"{getattr(admission, 'reason', '?')}",
+                    primed, tuple(resolved), 0, report,
+                )
 
         # 8) preparado
         self._ready = True
@@ -501,6 +537,20 @@ class LiveExecutionRuntime:
             raise RuntimeNotReadyError(
                 f"reconciliacion {self._last_report.status.value}: operacion bloqueada"
             )
+        # Gate contable MT5: no existe camino alternativo (submit/cancel/close/reduce
+        # pasan todos por aqui). Si el adaptador lo exige y falta el componente, o
+        # este no esta admitido, se bloquea.
+        if self._mt5_accounting_required() and self.mt5_accounting is None:
+            raise RuntimeNotReadyError(
+                "admisión contable MT5 ausente: runtime bloqueado (fail-closed)"
+            )
+        if self.mt5_accounting is not None:
+            try:
+                self.mt5_accounting.ensure_admitted()
+            except Exception as exc:  # noqa: BLE001
+                raise RuntimeNotReadyError(
+                    f"admisión contable MT5 no satisfecha: {exc}"
+                ) from exc
 
     def _post_operation(self, out: ExecutionOutcome) -> ExecutionOutcome:
         submission = getattr(out, "submission", None)
@@ -512,6 +562,13 @@ class LiveExecutionRuntime:
         # HEDGING restringido: vincula durablemente cid -> POSITION_IDENTIFIER.
         self._link_open_position(out)
         report = self.reconcile_now()
+        # Admision contable MT5: re-valida tras la actividad del broker. Si falla,
+        # el estado de admision queda BLOQUEADO y `_ensure_operable` impide la
+        # siguiente operacion (no basta con que el ledger SPOT haya actualizado).
+        if self.mt5_accounting is not None:
+            refresh = getattr(self.mt5_accounting, "refresh", None)
+            if callable(refresh):
+                refresh(self.broker)
         return out
 
     def submit(self, **kwargs) -> ExecutionOutcome:

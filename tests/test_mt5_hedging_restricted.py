@@ -24,6 +24,7 @@ from tests.test_mt5_execution_foundation import (
     FakeMT5,
     FakeSessions,
     _spec,
+    passing_admission,
 )
 
 from execution.intent_journal import (
@@ -290,7 +291,7 @@ def _hedge_runtime(journal, adapter, ledger_path, marks):
             INSTRUMENT, 3600, OPEN_TIME, CLOSE_TIME),
         data_max_age_s=120.0, account_mode_provider=lambda: 2,
         marks_provider=marks, allow_restricted_hedging=True,
-        clock=lambda: NOW, run_id="RT-HEDGE",
+        clock=lambda: NOW, run_id="RT-HEDGE", mt5_accounting=passing_admission(),
     )
 
 
@@ -505,6 +506,7 @@ class TestJournalPositionLinkage:
             data_max_age_s=120.0, account_mode_provider=lambda: 2,
             marks_provider=lambda: {INSTRUMENT: 1.1},
             allow_restricted_hedging=True, clock=lambda: NOW, run_id="RT-LINK",
+            mt5_accounting=passing_admission(),
         )
         assert rt.initialize().ready is True
         rt.submit(side=OrderSide.BUY, quantity=0.1, strategy_id="s",
@@ -532,6 +534,7 @@ class TestJournalPositionLinkage:
             data_max_age_s=120.0, account_mode_provider=lambda: 2,
             marks_provider=lambda: {INSTRUMENT: 1.1},
             allow_restricted_hedging=True, clock=lambda: NOW, run_id="RT-H",
+            mt5_accounting=passing_admission(),
         )
         rep = rt.initialize()
         assert rep.ready is False and rep.stage == "ownership"

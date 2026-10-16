@@ -21,6 +21,7 @@ from tests.test_mt5_execution_foundation import (
     ORDER_TYPE_SELL,
     FakeMT5,
     FakeSessions,
+    passing_admission,
 )
 
 from execution.instrument import InstrumentSpec
@@ -187,6 +188,7 @@ def _runtime(tmp_path, *, fake=None, journal=None, ledger=None, account_mode=0,
         data_max_age_s=120.0, account_mode_provider=lambda: account_mode,
         marks_provider=lambda: {INSTRUMENT: fake._mark},
         commission_policy=commission_policy, clock=lambda: NOW, run_id="RT",
+        mt5_accounting=passing_admission(),
     )
     return rt, adapter, fake, ledger, journal, store
 
@@ -361,6 +363,7 @@ class TestIdempotencyDurability:
             data_max_age_s=120.0, account_mode_provider=lambda: 0,
             marks_provider=lambda: {INSTRUMENT: fake._mark},
             commission_policy=CommissionPolicy("USD"), clock=lambda: NOW, run_id="RT2",
+            mt5_accounting=passing_admission(),
         )
         rep = rt2.initialize()
         assert rep.ready is True
@@ -514,6 +517,7 @@ class TestHistoryIntegrity:
             data_max_age_s=120.0, account_mode_provider=lambda: 0,
             marks_provider=lambda: {INSTRUMENT: fake._mark},
             commission_policy=CommissionPolicy("USD"), clock=lambda: NOW, run_id="RT2",
+            mt5_accounting=passing_admission(),
         )
         rep = rt2.initialize()
         assert rep.ready is True

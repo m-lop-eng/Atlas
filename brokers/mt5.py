@@ -488,6 +488,29 @@ class DealHistoryResult:
         return self.status == HISTORY_COMPLETE
 
 
+class MT5AccountObservationError(BrokerError):
+    """La cuenta MT5 no expone los campos de identidad/economicos requeridos."""
+
+
+@dataclass(frozen=True, slots=True)
+class MT5AccountSnapshot:
+    """Observacion READ-ONLY de la cuenta MT5 (identidad + economicos basicos).
+
+    Fuente unica: `MetaTrader5.account_info()` (lectura). `credit` se lee del campo
+    reportado y NO se sustituye por cero si falta. NO calcula equity de mercado
+    completa: `equity` es el valor reportado por el broker.
+    """
+
+    server: str
+    login: str
+    login_masked: str
+    currency: str
+    margin_mode: int | None
+    balance: float
+    credit: float
+    equity: float
+
+
 class MT5BrokerAdapter(BrokerAdapter):
     """Adapter real MT5 (DEMO-only en LIVE-09).
 
@@ -537,6 +560,12 @@ class MT5BrokerAdapter(BrokerAdapter):
     @property
     def environment(self) -> MT5Environment:
         return self.config.environment
+
+    # Marcador de CAPACIDAD: el adaptador MT5 EXIGE un gate de admision contable
+    # fail-closed en el runtime. NO es un flag configurable: no puede desactivarse
+    # desde configuracion (evita habilitar un runtime aparentemente listo sin
+    # contabilidad MT5).
+    requires_accounting_admission: bool = True
 
     # -------------------------------------------------------------- lifecycle
 
@@ -736,6 +765,53 @@ class MT5BrokerAdapter(BrokerAdapter):
             buying_power=_finite(getattr(info, "margin_free")),
             currency=str(getattr(info, "currency", "")),
             as_of=self._clock(),
+        )
+
+    def read_account_snapshot(self) -> MT5AccountSnapshot:
+        """Observa identidad + economicos basicos de la cuenta (SOLO LECTURA).
+
+        Requiere estado READY. Falla cerrado si el terminal no expone servidor,
+        login, divisa o credito: NO se inventan valores por defecto (en particular,
+        `credit` ausente NO se sustituye por cero).
+        """
+        self._require_ready()
+        try:
+            info = self._module().account_info()
+        except BrokerError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - transporte/consulta incierta
+            raise BrokerConnectionError(
+                f"account_info fallo ({type(exc).__name__})"
+            ) from exc
+        if info is None:
+            raise BrokerConnectionError("account_info() no disponible")
+        server = getattr(info, "server", None)
+        if not isinstance(server, str) or not server.strip():
+            raise MT5AccountObservationError("servidor no observable en account_info()")
+        login = getattr(info, "login", None)
+        if login is None or isinstance(login, bool):
+            raise MT5AccountObservationError("login no observable en account_info()")
+        currency = getattr(info, "currency", None)
+        if not isinstance(currency, str) or not currency.strip():
+            raise MT5AccountObservationError("divisa no observable en account_info()")
+        credit = getattr(info, "credit", None)
+        if credit is None:
+            raise MT5AccountObservationError("credit no observable en account_info()")
+        raw_mode = getattr(info, "margin_mode", None)
+        margin_mode = (
+            int(raw_mode)
+            if isinstance(raw_mode, int) and not isinstance(raw_mode, bool)
+            else None
+        )
+        return MT5AccountSnapshot(
+            server=server.strip(),
+            login=str(login),
+            login_masked="***" + str(login)[-4:],
+            currency=currency.strip(),
+            margin_mode=margin_mode,
+            balance=_finite(getattr(info, "balance")),
+            credit=_finite(credit),
+            equity=_finite(getattr(info, "equity")),
         )
 
     # ---------------------------------------------------------------- simbolos
@@ -1690,6 +1766,8 @@ class MT5BrokerAdapter(BrokerAdapter):
 
 __all__ = [
     "DealHistoryResult",
+    "MT5AccountObservationError",
+    "MT5AccountSnapshot",
     "MT5BrokerAdapter",
     "MT5Config",
     "MT5ConfigError",

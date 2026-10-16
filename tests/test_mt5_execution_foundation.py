@@ -305,6 +305,40 @@ class Recorder:
         self._log.append(self._label)
 
 
+class _PassAdmissionReport:
+    """Informe de admision contable MT5 ya satisfecho (stub de tests)."""
+
+    admitted = True
+    stage = "admitted"
+    reason = "stub"
+
+
+class PassingAdmission:
+    """Stub de admision contable MT5 SIEMPRE admitida.
+
+    Para tests de runtime NO contables (ledger SPOT). No valida nada: solo evita
+    que el gate obligatorio del adaptador MT5 bloquee escenarios ajenos a la
+    contabilidad MT5. Los tests de admision usan la autoridad REAL
+    (`execution.mt5_admission.MT5AccountingAdmission`).
+    """
+
+    admitted = True
+    report = _PassAdmissionReport()
+
+    def initialize(self, broker):  # noqa: D401 - stub
+        return self.report
+
+    def refresh(self, broker):
+        return self.report
+
+    def ensure_admitted(self) -> None:
+        return None
+
+
+def passing_admission() -> PassingAdmission:
+    return PassingAdmission()
+
+
 # --------------------------------------------------------------------------
 # Helpers
 # --------------------------------------------------------------------------
