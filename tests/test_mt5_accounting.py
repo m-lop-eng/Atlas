@@ -40,6 +40,9 @@ from execution.mt5_accounting import (
     AccountingEpoch,
     AccountingEpochError,
     BaselineOrigin,
+    IngestionScanStatus,
+    IngestionState,
+    IngestionStateError,
     MT5AccountStateVersionError,
 )
 from papertrading.ledger import AccountLedger
@@ -189,6 +192,102 @@ class TestBaseline:
             MT5AccountLedger.from_snapshot(snap)
         snap["epoch"] = {"origin": "RECONSTRUCTED", "continuity_verified": True}
         with pytest.raises(AccountingEpochError):
+            MT5AccountLedger.from_snapshot(snap)
+
+
+_TO = datetime(2026, 1, 2, tzinfo=UTC)
+
+
+class TestIngestionState:
+    def _ledger_ing(self, state):
+        return MT5AccountLedger(_baseline(), ingestion=state)
+
+    def test_initial_has_no_successful_scan(self):
+        ledger = _ledger()
+        ing = ledger.ingestion
+        assert ing.has_successful_scan is False
+        assert ing.last_successful_scan_from is None
+        assert ing.last_successful_scan_to is None
+        assert ing.status is None
+        assert ledger.to_snapshot()["ingestion"] == {
+            "last_successful_scan_from": None,
+            "last_successful_scan_to": None,
+            "status": None,
+        }
+
+    def test_roundtrip_complete_interval(self):
+        state = IngestionState(BASELINE_AT, _TO, IngestionScanStatus.COMPLETE)
+        restored = MT5AccountLedger.from_snapshot(self._ledger_ing(state).to_snapshot())
+        assert restored.ingestion.has_successful_scan is True
+        assert restored.ingestion.status is IngestionScanStatus.COMPLETE
+        assert restored.ingestion.last_successful_scan_from == BASELINE_AT
+        assert restored.ingestion.last_successful_scan_to == _TO
+
+    def test_roundtrip_empty_confirmed(self):
+        state = IngestionState(BASELINE_AT, BASELINE_AT, IngestionScanStatus.EMPTY_CONFIRMED)
+        restored = MT5AccountLedger.from_snapshot(self._ledger_ing(state).to_snapshot())
+        assert restored.ingestion.status is IngestionScanStatus.EMPTY_CONFIRMED
+
+    def test_utc_normalization(self):
+        tz2 = timezone(timedelta(hours=2))
+        state = IngestionState(
+            datetime(2026, 1, 1, 2, 0, tzinfo=tz2),
+            datetime(2026, 1, 1, 3, 0, tzinfo=tz2),
+            IngestionScanStatus.COMPLETE,
+        )
+        assert state.last_successful_scan_from == datetime(2026, 1, 1, 0, 0, tzinfo=UTC)
+        assert state.last_successful_scan_to == datetime(2026, 1, 1, 1, 0, tzinfo=UTC)
+
+    def test_naive_rejected(self):
+        with pytest.raises(IngestionStateError):
+            IngestionState(datetime(2026, 1, 1), _TO, IngestionScanStatus.COMPLETE)
+
+    def test_from_after_to_rejected(self):
+        with pytest.raises(IngestionStateError):
+            IngestionState(_TO, BASELINE_AT, IngestionScanStatus.COMPLETE)
+
+    def test_partial_or_incoherent_fields_rejected(self):
+        with pytest.raises(IngestionStateError):
+            IngestionState(last_successful_scan_from=BASELINE_AT)
+        with pytest.raises(IngestionStateError):
+            IngestionState(last_successful_scan_to=BASELINE_AT)
+        with pytest.raises(IngestionStateError):
+            IngestionState(status=IngestionScanStatus.COMPLETE)
+        with pytest.raises(IngestionStateError):  # intervalo sin status
+            IngestionState(BASELINE_AT, BASELINE_AT, None)
+
+    def test_invalid_status_rejected(self):
+        with pytest.raises(IngestionStateError):
+            IngestionState(BASELINE_AT, BASELINE_AT, "INCOMPLETE")
+        with pytest.raises(IngestionStateError):
+            IngestionState(BASELINE_AT, BASELINE_AT, 1)
+
+    def test_status_coerced_from_string(self):
+        assert (
+            IngestionState(BASELINE_AT, BASELINE_AT, "COMPLETE").status
+            is IngestionScanStatus.COMPLETE
+        )
+
+    def test_ingestion_does_not_change_is_complete_or_continuity(self):
+        state = IngestionState(BASELINE_AT, _TO, IngestionScanStatus.COMPLETE)
+        ledger = self._ledger_ing(state)
+        assert ledger.is_complete is True
+        assert ledger.continuity_verified is False
+
+    def test_snapshot_missing_ingestion_rejected(self):
+        snap = _ledger().to_snapshot()
+        del snap["ingestion"]
+        with pytest.raises(IngestionStateError):
+            MT5AccountLedger.from_snapshot(snap)
+
+    def test_snapshot_invalid_ingestion_rejected(self):
+        snap = _ledger().to_snapshot()
+        snap["ingestion"] = {
+            "last_successful_scan_from": None,
+            "last_successful_scan_to": None,
+            "status": "INCOMPLETE",
+        }
+        with pytest.raises(IngestionStateError):
             MT5AccountLedger.from_snapshot(snap)
 
     @pytest.mark.parametrize("over", [

@@ -29,6 +29,8 @@ from execution.mt5_accounting import (
     AccountingEpochError,
     BaselineOrigin,
     DealIdentityCollisionError,
+    IngestionScanStatus,
+    IngestionState,
     UnsupportedDealError,
     account_fingerprint,
 )
@@ -776,3 +778,86 @@ class TestAccountingEpochPersistence:
         store.path.write_text(json.dumps(raw), encoding="utf-8")
         with pytest.raises(SnapshotCorruptError):
             store.load()
+
+
+# --------------------------------------------------------------------------
+# 05C-INGESTION: estado durable de ingestion y cursor (mismo snapshot)
+# --------------------------------------------------------------------------
+
+_TO = datetime(2026, 1, 2, tzinfo=UTC)
+
+
+class TestIngestionStatePersistence:
+    def test_create_has_no_successful_scan(self, tmp_path):
+        store = _store(tmp_path)
+        ledger = store.create(_baseline())
+        assert ledger.ingestion.has_successful_scan is False
+        loaded = store.load()
+        assert loaded.ingestion.has_successful_scan is False
+        assert loaded.ingestion.last_successful_scan_to is None
+        assert loaded.ingestion.status is None
+
+    def test_save_load_preserves_ingestion_interval(self, tmp_path):
+        store = _store(tmp_path)
+        ledger = store.create(_baseline())
+        ledger._ingestion = IngestionState(
+            AT, _TO, IngestionScanStatus.COMPLETE
+        )
+        store.save(ledger, overwrite=True)
+        loaded = store.load()
+        assert loaded.ingestion.status is IngestionScanStatus.COMPLETE
+        assert loaded.ingestion.last_successful_scan_from == AT
+        assert loaded.ingestion.last_successful_scan_to == _TO
+        # baseline/epoca/ledger preservados conjuntamente.
+        assert loaded.balance == pytest.approx(10000.0)
+        assert loaded.origin is BaselineOrigin.DECLARED
+        assert loaded.continuity_verified is False
+
+    def test_empty_confirmed_scan_preserved(self, tmp_path):
+        store = _store(tmp_path)
+        ledger = store.create(_baseline())
+        ledger._ingestion = IngestionState(
+            AT, AT, IngestionScanStatus.EMPTY_CONFIRMED
+        )
+        store.save(ledger, overwrite=True)
+        assert store.load().ingestion.status is IngestionScanStatus.EMPTY_CONFIRMED
+
+    def test_snapshot_missing_ingestion_rejected(self, tmp_path):
+        store = _store(tmp_path)
+        store.create(_baseline())
+        raw = _read(store)
+        del raw["accounting"]["ingestion"]
+        store.path.write_text(json.dumps(raw), encoding="utf-8")
+        with pytest.raises(SnapshotCorruptError):
+            store.load()
+
+    def test_old_state_version_2_rejected(self, tmp_path):
+        store = _store(tmp_path)
+        store.create(_baseline())
+        raw = _read(store)
+        raw["accounting"]["state_version"] = 2
+        store.path.write_text(json.dumps(raw), encoding="utf-8")
+        with pytest.raises(SnapshotVersionError):
+            store.load()
+
+    def test_failed_save_preserves_previous_snapshot(self, tmp_path):
+        store = _store(tmp_path)
+        ledger = store.create(_baseline())
+        # Ingesta parcial (invalida) via mutacion normal => save() revalida y falla.
+        ledger._ingestion = SimpleNamespace(
+            last_successful_scan_from=AT, last_successful_scan_to=None, status=None
+        )
+        with pytest.raises(MT5AccountingStoreError):
+            store.save(ledger, overwrite=True)
+        assert store.load().ingestion.has_successful_scan is False
+
+    def test_ingestion_does_not_mark_continuity_verified(self, tmp_path):
+        store = _store(tmp_path)
+        ledger = store.create(_baseline())
+        ledger._ingestion = IngestionState(
+            AT, _TO, IngestionScanStatus.COMPLETE
+        )
+        store.save(ledger, overwrite=True)
+        loaded = store.load()
+        assert loaded.continuity_verified is False
+        assert loaded.origin is BaselineOrigin.DECLARED

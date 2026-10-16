@@ -36,14 +36,18 @@ import hashlib
 import math
 import re
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 
 MT5_ACCOUNTING_SCHEMA_VERSION = 1
 # Version del payload de ESTADO serializable (snapshot del ledger).
-# v2 (05B): anade la metadata de EPOCA contable (`epoch`). Los payloads v1 NO se
-# interpretan con defaults: se rechazan con `MT5AccountStateVersionError`.
-MT5_ACCOUNTING_STATE_VERSION = 2
+#   * v2 (05B): anade la metadata de EPOCA contable (`epoch`).
+#   * v3 (05C-INGESTION): anade el estado DURABLE de ingestion (`ingestion`:
+#     cursor `last_successful_scan_to` + intervalo y status de la ultima
+#     consulta exitosa).
+# Los payloads de versiones anteriores NO se interpretan con defaults: se
+# rechazan con `MT5AccountStateVersionError`.
+MT5_ACCOUNTING_STATE_VERSION = 3
 
 # Constantes oficiales MQL5 (ENUM_DEAL_TYPE / ENUM_DEAL_ENTRY), definidas localmente
 # para no depender del paquete MetaTrader5 (import perezoso innecesario offline).
@@ -128,6 +132,10 @@ class MT5AccountStateVersionError(MT5AccountingError):
 
 class AccountingEpochError(MT5AccountingError):
     """Metadata de epoca contable ausente, mal formada o contradictoria."""
+
+
+class IngestionStateError(MT5AccountingError):
+    """Estado de ingestion ausente, mal formado o incoherente."""
 
 
 class DealEventKind(str, Enum):
@@ -244,6 +252,91 @@ class AccountingEpoch:
             raise AccountingEpochError(
                 "una baseline DECLARED no puede declarar continuidad verificada"
             )
+
+
+class IngestionScanStatus(str, Enum):
+    """Resultado de la ULTIMA consulta de historial completada con exito.
+
+    NO se acopla a `brokers.mt5` (capa broker): mismos valores semanticos
+    (`HISTORY_COMPLETE`/`HISTORY_EMPTY_CONFIRMED`).
+    """
+
+    COMPLETE = "COMPLETE"
+    EMPTY_CONFIRMED = "EMPTY_CONFIRMED"
+
+
+@dataclass(frozen=True, slots=True)
+class IngestionState:
+    """Estado DURABLE de ingestion historica (mismo snapshot que el ledger).
+
+    Registra la ULTIMA consulta de `deal_history` completada con EXITO. NO es
+    evidencia de cobertura historica global: `COMPLETE`/`EMPTY_CONFIRMED` solo
+    describen el intervalo solicitado; no demuestran ausencia de huecos ni de
+    eventos tardios, ni habilitan continuidad verificada.
+
+    Invariantes:
+      * Sin consultas previas: `from`/`to`/`status` a `None` (sin cursor ficticio).
+      * `from`/`to` presentes juntos o ausentes juntos, normalizados a UTC.
+      * `from <= to`.
+      * `status ∈ {COMPLETE, EMPTY_CONFIRMED}`, presente si y solo si hay intervalo.
+    """
+
+    last_successful_scan_from: datetime | None = None
+    last_successful_scan_to: datetime | None = None
+    status: IngestionScanStatus | None = None
+
+    def __post_init__(self) -> None:
+        frm = self.last_successful_scan_from
+        to = self.last_successful_scan_to
+        status = self.status
+        if (frm is None) != (to is None):
+            raise IngestionStateError(
+                "intervalo de ingesta parcial: from/to deben estar juntos o ausentes"
+            )
+        if frm is None:
+            if status is not None:
+                raise IngestionStateError(
+                    "status de ingesta sin intervalo de consulta"
+                )
+            return
+        if (
+            not isinstance(frm, datetime)
+            or frm.tzinfo is None
+            or frm.utcoffset() is None
+        ):
+            raise IngestionStateError(
+                "last_successful_scan_from debe ser datetime con zona (UTC), no naive"
+            )
+        if (
+            not isinstance(to, datetime)
+            or to.tzinfo is None
+            or to.utcoffset() is None
+        ):
+            raise IngestionStateError(
+                "last_successful_scan_to debe ser datetime con zona (UTC), no naive"
+            )
+        frm = frm.astimezone(timezone.utc)
+        to = to.astimezone(timezone.utc)
+        if frm > to:
+            raise IngestionStateError(
+                "last_successful_scan_from no puede ser posterior a _to"
+            )
+        if status is None:
+            raise IngestionStateError("intervalo de ingesta sin status")
+        if not isinstance(status, IngestionScanStatus):
+            try:
+                status = IngestionScanStatus(status)
+            except ValueError:
+                raise IngestionStateError(
+                    f"status de ingesta invalido: {status!r}"
+                ) from None
+        object.__setattr__(self, "last_successful_scan_from", frm)
+        object.__setattr__(self, "last_successful_scan_to", to)
+        object.__setattr__(self, "status", status)
+
+    @property
+    def has_successful_scan(self) -> bool:
+        return self.last_successful_scan_to is not None
 
 
 @dataclass(frozen=True, slots=True)
@@ -571,6 +664,48 @@ def _epoch_from_dict(d: object) -> AccountingEpoch:
     )
 
 
+def _ingestion_to_dict(state: IngestionState) -> dict:
+    return {
+        "last_successful_scan_from": (
+            None
+            if state.last_successful_scan_from is None
+            else state.last_successful_scan_from.isoformat()
+        ),
+        "last_successful_scan_to": (
+            None
+            if state.last_successful_scan_to is None
+            else state.last_successful_scan_to.isoformat()
+        ),
+        "status": None if state.status is None else state.status.value,
+    }
+
+
+def _ingestion_from_dict(d: object) -> IngestionState:
+    if not isinstance(d, dict):
+        raise IngestionStateError("ingestion del snapshot no es dict")
+    for key in ("last_successful_scan_from", "last_successful_scan_to", "status"):
+        if key not in d:
+            raise IngestionStateError(f"ingestion sin `{key}`")
+    frm_raw = d["last_successful_scan_from"]
+    to_raw = d["last_successful_scan_to"]
+    status_raw = d["status"]
+    frm = (
+        None
+        if frm_raw is None
+        else _parse_utc(frm_raw, "last_successful_scan_from")
+    )
+    to = (
+        None
+        if to_raw is None
+        else _parse_utc(to_raw, "last_successful_scan_to")
+    )
+    return IngestionState(
+        last_successful_scan_from=frm,
+        last_successful_scan_to=to,
+        status=None if status_raw is None else status_raw,
+    )
+
+
 def _baseline_to_dict(baseline: MT5AccountBaseline) -> dict:
     return {
         "schema_version": baseline.schema_version,
@@ -860,6 +995,7 @@ class MT5AccountLedger:
         baseline: MT5AccountBaseline,
         *,
         epoch: AccountingEpoch | None = None,
+        ingestion: IngestionState | None = None,
         reconciliation_tolerance_abs: float = _DEFAULT_MONEY_EPS,
         reconciliation_tolerance_rel: float = _DEFAULT_MONEY_EPS,
     ) -> None:
@@ -871,6 +1007,11 @@ class MT5AccountLedger:
             epoch = AccountingEpoch(BaselineOrigin.DECLARED)
         elif not isinstance(epoch, AccountingEpoch):
             raise AccountingEpochError("epoch debe ser AccountingEpoch")
+        if ingestion is None:
+            # Sin consultas exitosas previas: SIN cursor ficticio.
+            ingestion = IngestionState()
+        elif not isinstance(ingestion, IngestionState):
+            raise IngestionStateError("ingestion debe ser IngestionState")
         for name, value in (
             ("reconciliation_tolerance_abs", reconciliation_tolerance_abs),
             ("reconciliation_tolerance_rel", reconciliation_tolerance_rel),
@@ -879,6 +1020,7 @@ class MT5AccountLedger:
                 raise MT5AccountingError(f"{name} debe ser finito y >= 0")
         self._baseline = baseline
         self._epoch = epoch
+        self._ingestion = ingestion
         self._balance = float(baseline.balance)
         self._credit = float(baseline.credit)
         self._realized_pnl = 0.0
@@ -916,6 +1058,10 @@ class MT5AccountLedger:
     @property
     def continuity_verified(self) -> bool:
         return self._epoch.continuity_verified
+
+    @property
+    def ingestion(self) -> IngestionState:
+        return self._ingestion
 
     @property
     def balance(self) -> float:
@@ -975,6 +1121,7 @@ class MT5AccountLedger:
             "state_version": MT5_ACCOUNTING_STATE_VERSION,
             "baseline": _baseline_to_dict(self._baseline),
             "epoch": _epoch_to_dict(self._epoch),
+            "ingestion": _ingestion_to_dict(self._ingestion),
             "balance": self._balance,
             "credit": self._credit,
             "realized_pnl": self._realized_pnl,
@@ -1024,6 +1171,7 @@ class MT5AccountLedger:
             )
         baseline = _baseline_from_dict(snapshot.get("baseline"))
         epoch = _epoch_from_dict(snapshot.get("epoch"))
+        ingestion = _ingestion_from_dict(snapshot.get("ingestion"))
 
         balance = _require_number(snapshot.get("balance"), "balance")
         credit = _require_number(snapshot.get("credit"), "credit")
@@ -1073,6 +1221,7 @@ class MT5AccountLedger:
         result._complete = complete
         result._incomplete_reason = reason
         result._epoch = epoch
+        result._ingestion = ingestion
         return result
 
     # -------------------------------------------------------------- apply
