@@ -24,6 +24,7 @@ ausencia de huecos historicos.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Any, Callable
 
@@ -49,6 +50,23 @@ from execution.mt5_ingestion import (
 )
 
 _SUCCESS_STATUSES = frozenset({HISTORY_COMPLETE, HISTORY_EMPTY_CONFIRMED})
+_UTC = timezone.utc
+
+
+def _now_utc() -> datetime:
+    return datetime.now(_UTC)
+
+
+def _norm_utc(value: object, field_name: str) -> datetime:
+    if (
+        not isinstance(value, datetime)
+        or value.tzinfo is None
+        or value.utcoffset() is None
+    ):
+        raise MT5AdmissionError(
+            f"{field_name} debe ser datetime con zona horaria (UTC), no naive"
+        )
+    return value.astimezone(_UTC)
 
 
 class MT5AdmissionError(MT5AccountingError):
@@ -90,12 +108,28 @@ class MT5AccountingAdmission:
     """
 
     store: MT5AccountingStore
-    history_provider: Callable[[], DealHistoryResult]
+    # El provider recibe EXPLICITAMENTE el intervalo acotado (frm, to) y debe
+    # consultar EXACTAMENTE ese intervalo (p. ej. `adapter.deal_history(frm, to)`).
+    history_provider: Callable[[datetime, datetime], DealHistoryResult]
+    # Fuente temporal explicita del limite final (normalizada a UTC).
+    clock: Callable[[], datetime] = _now_utc
+    # Solapamiento declarado para consultas posteriores (segundos, >= 0). 0 = sin
+    # solapamiento. Nunca deja que el inicio retroceda por debajo de
+    # `baseline.coverage_from`.
+    overlap_seconds: int = 0
     tolerance: float = 1e-9
 
     _ingestor: MT5AccountIngestor | None = field(init=False, default=None)
     _admitted: bool = field(init=False, default=False)
     _report: MT5AdmissionReport | None = field(init=False, default=None)
+
+    def __post_init__(self) -> None:
+        if isinstance(self.overlap_seconds, bool) or not isinstance(
+            self.overlap_seconds, int
+        ):
+            raise MT5AdmissionError("overlap_seconds debe ser int")
+        if self.overlap_seconds < 0:
+            raise MT5AdmissionError("overlap_seconds no puede ser negativo")
 
     # ------------------------------------------------------------- estado
 
@@ -136,6 +170,38 @@ class MT5AccountingAdmission:
         report = MT5AdmissionReport(MT5AdmissionState.BLOCKED, stage, reason)
         self._report = report
         return report
+
+    def _clock_utc(self) -> datetime:
+        value = self.clock()
+        if (
+            not isinstance(value, datetime)
+            or value.tzinfo is None
+            or value.utcoffset() is None
+        ):
+            raise MT5AdmissionError("el reloj no devuelve datetime con zona horaria")
+        return value.astimezone(_UTC)
+
+    def _window(self, ledger: Any) -> tuple[datetime, datetime]:
+        """Intervalo [frm, to] en UTC impuesto por la autoridad.
+
+        Primera consulta (sin cursor exitoso): `frm == baseline.coverage_from`.
+        Consultas posteriores: `frm = cursor - overlap_seconds`, nunca por debajo
+        de `baseline.coverage_from`. `to` = reloj explicitamente normalizado a UTC.
+        """
+        coverage = ledger.baseline.coverage_from.astimezone(_UTC)
+        ingestion = ledger.ingestion
+        if ingestion.has_successful_scan:
+            frm = ingestion.last_successful_scan_to - timedelta(
+                seconds=self.overlap_seconds
+            )
+        else:
+            frm = coverage
+        if frm < coverage:
+            frm = coverage
+        to = self._clock_utc()
+        if frm > to:
+            raise MT5AdmissionError("intervalo de historial invertido (frm > to)")
+        return frm, to
 
     def _evaluate(self, broker: Any) -> MT5AdmissionReport:
         # 1) Observacion FIABLE de la cuenta (solo lectura). El adaptador debe
@@ -198,11 +264,30 @@ class MT5AccountingAdmission:
                 "durability", f"durabilidad no confirmada ({durability.value})"
             )
 
-        # 7) Ingesta idempotente del historial acotado.
+        # 7) Ingesta idempotente del historial acotado. La AUTORIDAD determina los
+        #    limites (inicio desde `baseline.coverage_from` en la primera consulta;
+        #    solapamiento declarado despues) y el provider DEBE consultar ese
+        #    intervalo exacto.
         try:
-            history = self.history_provider()
+            frm, to = self._window(ledger)
+        except MT5AdmissionError as exc:
+            return self._block("history", f"intervalo de historial invalido: {exc}")
+        try:
+            history = self.history_provider(frm, to)
         except Exception as exc:  # noqa: BLE001
             return self._block("history", f"historial no consultable: {exc}")
+        if not isinstance(history, DealHistoryResult):
+            return self._block("history", "historial no es DealHistoryResult")
+        try:
+            declared_frm = _norm_utc(history.date_from, "history.date_from")
+            declared_to = _norm_utc(history.date_to, "history.date_to")
+        except MT5AdmissionError as exc:
+            return self._block("history", str(exc))
+        if declared_frm != frm or declared_to != to:
+            return self._block(
+                "history",
+                "el intervalo declarado por el resultado NO coincide con el solicitado",
+            )
         status = getattr(history, "status", None)
         if status not in _SUCCESS_STATUSES:
             return self._block("history", f"historial no exitoso ({status!r})")

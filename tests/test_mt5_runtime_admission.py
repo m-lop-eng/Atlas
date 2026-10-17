@@ -23,11 +23,12 @@ from tests.test_mt5_execution_foundation import (
 )
 
 from execution.intent_journal import IntentJournal, OrderIntent
-from execution.ledger_applier import CommissionPolicy
+from execution.ledger_applier import CommissionPolicy, LedgerApplier
 from execution.ledger_store import LedgerStore
-from execution.live_execution import MarketDataReference
+from execution.live_execution import LiveExecutionCoordinator, MarketDataReference
 from execution.live_runtime import LiveExecutionRuntime, RuntimeNotReadyError
 from execution.mt5_accounting import (
+    DEAL_TYPE_BALANCE,
     MT5_ACCOUNTING_SCHEMA_VERSION,
     MT5AccountBaseline,
     MT5AccountingError,
@@ -51,7 +52,7 @@ from brokers.mt5 import (
     MT5Environment,
     OrderHistoryLookup,
 )
-from brokers.models import AccountState, OrderNotFoundError, Position
+from brokers.models import AccountState, HistoricalDeal, OrderNotFoundError, Position
 
 from killswitches.coordinator import KillSwitchCoordinator
 from killswitches.models import KillSource, KillSwitchState
@@ -182,11 +183,19 @@ def _store(tmp_path, monkeypatch, *, durable=True, create=True, baseline=None):
 
 
 def _provider(status=HISTORY_EMPTY_CONFIRMED, deals=()):
-    return lambda: DealHistoryResult(AT, TO, status, tuple(deals))
+    return lambda frm, to: DealHistoryResult(frm, to, status, tuple(deals))
 
 
-def _admission(store, *, status=HISTORY_EMPTY_CONFIRMED, deals=()):
-    return MT5AccountingAdmission(store=store, history_provider=_provider(status, deals))
+def _admission(
+    store, *, status=HISTORY_EMPTY_CONFIRMED, deals=(), clock=lambda: TO,
+    overlap_seconds=0,
+):
+    return MT5AccountingAdmission(
+        store=store,
+        history_provider=_provider(status, deals),
+        clock=clock,
+        overlap_seconds=overlap_seconds,
+    )
 
 
 def _make_runtime(
@@ -386,10 +395,12 @@ class TestIngestion:
     def test_malformed_result_blocks_without_cursor(self, tmp_path, monkeypatch):
         store = _store(tmp_path, monkeypatch)
 
-        def provider():
-            return DealHistoryResult(AT, TO, HISTORY_COMPLETE, None)  # deals invalido
+        def provider(frm, to):
+            return DealHistoryResult(frm, to, HISTORY_COMPLETE, None)  # deals invalido
 
-        admission = MT5AccountingAdmission(store=store, history_provider=provider)
+        admission = MT5AccountingAdmission(
+            store=store, history_provider=provider, clock=lambda: TO
+        )
         rep = admission.initialize(_FakeBroker())
         assert rep.state is MT5AdmissionState.BLOCKED and rep.stage == "ingestion"
         assert admission.ingestor.ledger.ingestion.has_successful_scan is False
@@ -552,3 +563,303 @@ class TestIsolation:
         import sys
 
         assert "MetaTrader5" not in sys.modules
+
+
+# --------------------------------------------------------------------------
+# 05H H-1. El coordinador NO se expone (sin bypass por API publica)
+# --------------------------------------------------------------------------
+
+
+class TestCoordinatorNotPublic:
+    def test_no_public_coordinator_access(self, tmp_path, monkeypatch):
+        store = _store(tmp_path, monkeypatch)
+        rt, _, _ = _make_runtime(
+            tmp_path, broker=_FakeBroker(), admission=_admission(store)
+        )
+        assert not hasattr(rt, "coordinator")
+        assert not hasattr(LiveExecutionRuntime, "coordinator")
+        public = [a for a in dir(rt) if not a.startswith("_")]
+        assert "coordinator" not in public
+        # Diagnostico de solo lectura disponible (no muta nada).
+        assert rt.reconciliation_blocked in (True, False)
+
+
+# --------------------------------------------------------------------------
+# 05H H-2. La autoridad impone el intervalo de historial
+# --------------------------------------------------------------------------
+
+
+def _deposit_hist(ticket, amount, at):
+    return HistoricalDeal(
+        ticket=ticket,
+        order=0,
+        time=at,
+        time_msc=int(at.timestamp()) * 1000,
+        type=DEAL_TYPE_BALANCE,
+        entry=None,
+        position_id=None,
+        symbol=None,
+        volume=0.0,
+        price=0.0,
+        profit=amount,
+        commission=0.0,
+        swap=0.0,
+        fee=0.0,
+    )
+
+
+class TestHistoryWindow:
+    def test_first_query_starts_at_coverage_from(self, tmp_path, monkeypatch):
+        store = _store(tmp_path, monkeypatch)
+        seen = {}
+
+        def provider(frm, to):
+            seen["frm"], seen["to"] = frm, to
+            return DealHistoryResult(frm, to, HISTORY_EMPTY_CONFIRMED, ())
+
+        adm = MT5AccountingAdmission(
+            store=store, history_provider=provider, clock=lambda: TO
+        )
+        rep = adm.initialize(_FakeBroker())
+        assert rep.admitted is True
+        assert seen["frm"] == AT  # == baseline.coverage_from
+        assert seen["to"] == TO
+
+    def test_result_with_later_start_rejected(self, tmp_path, monkeypatch):
+        store = _store(tmp_path, monkeypatch)
+
+        def provider(frm, to):
+            return DealHistoryResult(
+                frm + timedelta(hours=1), to, HISTORY_EMPTY_CONFIRMED, ()
+            )
+
+        adm = MT5AccountingAdmission(
+            store=store, history_provider=provider, clock=lambda: TO
+        )
+        rep = adm.initialize(_FakeBroker())
+        assert rep.state is MT5AdmissionState.BLOCKED and rep.stage == "history"
+        assert adm.ingestor.ledger.ingestion.has_successful_scan is False
+
+    def test_naive_clock_blocks(self, tmp_path, monkeypatch):
+        store = _store(tmp_path, monkeypatch)
+        adm = MT5AccountingAdmission(
+            store=store,
+            history_provider=_provider(),
+            clock=lambda: datetime(2026, 1, 2),  # naive
+        )
+        rep = adm.initialize(_FakeBroker())
+        assert rep.state is MT5AdmissionState.BLOCKED and rep.stage == "history"
+
+    def test_inverted_window_blocks(self, tmp_path, monkeypatch):
+        store = _store(tmp_path, monkeypatch)
+        adm = MT5AccountingAdmission(
+            store=store, history_provider=_provider(),
+            clock=lambda: AT - timedelta(hours=1),
+        )
+        rep = adm.initialize(_FakeBroker())
+        assert rep.state is MT5AdmissionState.BLOCKED and rep.stage == "history"
+
+    def test_overlap_applied_on_subsequent_query(self, tmp_path, monkeypatch):
+        store = _store(tmp_path, monkeypatch)
+        box = {"now": TO}
+        calls = []
+
+        def provider(frm, to):
+            calls.append((frm, to))
+            return DealHistoryResult(frm, to, HISTORY_EMPTY_CONFIRMED, ())
+
+        adm = MT5AccountingAdmission(
+            store=store, history_provider=provider, clock=lambda: box["now"],
+            overlap_seconds=3600,
+        )
+        assert adm.initialize(_FakeBroker()).admitted is True
+        assert calls[0] == (AT, TO)
+        box["now"] = TO + timedelta(days=1)
+        assert adm.refresh(_FakeBroker()).admitted is True
+        assert calls[1] == (TO - timedelta(seconds=3600), TO + timedelta(days=1))
+
+    def test_overlap_does_not_double_count(self, tmp_path, monkeypatch):
+        store = _store(tmp_path, monkeypatch)
+        box = {"now": TO}
+        deal = _deposit_hist(1, 5.0, TO - timedelta(minutes=1))
+        broker = _FakeBroker(balance=10_005.0)
+
+        def provider(frm, to):
+            return DealHistoryResult(frm, to, HISTORY_COMPLETE, (deal,))
+
+        adm = MT5AccountingAdmission(
+            store=store, history_provider=provider, clock=lambda: box["now"],
+            overlap_seconds=3600,
+        )
+        assert adm.initialize(broker).admitted is True
+        assert adm.ingestor.ledger.balance == pytest.approx(10_005.0)
+        box["now"] = TO + timedelta(days=1)
+        assert adm.refresh(broker).admitted is True
+        assert adm.ingestor.ledger.balance == pytest.approx(10_005.0)
+        assert adm.ingestor.ledger.processed_deal_count() == 1
+
+
+# --------------------------------------------------------------------------
+# 05H H-3. `repr` de MT5AccountSnapshot sin login completo
+# --------------------------------------------------------------------------
+
+
+class TestSnapshotRepr:
+    def _snap(self, login="1234567890"):
+        return MT5AccountSnapshot(
+            server="S", login=login, login_masked="***7890", currency="USD",
+            margin_mode=0, balance=1.0, credit=0.0, equity=1.0,
+        )
+
+    def test_repr_hides_full_login(self):
+        snap = self._snap()
+        text = repr(snap)
+        assert "1234567890" not in text
+        assert "***7890" in text
+        assert snap.login == "1234567890"  # conservado internamente
+
+    def test_equality_still_includes_login(self):
+        assert self._snap("111") != self._snap("222")
+        assert self._snap("111") == self._snap("111")
+
+    def test_fingerprint_uses_login(self):
+        assert account_fingerprint(server="S", account_id="111") != (
+            account_fingerprint(server="S", account_id="222")
+        )
+
+
+# --------------------------------------------------------------------------
+# 05H H-4. Fallo de `_post_operation()` bloquea operaciones posteriores
+# --------------------------------------------------------------------------
+
+
+class TestPostOperationFailure:
+    def _ready(self, tmp_path, monkeypatch):
+        store = _store(tmp_path, monkeypatch)
+        admission = _admission(store)
+        rt, ledger, journal = _make_runtime(
+            tmp_path, broker=_FakeBroker(), admission=admission
+        )
+        assert rt.initialize().ready is True
+        return rt, admission
+
+    @staticmethod
+    def _outcome():
+        return SimpleNamespace(
+            submission=SimpleNamespace(broker_order=object(), client_order_id="O-1"),
+            order=SimpleNamespace(client_order_id="O-1", purpose="OPEN"),
+        )
+
+    def _assert_blocked_before_coordinator(self, rt, monkeypatch):
+        calls = []
+        monkeypatch.setattr(
+            LiveExecutionCoordinator, "submit", lambda self, **k: calls.append(k)
+        )
+        with pytest.raises(RuntimeNotReadyError):
+            rt.submit(strategy_id="s", strategy_version="1", client_order_id="O-2")
+        assert calls == []
+
+    def test_spot_apply_failure_blocks(self, tmp_path, monkeypatch):
+        rt, _ = self._ready(tmp_path, monkeypatch)
+
+        def boom(self, cid, bro):
+            raise RuntimeError("apply spot fail")
+
+        monkeypatch.setattr(LedgerApplier, "apply_broker_order", boom)
+        with pytest.raises(RuntimeError):
+            rt._post_operation(self._outcome())
+        self._assert_blocked_before_coordinator(rt, monkeypatch)
+
+    def test_spot_persist_failure_blocks(self, tmp_path, monkeypatch):
+        rt, _ = self._ready(tmp_path, monkeypatch)
+        monkeypatch.setattr(
+            LedgerApplier, "apply_broker_order",
+            lambda self, cid, bro: SimpleNamespace(unverified_commission=0.0),
+        )
+
+        def boom(*a, **k):
+            raise RuntimeError("persist spot fail")
+
+        monkeypatch.setattr(rt.ledger_store, "persist", boom)
+        with pytest.raises(RuntimeError):
+            rt._post_operation(self._outcome())
+        self._assert_blocked_before_coordinator(rt, monkeypatch)
+
+    def test_reconcile_failure_blocks(self, tmp_path, monkeypatch):
+        rt, _ = self._ready(tmp_path, monkeypatch)
+
+        def boom(self):
+            raise RuntimeError("reconcile fail")
+
+        monkeypatch.setattr(LiveExecutionRuntime, "reconcile_now", boom)
+        with pytest.raises(RuntimeError):
+            rt._post_operation(SimpleNamespace(submission=None, order=None))
+        self._assert_blocked_before_coordinator(rt, monkeypatch)
+
+    def test_mt5_refresh_failure_blocks(self, tmp_path, monkeypatch):
+        rt, admission = self._ready(tmp_path, monkeypatch)
+
+        def boom(broker):
+            raise RuntimeError("refresh fail")
+
+        monkeypatch.setattr(admission, "refresh", boom)
+        with pytest.raises(RuntimeError):
+            rt._post_operation(SimpleNamespace(submission=None, order=None))
+        self._assert_blocked_before_coordinator(rt, monkeypatch)
+
+    def test_refresh_blocked_blocks_next(self, tmp_path, monkeypatch):
+        rt, admission = self._ready(tmp_path, monkeypatch)
+        monkeypatch.setattr(admission.store, "_sync_dir", lambda: False)
+        rt._post_operation(SimpleNamespace(submission=None, order=None))
+        with pytest.raises(RuntimeNotReadyError):
+            rt._ensure_operable()
+
+    def test_recovery_clears_block_only_after_full_cycle(self, tmp_path, monkeypatch):
+        rt, admission = self._ready(tmp_path, monkeypatch)
+
+        def boom(self, cid, bro):
+            raise RuntimeError("apply spot fail")
+
+        orig = LedgerApplier.apply_broker_order
+        monkeypatch.setattr(LedgerApplier, "apply_broker_order", boom)
+        with pytest.raises(RuntimeError):
+            rt._post_operation(self._outcome())
+        with pytest.raises(RuntimeNotReadyError):
+            rt._ensure_operable()
+        # Un refresh aislado NO libera el bloqueo.
+        admission.refresh(rt.broker)
+        with pytest.raises(RuntimeNotReadyError):
+            rt._ensure_operable()
+        monkeypatch.setattr(LedgerApplier, "apply_broker_order", orig)
+        assert rt.initialize().ready is True
+        rt._ensure_operable()  # ya no lanza
+
+    def test_failed_reinit_keeps_block(self, tmp_path, monkeypatch):
+        rt, _ = self._ready(tmp_path, monkeypatch)
+
+        def boom(self, cid, bro):
+            raise RuntimeError("apply spot fail")
+
+        orig = LedgerApplier.apply_broker_order
+        monkeypatch.setattr(LedgerApplier, "apply_broker_order", boom)
+        with pytest.raises(RuntimeError):
+            rt._post_operation(self._outcome())
+        monkeypatch.setattr(LedgerApplier, "apply_broker_order", orig)
+        rt.broker._healthy = False
+        assert rt.initialize().ready is False
+        with pytest.raises(RuntimeNotReadyError):
+            rt._ensure_operable()
+
+    def test_generic_broker_unchanged(self, tmp_path, monkeypatch):
+        rt, ledger, journal = _make_runtime(
+            tmp_path, broker=_GenericBroker(), admission=None
+        )
+        assert rt.initialize().ready is True
+
+        def boom(self):
+            raise RuntimeError("reconcile fail")
+
+        monkeypatch.setattr(LiveExecutionRuntime, "reconcile_now", boom)
+        with pytest.raises(RuntimeError):
+            rt._post_operation(SimpleNamespace(submission=None, order=None))
+        assert rt._post_operation_failed is False

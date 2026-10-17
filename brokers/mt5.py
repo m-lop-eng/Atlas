@@ -502,7 +502,9 @@ class MT5AccountSnapshot:
     """
 
     server: str
-    login: str
+    # El login completo se conserva para el calculo de identidad/huella, pero NO
+    # se incluye en la representacion publica (repr) para no exponerlo.
+    login: str = field(repr=False)
     login_masked: str
     currency: str
     margin_mode: int | None

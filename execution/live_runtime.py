@@ -114,6 +114,9 @@ class LiveExecutionRuntime:
     _history_incomplete: bool = field(init=False, default=False)
     _snapshot_present: bool = field(init=False, default=False)
     _ownership_unverified: bool = field(init=False, default=False)
+    # H-4: el procesamiento posterior a una operacion quedo incompleto; se exige
+    # un ciclo COMPLETO de recuperacion (`initialize`) antes de volver a operar.
+    _post_operation_failed: bool = field(init=False, default=False)
 
     def __post_init__(self) -> None:
         # La economia del instrumento queda registrada en el ledger (autoridad de
@@ -149,9 +152,12 @@ class LiveExecutionRuntime:
         )
 
     # ------------------------------------------------------------ propiedades
+    # H-1: el COORDINADOR (que puede enviar/gestionar ordenes con el token de
+    # ejecucion) NO se expone por API publica. Solo se ofrece DIAGNOSTICO de solo
+    # lectura; las operaciones deben pasar por los verbos del runtime (gated).
     @property
-    def coordinator(self) -> LiveExecutionCoordinator:
-        return self._coordinator
+    def reconciliation_blocked(self) -> bool:
+        return self._coordinator.reconciliation_blocked
 
     @property
     def applier(self) -> LedgerApplier:
@@ -325,7 +331,9 @@ class LiveExecutionRuntime:
                     primed, tuple(resolved), 0, report,
                 )
 
-        # 8) preparado
+        # 8) preparado: SOLO aqui, con todos los gates superados, se libera el
+        #    bloqueo por fallo de procesamiento posterior a una operacion (H-4).
+        self._post_operation_failed = False
         self._ready = True
         self._last_report = report
         return ReadinessReport(
@@ -525,6 +533,11 @@ class LiveExecutionRuntime:
     def _ensure_operable(self) -> None:
         if not self._ready:
             raise RuntimeNotReadyError("runtime no preparado: ejecute initialize()")
+        if self._post_operation_failed:
+            raise RuntimeNotReadyError(
+                "fallo en el procesamiento posterior a una operacion: recuperacion "
+                "requerida (initialize()) antes de volver a operar (fail-closed)"
+            )
         if self._commission_unverified > 0.0:
             raise RuntimeNotReadyError(
                 "comision no valorable pendiente: runtime bloqueado (fail-safe)"
@@ -553,6 +566,12 @@ class LiveExecutionRuntime:
                 ) from exc
 
     def _post_operation(self, out: ExecutionOutcome) -> ExecutionOutcome:
+        # H-4: para el adaptador MT5 se levanta el bloqueo ANTES de empezar el
+        # trabajo que puede fallar; solo el exito completo (mas abajo) lo libera.
+        # Asi una operacion posterior no puede ver una senal de admision obsoleta.
+        mt5_mode = self._mt5_accounting_required()
+        if mt5_mode:
+            self._post_operation_failed = True
         submission = getattr(out, "submission", None)
         if submission is not None and submission.broker_order is not None:
             cid = getattr(out.order, "client_order_id", None) or submission.client_order_id
@@ -569,6 +588,8 @@ class LiveExecutionRuntime:
             refresh = getattr(self.mt5_accounting, "refresh", None)
             if callable(refresh):
                 refresh(self.broker)
+        if mt5_mode:
+            self._post_operation_failed = False
         return out
 
     def submit(self, **kwargs) -> ExecutionOutcome:
