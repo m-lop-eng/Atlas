@@ -10,7 +10,7 @@ lo que el broker reporta, NO lo que Atlas cree tener.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 
@@ -220,9 +220,14 @@ class HistoricalDeal:
 
 @dataclass(frozen=True, slots=True)
 class AccountState:
-    """Estado de cuenta reportado por el broker."""
+    """Estado de cuenta reportado por el broker.
 
-    account_id: str
+    `account_id` se conserva para comparaciones/contratos, pero NO aparece en la
+    representacion publica (`repr`): puede contener el login completo de la cuenta
+    y no debe filtrarse a logs/diagnosticos.
+    """
+
+    account_id: str = field(repr=False)
     cash: float
     equity: float
     buying_power: float

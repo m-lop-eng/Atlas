@@ -10,7 +10,7 @@ bloqueo; nunca cancela, cierra ni reenvía nada por sí mismo.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 
 
@@ -121,9 +121,12 @@ class AccountSnapshot:
 
     `currency` (LIVE-06) es la moneda de la cuenta; se compara solo si AMBOS
     lados la proporcionan (None => no comparable, sin falso positivo).
+
+    ATLAS-MT5-ACCOUNTING-05I: `account_id` se conserva para comparaciones, pero
+    NO se incluye en la representacion publica (puede contener el login completo).
     """
 
-    account_id: str
+    account_id: str = field(repr=False)
     cash: float
     equity: float
     currency: str | None = None

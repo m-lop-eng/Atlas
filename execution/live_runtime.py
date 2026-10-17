@@ -22,6 +22,7 @@ contable, identidad ambigua) el runtime NO se marca preparado.
 
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Callable
@@ -117,6 +118,11 @@ class LiveExecutionRuntime:
     # H-4: el procesamiento posterior a una operacion quedo incompleto; se exige
     # un ciclo COMPLETO de recuperacion (`initialize`) antes de volver a operar.
     _post_operation_failed: bool = field(init=False, default=False)
+    # ATLAS-MT5-ACCOUNTING-05I (H-2): serializacion por instancia. RLock porque
+    # `_post_operation` (dentro de un verbo ya con el lock) reentra en
+    # `reconcile_now`. Cubre readiness + operacion + trabajo posterior + refresh
+    # de admision como una seccion critica unica.
+    _lock: Any = field(init=False, default_factory=threading.RLock)
 
     def __post_init__(self) -> None:
         # La economia del instrumento queda registrada en el ledger (autoridad de
@@ -183,7 +189,17 @@ class LiveExecutionRuntime:
         return bool(getattr(self.broker, "requires_accounting_admission", False))
 
     def initialize(self) -> ReadinessReport:
-        """Secuencia de arranque fail-closed. Devuelve el informe de preparacion."""
+        """Secuencia de arranque fail-closed (serializada por instancia).
+
+        ATLAS-MT5-ACCOUNTING-05I (H-2): no se solapa con operaciones en curso ni
+        con `reconcile_now()`; una reinicializacion espera a que termine la seccion
+        critica anterior.
+        """
+        with self._lock:
+            return self._initialize_locked()
+
+    def _initialize_locked(self) -> ReadinessReport:
+        """Cuerpo de `initialize()` ejecutado con el lock de instancia tomado."""
         # 1) config DEMO / mapping / moneda / NETTING
         if not self._demo_environment_ok():
             return self._not_ready("config", "entorno no DEMO (produccion prohibida)")
@@ -524,9 +540,12 @@ class LiveExecutionRuntime:
         return report
 
     def reconcile_now(self) -> ReconciliationReport:
-        report = self._reconcile()
-        self.kill_switch.update_from_reconciliation(report.status)
-        return report
+        # H-2: serializado; no permite que otra operacion use una senal de
+        # readiness mientras el estado de reconciliacion/admision cambia.
+        with self._lock:
+            report = self._reconcile()
+            self.kill_switch.update_from_reconciliation(report.status)
+            return report
 
     # -------------------------------------------------------------- operacion
 
@@ -593,33 +612,38 @@ class LiveExecutionRuntime:
         return out
 
     def submit(self, **kwargs) -> ExecutionOutcome:
-        self._ensure_operable()
-        out = self._coordinator.submit(**kwargs)
-        return self._post_operation(out)
+        # H-2: seccion critica completa (readiness -> coordinador -> post-operacion).
+        with self._lock:
+            self._ensure_operable()
+            out = self._coordinator.submit(**kwargs)
+            return self._post_operation(out)
 
     def cancel_pending(self, *, client_order_id: str, operation_id: str | None = None) -> ExecutionOutcome:
-        self._ensure_operable()
-        # Preserva/contabiliza los fills YA ejecutados del objetivo (idempotente)
-        # antes de cancelar el remanente.
-        self._apply_known_fills()
-        out = self._coordinator.cancel_pending(
-            client_order_id=client_order_id, operation_id=operation_id
-        )
-        return self._post_operation(out)
+        with self._lock:
+            self._ensure_operable()
+            # Preserva/contabiliza los fills YA ejecutados del objetivo
+            # (idempotente) antes de cancelar el remanente.
+            self._apply_known_fills()
+            out = self._coordinator.cancel_pending(
+                client_order_id=client_order_id, operation_id=operation_id
+            )
+            return self._post_operation(out)
 
     def close_position(self, *, operation_id: str | None = None, target_position_id: str | None = None) -> ExecutionOutcome:
-        self._ensure_operable()
-        out = self._coordinator.close_position(
-            operation_id=operation_id, target_position_id=target_position_id
-        )
-        return self._post_operation(out)
+        with self._lock:
+            self._ensure_operable()
+            out = self._coordinator.close_position(
+                operation_id=operation_id, target_position_id=target_position_id
+            )
+            return self._post_operation(out)
 
     def reduce_position(self, *, quantity: float, operation_id: str | None = None, target_position_id: str | None = None) -> ExecutionOutcome:
-        self._ensure_operable()
-        out = self._coordinator.reduce_position(
-            quantity=quantity, operation_id=operation_id, target_position_id=target_position_id
-        )
-        return self._post_operation(out)
+        with self._lock:
+            self._ensure_operable()
+            out = self._coordinator.reduce_position(
+                quantity=quantity, operation_id=operation_id, target_position_id=target_position_id
+            )
+            return self._post_operation(out)
 
 
 __all__ = [
