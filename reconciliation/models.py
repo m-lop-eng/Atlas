@@ -108,11 +108,20 @@ class FillSnapshot:
 
 @dataclass(frozen=True, slots=True)
 class PositionSnapshot:
-    """Vista mínima de una posición (quantity dirigida: +long / -short)."""
+    """Vista mínima de una posición (quantity dirigida: +long / -short).
+
+    ATLAS-MT5-ACCOUNTING-06B: `position_id` conserva la identidad ESTABLE del
+    broker (`POSITION_IDENTIFIER`) cuando existe, para la reconciliación futura.
+    Es `None` para brokers/posiciones sin identidad estable (SPOT/genéricos) y
+    NUNCA se inventa. NO es el `POSITION_TICKET` actual (ese puede cambiar sin
+    cambiar la identidad económica). El motor de reconciliación actual NO compara
+    este campo (empareja por `instrument`).
+    """
 
     instrument: str
     quantity: float
     avg_entry_price: float
+    position_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

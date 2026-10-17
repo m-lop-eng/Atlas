@@ -86,6 +86,9 @@ def broker_state_from_adapter(
                 instrument=p.instrument,
                 quantity=p.quantity,
                 avg_entry_price=p.avg_entry_price,
+                # 06B: conserva la identidad estable si el broker la expone
+                # (`Position.position_id` = POSITION_IDENTIFIER); None si no.
+                position_id=getattr(p, "position_id", None),
             )
             for p in adapter.get_positions()
         )
