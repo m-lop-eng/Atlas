@@ -35,10 +35,11 @@ NO usa `pickle`. NO persiste ni registra secretos.
 
 from __future__ import annotations
 
+import inspect
 import math
 import zlib
 from dataclasses import dataclass, field, replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Any, Callable, Mapping
 
@@ -344,9 +345,16 @@ def _finite(value: Any) -> float:
         f = float(value)
     except (TypeError, ValueError):
         raise BrokerError(f"valor no numerico del proveedor: {value!r}") from None
+    except OverflowError:
+        # Entero/fraccion demasiado grande para `float`: NO se propaga sin tipar.
+        raise BrokerError("valor fuera de rango del proveedor") from None
     if f != f or f in (float("inf"), float("-inf")):
         raise BrokerError(f"valor no finito del proveedor: {value!r}")
     return f
+
+
+# Sentinel unico para introspeccion estatica de atributos (06F-FIX2).
+_ATTR_UNDEFINED = object()
 
 
 def _load_mt5():
@@ -512,6 +520,44 @@ class MT5AccountSnapshot:
     balance: float
     credit: float
     equity: float
+
+
+class MT5MarketMarkError(BrokerError):
+    """Error base de la lectura de marcas de mercado MT5 (solo lectura)."""
+
+
+class MT5MarketMarkSymbolError(MT5MarketMarkError):
+    """Instrumento Atlas ausente, vacio o sin mapping MT5 explicito."""
+
+
+class MT5MarketMarkUnavailableError(MT5MarketMarkError):
+    """La consulta del tick fallo o no hay respuesta utilizable del terminal."""
+
+
+class MT5MarketMarkDataError(MT5MarketMarkError):
+    """El tick llego pero sus datos son invalidos/incompletos (precio o tiempo)."""
+
+
+@dataclass(frozen=True, slots=True)
+class MT5MarketMark:
+    """Marca de mercado MT5 READ-ONLY para UN instrumento (procedencia preservada).
+
+    Conserva los datos OBSERVADOS sin decidir politica de valoracion:
+      * `bid`/`ask`/`last`: opcionales; `None` = ausente (NO se sustituye por 0 ni
+        por otro precio). Se guardan por separado sin alterar su significado.
+      * `tick_time`: hora del TICK del servidor en UTC, o `None` si no se puede
+        determinar de forma fiable (NO se inventa con la hora local).
+      * `received_at`: hora local de RECEPCION (reloj inyectado), UTC. Distinta de
+        `tick_time` y de cualquier calculo posterior de equity.
+    """
+
+    atlas_instrument: str
+    mt5_symbol: str
+    bid: float | None
+    ask: float | None
+    last: float | None
+    tick_time: datetime | None
+    received_at: datetime
 
 
 class MT5BrokerAdapter(BrokerAdapter):
@@ -821,6 +867,170 @@ class MT5BrokerAdapter(BrokerAdapter):
             balance=_finite(getattr(info, "balance")),
             credit=_finite(credit),
             equity=_finite(getattr(info, "equity")),
+        )
+
+    # -------------------------------------------------------- marcas (06F)
+
+    @staticmethod
+    def _tick_attr(tick: Any, name: str) -> Any:
+        """Lee un atributo del tick distinguiendo AUSENCIA real de GETTER defectuoso.
+
+        * Lectura normal con exito => devuelve el valor (validacion posterior).
+        * `AttributeError`: se inspecciona ESTATICAMENTE si el atributo esta DEFINIDO
+          (instancia/clase/MRO) sin ejecutar su descriptor:
+            - definido => respuesta MALFORMADA => `MT5MarketMarkDataError`.
+            - no definido => campo opcional genuinamente ausente => `None`.
+            - introspeccion ambigua/fallida => error de datos (conservador).
+        * Cualquier OTRA excepcion de lectura => `MT5MarketMarkDataError`.
+        NO se usa `hasattr` (ejecutaria el getter y ocultaria el mismo fallo).
+        """
+        try:
+            return getattr(tick, name)
+        except AttributeError as exc:
+            try:
+                defined = inspect.getattr_static(tick, name, _ATTR_UNDEFINED)
+            except Exception as intro_exc:  # noqa: BLE001 - introspeccion incierta
+                raise MT5MarketMarkDataError(
+                    f"tick con atributo {name!r} ilegible (AttributeError)"
+                ) from intro_exc
+            if defined is _ATTR_UNDEFINED:
+                return None
+            raise MT5MarketMarkDataError(
+                f"tick con atributo {name!r} ilegible (AttributeError)"
+            ) from exc
+        except Exception as exc:  # noqa: BLE001 - descriptor/atributo defectuoso
+            raise MT5MarketMarkDataError(
+                f"tick con atributo {name!r} ilegible ({type(exc).__name__})"
+            ) from exc
+
+    @staticmethod
+    def _optional_finite(value: Any, field_name: str) -> float | None:
+        """`None` = ausente; en otro caso exige numero finito (rechaza bool/NaN/Inf).
+
+        Rechaza explicitamente `bool` y cualquier valor que no sea `int`/`float`
+        real (no se aceptan cadenas numericas como precio).
+        """
+        if value is None:
+            return None
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise MT5MarketMarkDataError(
+                f"tick con {field_name} invalido (tipo {type(value).__name__})"
+            )
+        try:
+            return _finite(value)
+        except BrokerError as exc:
+            raise MT5MarketMarkDataError(
+                f"tick con {field_name} invalido ({exc})"
+            ) from exc
+
+    def _received_at_utc(self) -> datetime:
+        value = self._clock()
+        if (
+            not isinstance(value, datetime)
+            or value.tzinfo is None
+            or value.utcoffset() is None
+        ):
+            raise MT5MarketMarkDataError(
+                "reloj local no devuelve datetime con zona horaria"
+            )
+        return value.astimezone(timezone.utc)
+
+    @classmethod
+    def _tick_time(cls, tick: Any) -> datetime | None:
+        """Hora del TICK del servidor en UTC, o `None` si no esta disponible.
+
+        `time_msc` (ms) es autoritativo si existe; si tambien hay `time` (s), se
+        exige coherencia (`time_msc // 1000 == time`). Ausentes ambos => `None`
+        (NO se usa la hora local). Valores malformados => `MT5MarketMarkDataError`.
+        """
+        raw_msc = cls._tick_attr(tick, "time_msc")
+        raw_sec = cls._tick_attr(tick, "time")
+
+        def _as_epoch(value: Any, field_name: str) -> int:
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise MT5MarketMarkDataError(
+                    f"tick con {field_name} no entero"
+                )
+            if value <= 0:
+                raise MT5MarketMarkDataError(f"tick con {field_name} invalido")
+            return value
+
+        if raw_msc is not None:
+            msc = _as_epoch(raw_msc, "time_msc")
+            if raw_sec is not None and _as_epoch(raw_sec, "time") != msc // 1000:
+                raise MT5MarketMarkDataError(
+                    "tick con time/time_msc incoherentes"
+                )
+            try:
+                base = datetime.fromtimestamp(msc // 1000, tz=timezone.utc)
+            except (OverflowError, OSError, ValueError) as exc:
+                raise MT5MarketMarkDataError(
+                    f"tick con time_msc fuera de rango: {msc!r}"
+                ) from exc
+            return base + timedelta(milliseconds=msc % 1000)
+        if raw_sec is not None:
+            sec = _as_epoch(raw_sec, "time")
+            try:
+                return datetime.fromtimestamp(sec, tz=timezone.utc)
+            except (OverflowError, OSError, ValueError) as exc:
+                raise MT5MarketMarkDataError(
+                    f"tick con time fuera de rango: {sec!r}"
+                ) from exc
+        return None
+
+    def read_market_mark(
+        self, atlas_instrument: str, *, require_tick_time: bool = False
+    ) -> MT5MarketMark:
+        """Lee una MARCA de mercado READ-ONLY para un instrumento Atlas.
+
+        SOLO LECTURA: consulta `symbol_info_tick` y no modifica ordenes, posiciones,
+        configuracion, readiness ni estado contable. NO selecciona el simbolo
+        automaticamente: si el terminal no lo tiene disponible, falla tipado.
+        Conserva el simbolo MT5 exacto usado y separa hora del tick del servidor
+        (`tick_time`) de la hora local de recepcion (`received_at`).
+        """
+        self._require_ready()
+        if not isinstance(atlas_instrument, str) or not atlas_instrument.strip():
+            raise MT5MarketMarkSymbolError("instrumento Atlas invalido o vacio")
+        mt5_symbol = self._symbol_resolver.to_mt5(atlas_instrument)
+        if mt5_symbol is None:
+            raise MT5MarketMarkSymbolError(
+                f"instrumento Atlas sin mapping MT5 explicito: {atlas_instrument!r}"
+            )
+        mt5 = self._module()
+        try:
+            tick = mt5.symbol_info_tick(mt5_symbol)
+        except BrokerError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - transporte/consulta incierta
+            raise MT5MarketMarkUnavailableError(
+                f"symbol_info_tick fallo ({type(exc).__name__})"
+            ) from exc
+        if tick is None:
+            raise MT5MarketMarkUnavailableError(
+                f"sin tick disponible para {mt5_symbol!r} (simbolo no disponible; "
+                "no se auto-selecciona)"
+            )
+        bid = self._optional_finite(self._tick_attr(tick, "bid"), "bid")
+        ask = self._optional_finite(self._tick_attr(tick, "ask"), "ask")
+        last = self._optional_finite(self._tick_attr(tick, "last"), "last")
+        if bid is None and ask is None and last is None:
+            raise MT5MarketMarkDataError(
+                "tick sin precios utilizables (bid/ask/last ausentes)"
+            )
+        tick_time = self._tick_time(tick)
+        if require_tick_time and tick_time is None:
+            raise MT5MarketMarkDataError(
+                "tick sin timestamp de mercado verificable"
+            )
+        return MT5MarketMark(
+            atlas_instrument=atlas_instrument,
+            mt5_symbol=mt5_symbol,
+            bid=bid,
+            ask=ask,
+            last=last,
+            tick_time=tick_time,
+            received_at=self._received_at_utc(),
         )
 
     # ---------------------------------------------------------------- simbolos
@@ -1787,6 +1997,11 @@ __all__ = [
     "MT5Credentials",
     "MT5DealHistoryError",
     "MT5Environment",
+    "MT5MarketMark",
+    "MT5MarketMarkDataError",
+    "MT5MarketMarkError",
+    "MT5MarketMarkSymbolError",
+    "MT5MarketMarkUnavailableError",
     "MT5SymbolSpec",
     "instrument_spec_from_mt5",
     "read_mt5_symbol_spec",
