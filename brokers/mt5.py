@@ -284,6 +284,12 @@ class MT5SymbolSpec:
     # futura politica de valoracion decidira si es admisible); NO implica que sea
     # apto para valorar.
     trade_calc_mode: int | None = None
+    # 06I-B1: valores de tick SEPARADOS para posicion ganadora/perdedora
+    # (`SYMBOL_TRADE_TICK_VALUE_PROFIT` / `..._LOSS`). `None` = ausente. NO se
+    # derivan de `trade_tick_value` (que es alias de `..._PROFIT`); la aptitud para
+    # valorar se decidira en una fase posterior.
+    trade_tick_value_profit: float | None = None
+    trade_tick_value_loss: float | None = None
 
 
 def instrument_spec_from_mt5(
@@ -394,6 +400,29 @@ def _safe_attr(obj: Any, name: str, *, error_cls: type) -> Any:
         ) from exc
 
 
+def _read_optional_finite_attr(info: Any, name: str) -> float | None:
+    """Lee un campo numerico OPCIONAL de `symbol_info` con validacion ESTRICTA.
+
+    * Ausente o `None` => `None`.
+    * Acceso defectuoso a un atributo DEFINIDO => `BrokerInvalidOrderError`.
+    * No numerico (bool/str/objeto) => `BrokerInvalidOrderError`.
+    * No finito (NaN/Inf) o fuera de rango (`OverflowError`) => `BrokerInvalidOrderError`.
+    Reutiliza `_safe_attr` (ausencia vs getter defectuoso) y `_finite` (finitud),
+    sin una segunda implementacion divergente.
+    """
+    raw = _safe_attr(info, name, error_cls=BrokerInvalidOrderError)
+    if raw is None:
+        return None
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        raise BrokerInvalidOrderError(
+            f"{name} invalido (tipo {type(raw).__name__})"
+        )
+    try:
+        return _finite(raw)
+    except BrokerError as exc:
+        raise BrokerInvalidOrderError(f"{name} invalido ({exc})") from exc
+
+
 def _read_trade_calc_mode(info: Any) -> int | None:
     """Lee `trade_calc_mode` (SYMBOL_TRADE_CALC_MODE) con validacion ESTRICTA.
 
@@ -490,6 +519,12 @@ def read_mt5_symbol_spec(
         filling_mode=int(getattr(info, "filling_mode", filling_mode_default)),
         digits=int(getattr(info, "digits", 0)),
         trade_calc_mode=_read_trade_calc_mode(info),
+        trade_tick_value_profit=_read_optional_finite_attr(
+            info, "trade_tick_value_profit"
+        ),
+        trade_tick_value_loss=_read_optional_finite_attr(
+            info, "trade_tick_value_loss"
+        ),
     )
     if spec.volume_min <= 0 or spec.volume_step <= 0 or spec.volume_max < spec.volume_min:
         raise BrokerInvalidOrderError(
