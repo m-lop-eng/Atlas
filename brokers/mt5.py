@@ -1986,12 +1986,22 @@ class MT5BrokerAdapter(BrokerAdapter):
         quantity = _finite(
             getattr(raw, "volume_initial", getattr(raw, "volume_current", filled))
         )
+        # 06I-C1: resolucion FAIL-CLOSED del simbolo MT5 -> instrumento Atlas.
+        # Antes, un simbolo MT5 SIN correspondencia configurada se devolvia tal
+        # cual como `instrument` (fallback textual), permitiendo que un simbolo
+        # ajeno a la configuracion se hiciera pasar por instrumento Atlas. Ahora
+        # la ausencia de mapping produce un error tipado ANTES de construir el
+        # `BrokerOrder`, coherente con la direccion directa (`_symbol_spec`).
+        mt5_symbol = str(getattr(raw, "symbol", ""))
+        instrument = self._reverse_symbol_map.get(mt5_symbol)
+        if instrument is None:
+            raise BrokerInvalidOrderError(
+                f"sin mapping explicito MT5->Atlas para {mt5_symbol!r}"
+            )
         return BrokerOrder(
             client_order_id=cid,
             broker_order_id=str(ticket),
-            instrument=self._reverse_symbol_map.get(
-                str(getattr(raw, "symbol", "")), str(getattr(raw, "symbol", ""))
-            ),
+            instrument=instrument,
             side=(
                 OrderSide.BUY
                 if int(getattr(raw, "type", ORDER_TYPE_BUY)) in (ORDER_TYPE_BUY, 2)

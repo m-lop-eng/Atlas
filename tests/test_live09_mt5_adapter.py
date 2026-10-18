@@ -43,6 +43,7 @@ from brokers.mt5 import (
     TRADE_RETCODE_TIMEOUT,
     _AMBIGUOUS_RETCODES,
 )
+from brokers.mt5_symbols import MT5SymbolMappingError
 from brokers.models import (
     BrokerAuthError,
     BrokerConnectionError,
@@ -655,6 +656,61 @@ class TestCorrelationLookup:
         assert resolved.state is BrokerOrderState.FILLED
         # Sin resubmit: solo un order_send.
         assert fake.send_count == 1
+
+
+# --------------------------------------------------------------------------
+# 06I-C1: resolucion de simbolo en ordenes FAIL-CLOSED
+# --------------------------------------------------------------------------
+
+
+class TestOrderSymbolResolutionFailClosed:
+    def _inject_order(self, adapter, fake, cid, symbol, ticket):
+        magic = adapter._magic_for(cid)
+        comment = adapter._comment_for(cid)
+        fake._orders[ticket] = SimpleNamespace(
+            ticket=ticket, symbol=symbol, magic=magic, comment=comment,
+            type=0, state=ORDER_STATE_FILLED, volume_initial=0.1,
+            volume_current=0.0, price_open=50_000.0,
+        )
+        adapter._remember(cid, ticket)
+
+    def test_mapped_symbol_resolves_to_atlas_instrument(self):
+        adapter, fake = _ready()
+        self._inject_order(adapter, fake, "C-MAP", MT5_SYMBOL, 71)
+        order = adapter.get_order("C-MAP")
+        assert order.instrument == ATLAS_INSTRUMENT
+        assert order.instrument != MT5_SYMBOL
+
+    def test_unmapped_symbol_fails_closed(self):
+        adapter, fake = _ready()
+        self._inject_order(adapter, fake, "C-GHOST", "GHOST.raw", 72)
+        with pytest.raises(BrokerInvalidOrderError):
+            adapter.get_order("C-GHOST")
+
+    def test_no_silent_fallback_to_raw_mt5_symbol(self):
+        # El nombre MT5 crudo NUNCA debe devolverse como instrumento Atlas.
+        adapter, fake = _ready()
+        self._inject_order(adapter, fake, "C-RAW", "EURUSD.raw", 73)
+        with pytest.raises(BrokerInvalidOrderError) as exc:
+            adapter.get_order("C-RAW")
+        assert "EURUSD.raw" in str(exc.value)
+
+    def test_failure_occurs_before_any_execution_call(self):
+        adapter, fake = _ready()
+        self._inject_order(adapter, fake, "C-SAFE", "GHOST.raw", 74)
+        sends = fake.send_count
+        with pytest.raises(BrokerInvalidOrderError):
+            adapter.get_order("C-SAFE")
+        assert fake.send_count == sends
+
+    def test_explicit_identity_mapping_is_valid(self):
+        adapter, fake = _ready(symbol_map={"IDENT": "IDENT"})
+        self._inject_order(adapter, fake, "C-ID", "IDENT", 75)
+        assert adapter.get_order("C-ID").instrument == "IDENT"
+
+    def test_invalid_non_injective_config_still_rejected(self):
+        with pytest.raises(MT5SymbolMappingError):
+            _adapter(symbol_map={"A": "SAME", "B": "SAME"})
 
 
 # --------------------------------------------------------------------------
