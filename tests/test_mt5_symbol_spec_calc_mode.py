@@ -101,6 +101,57 @@ class TestStrictValidation:
             _read(fake)
 
 
+class _CalcGetterRaiser:
+    """Symbol-info dobule con un getter `trade_calc_mode` DEFINIDO que falla."""
+
+    def __init__(self, base, exc):
+        self.__dict__.update(vars(base))
+        self._exc = exc
+
+    @property
+    def trade_calc_mode(self):
+        raise self._exc
+
+
+class _CalcDynamic:
+    """Symbol-info double cuyo `trade_calc_mode` procede de `__getattr__`."""
+
+    def __init__(self, base, value):
+        self.__dict__.update(vars(base))
+        self._value = value
+
+    def __getattr__(self, item):
+        if item == "trade_calc_mode":
+            return self._value
+        raise AttributeError(item)
+
+
+class TestAttributeAccess:
+    def test_defined_getter_attributeerror_is_typed_error(self):
+        fake = _fake()
+        base = fake.symbols[INSTRUMENT]
+        fake.symbols[INSTRUMENT] = _CalcGetterRaiser(base, AttributeError("boom"))
+        with pytest.raises(BrokerInvalidOrderError):
+            _read(fake)
+
+    @pytest.mark.parametrize("exc", [RuntimeError("boom"), ValueError("boom")])
+    def test_defined_getter_other_exception_is_typed_error(self, exc):
+        fake = _fake()
+        base = fake.symbols[INSTRUMENT]
+        fake.symbols[INSTRUMENT] = _CalcGetterRaiser(base, exc)
+        with pytest.raises(BrokerInvalidOrderError):
+            _read(fake)
+
+    def test_dynamic_valid_getter_value_preserved(self):
+        fake = _fake()
+        base = fake.symbols[INSTRUMENT]
+        fake.symbols[INSTRUMENT] = _CalcDynamic(base, 3)
+        assert _read(fake).trade_calc_mode == 3
+
+    def test_absent_is_none_not_defect(self):
+        assert _read(_fake()).trade_calc_mode is None
+
+
 # ------------------------------------------------------------------ aislamiento
 
 

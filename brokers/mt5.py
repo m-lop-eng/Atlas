@@ -363,17 +363,50 @@ def _finite(value: Any) -> float:
 _ATTR_UNDEFINED = object()
 
 
+def _safe_attr(obj: Any, name: str, *, error_cls: type) -> Any:
+    """Lee `obj.name` distinguiendo AUSENCIA real de GETTER defectuoso.
+
+    * Lectura normal con exito => valor (aunque sea `None`).
+    * `AttributeError`: se inspecciona ESTATICAMENTE si el atributo esta DEFINIDO
+      (instancia/clase/MRO) sin ejecutar su descriptor:
+        - definido => acceso defectuoso => `error_cls(...)`.
+        - no definido => campo genuinamente ausente => `None`.
+        - introspeccion ambigua/fallida => `error_cls(...)` (conservador).
+    * Cualquier OTRA excepcion de lectura => `error_cls(...)`.
+    NO usa `hasattr` (ejecutaria el getter). No captura `BaseException` ni expone
+    el objeto en el mensaje. `error_cls` debe aceptar un unico `str`.
+    """
+    try:
+        return getattr(obj, name)
+    except AttributeError as exc:
+        try:
+            defined = inspect.getattr_static(obj, name, _ATTR_UNDEFINED)
+        except Exception as intro_exc:  # noqa: BLE001 - introspeccion incierta
+            raise error_cls(
+                f"atributo {name!r} ilegible (AttributeError)"
+            ) from intro_exc
+        if defined is _ATTR_UNDEFINED:
+            return None
+        raise error_cls(f"atributo {name!r} ilegible (AttributeError)") from exc
+    except Exception as exc:  # noqa: BLE001 - descriptor/atributo defectuoso
+        raise error_cls(
+            f"atributo {name!r} ilegible ({type(exc).__name__})"
+        ) from exc
+
+
 def _read_trade_calc_mode(info: Any) -> int | None:
     """Lee `trade_calc_mode` (SYMBOL_TRADE_CALC_MODE) con validacion ESTRICTA.
 
     * Ausente o `None` => `None` (desconocido; NUNCA un modo por defecto).
+    * Acceso defectuoso a un atributo DEFINIDO (getter que lanza AttributeError u
+      otra excepcion) => `BrokerInvalidOrderError` (no se degrada a `None`).
     * Tipo invalido (bool/str/float/objeto) o entero negativo =>
       `BrokerInvalidOrderError` (no se convierte en silencio).
     * Entero `>= 0` (reconocido o no) se conserva TAL CUAL; conservarlo NO
       significa que sea apto para valorar (eso lo decide la futura politica).
     No se deriva de `trade_mode`.
     """
-    raw = getattr(info, "trade_calc_mode", None)
+    raw = _safe_attr(info, "trade_calc_mode", error_cls=BrokerInvalidOrderError)
     if raw is None:
         return None
     if isinstance(raw, bool) or not isinstance(raw, int):
@@ -904,33 +937,10 @@ class MT5BrokerAdapter(BrokerAdapter):
     def _tick_attr(tick: Any, name: str) -> Any:
         """Lee un atributo del tick distinguiendo AUSENCIA real de GETTER defectuoso.
 
-        * Lectura normal con exito => devuelve el valor (validacion posterior).
-        * `AttributeError`: se inspecciona ESTATICAMENTE si el atributo esta DEFINIDO
-          (instancia/clase/MRO) sin ejecutar su descriptor:
-            - definido => respuesta MALFORMADA => `MT5MarketMarkDataError`.
-            - no definido => campo opcional genuinamente ausente => `None`.
-            - introspeccion ambigua/fallida => error de datos (conservador).
-        * Cualquier OTRA excepcion de lectura => `MT5MarketMarkDataError`.
-        NO se usa `hasattr` (ejecutaria el getter y ocultaria el mismo fallo).
+        Delega en `_safe_attr`: ausente real => `None`; acceso defectuoso a un
+        atributo DEFINIDO => `MT5MarketMarkDataError`. NO usa `hasattr`.
         """
-        try:
-            return getattr(tick, name)
-        except AttributeError as exc:
-            try:
-                defined = inspect.getattr_static(tick, name, _ATTR_UNDEFINED)
-            except Exception as intro_exc:  # noqa: BLE001 - introspeccion incierta
-                raise MT5MarketMarkDataError(
-                    f"tick con atributo {name!r} ilegible (AttributeError)"
-                ) from intro_exc
-            if defined is _ATTR_UNDEFINED:
-                return None
-            raise MT5MarketMarkDataError(
-                f"tick con atributo {name!r} ilegible (AttributeError)"
-            ) from exc
-        except Exception as exc:  # noqa: BLE001 - descriptor/atributo defectuoso
-            raise MT5MarketMarkDataError(
-                f"tick con atributo {name!r} ilegible ({type(exc).__name__})"
-            ) from exc
+        return _safe_attr(tick, name, error_cls=MT5MarketMarkDataError)
 
     @staticmethod
     def _optional_finite(value: Any, field_name: str) -> float | None:
