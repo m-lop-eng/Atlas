@@ -58,6 +58,7 @@ from execution.order import (
 )
 
 from brokers.base import BrokerAdapter
+from brokers.mt5_symbols import MT5SymbolResolver
 from brokers.models import (
     AccountState,
     BrokerAuthError,
@@ -548,9 +549,10 @@ class MT5BrokerAdapter(BrokerAdapter):
         # conozca el `client_order_id` (lo aprueba SOLO el coordinador de
         # ejecucion). Sin gate (default) el comportamiento LIVE-09 es intacto.
         self._execution_gate = None
-        self._reverse_symbol_map = {
-            mt5_symbol: atlas for atlas, mt5_symbol in config.symbol_map.items()
-        }
+        # 06E: UN solo resolver validado (rechaza mappings no inyectivos). El
+        # diccionario inverso se DERIVA de el, evitando dos algoritmos inversos.
+        self._symbol_resolver = MT5SymbolResolver.from_mapping(config.symbol_map)
+        self._reverse_symbol_map = dict(self._symbol_resolver.mt5_to_atlas)
 
     # ------------------------------------------------------------- propiedades
 
@@ -568,6 +570,11 @@ class MT5BrokerAdapter(BrokerAdapter):
     # desde configuracion (evita habilitar un runtime aparentemente listo sin
     # contabilidad MT5).
     requires_accounting_admission: bool = True
+
+    @property
+    def symbol_resolver(self) -> MT5SymbolResolver:
+        """Resolver canonico Atlas<->MT5 validado (compartido con la conciliacion)."""
+        return self._symbol_resolver
 
     # -------------------------------------------------------------- lifecycle
 
@@ -822,7 +829,7 @@ class MT5BrokerAdapter(BrokerAdapter):
         cached = self._specs.get(strategy_instrument)
         if cached is not None:
             return cached
-        mt5_name = self.config.symbol_map.get(strategy_instrument)
+        mt5_name = self._symbol_resolver.to_mt5(strategy_instrument)
         if not mt5_name:
             raise BrokerInvalidOrderError(
                 f"sin mapping explicito Atlas->MT5 para {strategy_instrument!r}"
@@ -1430,7 +1437,11 @@ class MT5BrokerAdapter(BrokerAdapter):
         ticket = getattr(p, "ticket", None)
         identifier = getattr(p, "identifier", None)
         return Position(
-            instrument=self._reverse_symbol_map.get(symbol, symbol),
+            # 06E: NO se inventa identidad Atlas. Si el simbolo MT5 no esta
+            # mapeado, `instrument` queda None (fail-closed) y se conserva el
+            # simbolo MT5 original en `mt5_symbol`.
+            instrument=self._symbol_resolver.to_atlas(symbol),
+            mt5_symbol=symbol,
             quantity=sign * volume,
             avg_entry_price=_finite(getattr(p, "price_open")),
             updated_at=self._position_time(getattr(p, "time", 0)),

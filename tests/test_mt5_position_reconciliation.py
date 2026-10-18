@@ -11,24 +11,31 @@ from datetime import datetime, timezone
 import pytest
 
 from brokers.models import Position
+from brokers.mt5_symbols import MT5SymbolResolver
 from execution.mt5_accounting import MT5Position
 from execution.mt5_position_reconciliation import (
+    MT5CanonicalPosition,
     MT5PositionDiff,
     MT5PositionReconciliationError,
     MT5PositionSource,
     MT5PositionStatus,
+    canonicalize_mt5_broker_positions,
+    canonicalize_mt5_ledger_positions,
     reconcile_mt5_positions,
 )
 
 NOW = datetime(2026, 1, 1, tzinfo=timezone.utc)
 NETTING = 0
 HEDGING = 2
+# Resolver explicito (inyectivo): EURUSD/GBPUSD.
+_RESOLVER = MT5SymbolResolver.from_mapping({"EURUSD": "EURUSD", "GBPUSD": "GBPUSD"})
 
 
-def _broker(position_id, *, ticket="901", instrument="EURUSD", quantity=1.0, price=1.10):
+def _broker(position_id, *, ticket="901", instrument="EURUSD", quantity=1.0, price=1.10,
+            mt5_symbol=None):
     return Position(
         instrument=instrument, quantity=quantity, avg_entry_price=price,
-        updated_at=NOW, ticket=ticket, position_id=position_id,
+        updated_at=NOW, ticket=ticket, position_id=position_id, mt5_symbol=mt5_symbol,
     )
 
 
@@ -38,8 +45,23 @@ def _ledger(position_id, *, symbol="EURUSD", quantity=1.0, price=1.10):
     )
 
 
-def _src(*, positions, available=True, detail=""):
-    return MT5PositionSource(positions=tuple(positions), available=available, detail=detail)
+def _canon(pos):
+    """Canonicaliza un objeto Position (broker) o MT5Position (ledger)."""
+    if hasattr(pos, "symbol") and hasattr(pos, "avg_price"):
+        return canonicalize_mt5_ledger_positions([pos], _RESOLVER)[0]
+    return canonicalize_mt5_broker_positions([pos], _RESOLVER)[0]
+
+
+def _src(*, positions, available=True, detail="", canonicalized=True):
+    if not available or positions is None:
+        return MT5PositionSource(
+            positions=positions, available=available, detail=detail,
+            canonicalized=canonicalized,
+        )
+    canon = tuple(_canon(p) for p in positions)
+    return MT5PositionSource(
+        positions=canon, available=True, detail=detail, canonicalized=canonicalized
+    )
 
 
 def _reconcile(broker, internal, *, mode=HEDGING, complete=True, durable=True,
@@ -355,3 +377,64 @@ class TestValidNumericRegression:
                        _src(positions=[_ledger(777, quantity=1.0, price=1.10)]),
                        qt=0.001, pt=0.001)
         assert r.status is MT5PositionStatus.RECONCILED
+
+
+# ---------------------------------- 06E: contrato canonico de instrumentos
+
+
+class TestCanonicalInstrumentContract:
+    def test_instrument_none_both_blocks(self):
+        b = _broker("777", instrument=None, mt5_symbol=None)
+        i = _ledger(777, symbol="")
+        r = _reconcile(_src(positions=[b]), _src(positions=[i]))
+        assert r.status is MT5PositionStatus.BLOCKED and _unverified(r)
+
+    def test_empty_instrument_blocks(self):
+        r = _reconcile(_src(positions=[_broker("777", instrument="")]),
+                       _src(positions=[_ledger(777, symbol="")]))
+        assert r.status is MT5PositionStatus.BLOCKED and _unverified(r)
+
+    def test_same_text_unmapped_not_equivalent(self):
+        # broker sin mapping ("EURUSDx"); ledger "EURUSD": no hay equivalencia.
+        b = _broker("777", instrument="EURUSD", mt5_symbol="EURUSDx")
+        i = _ledger(777, symbol="EURUSD")
+        r = _reconcile(_src(positions=[b]), _src(positions=[i]))
+        assert r.status is MT5PositionStatus.BLOCKED and _unverified(r)
+
+    def test_provenance_prefers_mt5_symbol(self):
+        # La canonicalizacion usa el simbolo MT5 ORIGINAL (`mt5_symbol`), no el
+        # campo `instrument` (aqui deliberadamente incorrecto).
+        b = _broker("777", instrument="WRONG", mt5_symbol="EURUSD")
+        i = _ledger(777, symbol="EURUSD")
+        assert _reconcile(_src(positions=[b]), _src(positions=[i])).status is (
+            MT5PositionStatus.RECONCILED
+        )
+
+    def test_non_canonicalized_source_with_positions_blocks(self):
+        canon_b = MT5CanonicalPosition("777", "EURUSD", 1.0, 1.10)
+        canon_i = MT5CanonicalPosition("777", "EURUSD", 1.0, 1.10)
+        broker = MT5PositionSource((canon_b,), True, canonicalized=False)
+        internal = MT5PositionSource((canon_i,), True, canonicalized=False)
+        r = _reconcile(broker, internal)
+        assert r.status is MT5PositionStatus.BLOCKED
+        assert "canonicalizar" in (r.blocked_reason or "")
+
+    def test_canonicalized_sources_reconcile(self):
+        canon_b = MT5CanonicalPosition("777", "EURUSD", 1.0, 1.10)
+        canon_i = MT5CanonicalPosition("777", "EURUSD", 1.0, 1.10)
+        broker = MT5PositionSource((canon_b,), True, canonicalized=True)
+        internal = MT5PositionSource((canon_i,), True, canonicalized=True)
+        assert _reconcile(broker, internal).status is MT5PositionStatus.RECONCILED
+
+    def test_non_canonicalized_empty_still_reconciled(self):
+        broker = MT5PositionSource((), True, canonicalized=False)
+        internal = MT5PositionSource((), True, canonicalized=False)
+        assert _reconcile(broker, internal).status is MT5PositionStatus.RECONCILED
+
+    def test_default_source_is_fail_closed(self):
+        # `canonicalized` por defecto False => fuente con posiciones bloquea.
+        canon = MT5CanonicalPosition("777", "EURUSD", 1.0, 1.10)
+        src = MT5PositionSource((canon,), True)  # sin canonicalized
+        assert src.canonicalized is False
+        r = _reconcile(src, MT5PositionSource((canon,), True, canonicalized=True))
+        assert r.status is MT5PositionStatus.BLOCKED

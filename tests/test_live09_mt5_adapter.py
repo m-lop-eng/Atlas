@@ -745,11 +745,15 @@ class TestOpenOrdersPositions:
         assert positions[0].quantity == pytest.approx(1.5)
         assert positions[0].avg_entry_price == pytest.approx(50_000.0)
 
-    def test_position_unexpected_symbol_kept(self):
+    def test_position_unexpected_symbol_not_invented(self):
+        # 06E: un simbolo MT5 NO mapeado no se convierte en un identificador
+        # canonico por fallback; se conserva la procedencia y `instrument` queda
+        # None (fail-closed).
         adapter, fake = _ready()
         fake.add_position(81, symbol="EURUSD", volume=1.0, price_open=1.1, type=1)
         positions = adapter.get_positions()
-        assert positions[0].instrument == "EURUSD"
+        assert positions[0].instrument is None
+        assert positions[0].mt5_symbol == "EURUSD"
         assert positions[0].quantity == pytest.approx(-1.0)
 
     def test_hedging_multiple_positions_failclosed(self):

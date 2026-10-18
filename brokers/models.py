@@ -187,6 +187,10 @@ class Position:
     position_id: str | None = None
     magic: int | None = None
     comment: str | None = None
+    # ATLAS-MT5-ACCOUNTING-06E: simbolo MT5 ORIGINAL (procedencia), tal como lo
+    # reporta el broker, para poder canonicalizar con el resolver sin depender del
+    # fallback textual. `None` en caminos no-MT5 (SPOT/genericos).
+    mt5_symbol: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
