@@ -714,6 +714,115 @@ class TestOrderSymbolResolutionFailClosed:
 
 
 # --------------------------------------------------------------------------
+# 06I-C1: consumidores (lookup/polling) y fallo POST-SEND fail-closed
+# --------------------------------------------------------------------------
+
+
+_UNMAPPED_MT5_SYMBOL = "GHOST.raw"
+
+
+class _UnmappedSymbolAfterSend(FakeMT5):
+    """FakeMT5 cuya orden ENVIADA queda registrada con un simbolo NO mapeado.
+
+    Simula un broker que responde DONE pero refleja la orden con un simbolo
+    distinto al solicitado (anomalia): la resolucion MT5->Atlas debe fallar.
+    """
+
+    def __init__(self, unmapped: str = _UNMAPPED_MT5_SYMBOL) -> None:
+        super().__init__()
+        self._unmapped = unmapped
+
+    def order_send(self, request):
+        result = super().order_send(request)
+        ticket = getattr(result, "order", None)
+        if ticket and int(ticket) in self._orders:
+            self._orders[int(ticket)].symbol = self._unmapped
+        return result
+
+
+class TestOrderSymbolConsumerRegression:
+    # ---- lookup_order_history -------------------------------------------
+    def _history_order(self, adapter, cid, ticket, symbol):
+        magic = adapter._magic_for(cid)
+        comment = adapter._comment_for(cid)
+        return SimpleNamespace(
+            ticket=ticket, symbol=symbol, magic=magic, comment=comment,
+            type=ORDER_TYPE_BUY, state=ORDER_STATE_FILLED,
+            volume_initial=0.1, volume_current=0.0, price_open=50_000.0,
+        )
+
+    def test_lookup_history_mapped_symbol_ok(self):
+        adapter, fake = _ready()
+        fake._orders[201] = self._history_order(adapter, "H-MAP", 201, MT5_SYMBOL)
+        fake.add_deal(1201, 201, volume=0.1, price=50_000.0)
+        adapter._remember("H-MAP", 201)
+        result = adapter.lookup_order_history("H-MAP")
+        assert result.status == HISTORY_COMPLETE
+        assert result.order.instrument == ATLAS_INSTRUMENT
+
+    def test_lookup_history_unmapped_symbol_raises(self):
+        adapter, fake = _ready()
+        fake._orders[202] = self._history_order(
+            adapter, "H-GHOST", 202, _UNMAPPED_MT5_SYMBOL
+        )
+        adapter._remember("H-GHOST", 202)
+        with pytest.raises(BrokerInvalidOrderError):
+            adapter.lookup_order_history("H-GHOST")
+
+    def test_lookup_history_unmapped_not_empty_or_incomplete(self):
+        # El fallo de resolucion NO puede degradarse a EMPTY_CONFIRMED ni a un
+        # INCOMPLETE "silencioso": debe ser el error tipado, nunca un resultado.
+        adapter, fake = _ready()
+        fake._orders[203] = self._history_order(
+            adapter, "H-RAW", 203, _UNMAPPED_MT5_SYMBOL
+        )
+        adapter._remember("H-RAW", 203)
+        with pytest.raises(BrokerInvalidOrderError):
+            adapter.lookup_order_history("H-RAW")
+
+    # ---- get_open_orders -------------------------------------------------
+    def test_get_open_orders_all_mapped_ok(self):
+        adapter, fake = _ready()
+        fake.add_open_order(301, symbol=MT5_SYMBOL)
+        orders = adapter.get_open_orders()
+        assert len(orders) == 1
+        assert orders[0].instrument == ATLAS_INSTRUMENT
+
+    def test_get_open_orders_unmapped_raises(self):
+        adapter, fake = _ready()
+        fake.add_open_order(302, symbol=_UNMAPPED_MT5_SYMBOL)
+        with pytest.raises(BrokerInvalidOrderError):
+            adapter.get_open_orders()
+
+    def test_get_open_orders_mixed_has_no_partial_snapshot(self):
+        adapter, fake = _ready()
+        fake.add_open_order(303, symbol=MT5_SYMBOL)
+        fake.add_open_order(304, symbol=_UNMAPPED_MT5_SYMBOL)
+        with pytest.raises(BrokerInvalidOrderError):
+            adapter.get_open_orders()  # NO devuelve una lista parcial
+
+    # ---- fallo POST-SEND (efecto externo ya ocurrido) --------------------
+    def test_submit_post_send_unmapped_raises_no_order(self):
+        adapter, fake = _adapter(_UnmappedSymbolAfterSend())
+        adapter.connect()
+        with pytest.raises(BrokerInvalidOrderError):
+            adapter.submit_order(_order(cid="S-UNMAP"))
+        assert fake.send_count == 1  # order_send SI ocurrio (efecto externo)
+
+    def test_cancel_post_send_unmapped_raises_no_order(self):
+        adapter, fake = _ready()
+        cid = "CANC-UNMAP"
+        fake.add_open_order(
+            401, symbol=_UNMAPPED_MT5_SYMBOL,
+            magic=adapter._magic_for(cid), comment=adapter._comment_for(cid),
+        )
+        with pytest.raises(BrokerInvalidOrderError):
+            adapter.cancel_order(cid)
+        # La cancelacion SI se ejecuto en el broker antes del fallo de resolucion.
+        assert fake._orders[401].state == ORDER_STATE_CANCELED
+
+
+# --------------------------------------------------------------------------
 # FILLS
 # --------------------------------------------------------------------------
 

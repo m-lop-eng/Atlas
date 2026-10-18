@@ -60,6 +60,7 @@ from brokers.mt5 import (
 from brokers.models import (
     BrokerConnectionError,
     BrokerFill,
+    BrokerInvalidOrderError,
     BrokerOrder,
     BrokerOrderState,
 )
@@ -594,3 +595,55 @@ class TestCompatibility:
         rt.close_position()
         assert journal.get("CLOSE:EURUSD").operation == OPERATION_CLOSE
         assert journal.get("O-1").operation == OPERATION_OPEN
+
+
+# --------------------------------------------------------------------------
+# 06I-C1: fallo de resolucion POST-SEND (efecto externo ya ocurrido)
+# --------------------------------------------------------------------------
+
+
+class UnmappedSymbolAfterSendFakeMT5(AccountingFakeMT5):
+    """La orden ENVIADA queda registrada con un simbolo MT5 NO mapeado.
+
+    Simula un broker que responde DONE pero refleja la orden con un simbolo ajeno
+    a la configuracion: la resolucion MT5->Atlas del adaptador falla DESPUES de
+    que `order_send` ya incremento el contador (efecto externo simulado).
+    """
+
+    unmapped_symbol = "GHOST.raw"
+
+    def order_send(self, request):
+        result = super().order_send(request)
+        ticket = getattr(result, "order", None)
+        if ticket and int(ticket) in self._orders:
+            self._orders[int(ticket)].symbol = self.unmapped_symbol
+        return result
+
+
+class TestPostSendSymbolResolutionFailure:
+    def test_post_send_failure_propagates_and_blocks_next_operation(self, tmp_path):
+        fake = UnmappedSymbolAfterSendFakeMT5()
+        rt, adapter, fake2, ledger, journal, store = _runtime(
+            tmp_path, fake=fake, maker=True
+        )
+        assert rt.initialize().ready is True
+
+        # 1) La operacion SI llego al broker (efecto externo) pero la resolucion
+        #    posterior falla: el error tipado se propaga (no es exito).
+        with pytest.raises(BrokerInvalidOrderError):
+            rt.submit(side=OrderSide.BUY, quantity=0.1, strategy_id="s",
+                      strategy_version="1.0.0", client_order_id="P-1")
+        assert fake.send_count == 1
+
+        # 2) El runtime NO autoriza una nueva operacion hasta la recuperacion:
+        #    el intent WRITE-AHEAD previo queda sin resolver y bloquea el envio.
+        sends = fake.send_count
+        with pytest.raises(ExecutionBlockedError):
+            rt.submit(side=OrderSide.BUY, quantity=0.1, strategy_id="s",
+                      strategy_version="1.0.0", client_order_id="P-2")
+        assert fake.send_count == sends  # sin segundo order_send
+        assert len(journal.unresolved()) == 1
+
+        # 3) La recuperacion NO limpia la incertidumbre en silencio.
+        assert rt.initialize().ready is False
+        assert len(journal.unresolved()) == 1

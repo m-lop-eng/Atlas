@@ -32,6 +32,7 @@ from brokers import (
     PaperBrokerAdapter,
     SubmitStatus,
 )
+from brokers.models import BrokerInvalidOrderError
 from brokers.reconcile import resolve_order
 from execution.order import Order, OrderSide, OrderType
 from reconciliation import (
@@ -559,6 +560,46 @@ class TestOracleWithPaperBroker:
         assert "submit_order" not in calls
         assert "cancel_order" not in calls
         assert calls  # el reconciliador SÍ usó lecturas get_*
+
+
+# ---------------------------------------------------------------------------
+# 06I-C1: snapshot no interpretable (simbolo MT5 sin mapping) => no disponible
+# ---------------------------------------------------------------------------
+
+
+class _UninterpretableOpenOrdersAdapter:
+    """Adapter de solo lectura con una orden abierta de simbolo MT5 sin mapping.
+
+    Su `get_open_orders` no puede interpretar la coleccion de forma INTEGRA, por
+    lo que falla de forma cerrada (BrokerInvalidOrderError) en lugar de devolver
+    una instantanea parcial.
+    """
+
+    account_id = "REC-UNMAPPED"
+
+    def health(self) -> bool:
+        return True
+
+    def get_open_orders(self):
+        raise BrokerInvalidOrderError(
+            "sin mapping explicito MT5->Atlas para 'GHOST.raw'"
+        )
+
+
+class TestUnmappedSymbolReconciliation:
+    def test_unmapped_open_order_yields_unavailable_no_match(self) -> None:
+        from reconciliation.orchestrator import (
+            broker_state_from_adapter, reconcile_with_broker,
+        )
+
+        adapter = _UninterpretableOpenOrdersAdapter()
+        snapshot = broker_state_from_adapter(adapter)
+        assert snapshot.available is False  # fail-closed, nunca parcial
+
+        report = reconcile_with_broker(_engine(), InternalSnapshot(), adapter)
+        assert report.status == ReconciliationStatus.RECONCILIATION_UNKNOWN
+        assert report.trading_allowed is False
+        assert not report.has(DiscrepancyClass.MISMATCH)
 
 
 if __name__ == "__main__":  # pragma: no cover
