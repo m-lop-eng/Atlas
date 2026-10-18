@@ -24,6 +24,8 @@ from brokers.mt5 import (
     HISTORY_COMPLETE,
     HISTORY_EMPTY_CONFIRMED,
     HISTORY_INCOMPLETE,
+    MT5AccountObservationError,
+    MT5AccountSnapshot,
     MT5BrokerAdapter,
     MT5Config,
     MT5ConfigError,
@@ -479,6 +481,142 @@ class TestAccount:
         fake.account.balance = float("nan")
         with pytest.raises(BrokerError):
             adapter.get_account_state()
+
+
+# --------------------------------------------------------------------------
+# 06I-B4: metadatos economicos observados de la cuenta (profit/assets/...)
+# --------------------------------------------------------------------------
+
+
+_ACCT_FIELDS = ("profit", "assets", "liabilities", "commission_blocked")
+
+
+def _account_property_raising(base, name, exc):
+    """`account_info` double con descriptor `name` DEFINIDO que lanza `exc`."""
+
+    def _getter(self):
+        raise exc
+
+    cls = type("_AcctProp", (), {name: property(_getter)})
+    obj = cls()
+    obj.__dict__.update(vars(base))
+    return obj
+
+
+class _AcctDynamic:
+    """`account_info` double cuyo `name` procede de `__getattr__`."""
+
+    def __init__(self, base, name, value):
+        self.__dict__.update(vars(base))
+        self._name = name
+        self._value = value
+
+    def __getattr__(self, item):
+        if item == self._name:
+            return self._value
+        raise AttributeError(item)
+
+
+class TestAccountFinancialMetadata:
+    def _base(self, fake):
+        if not hasattr(fake.account, "server"):
+            fake.account.server = "MetaQuotes-Demo"
+        if not hasattr(fake.account, "credit"):
+            fake.account.credit = 0.0
+        return fake.account
+
+    def _snap(self, adapter, fake, **fields):
+        self._base(fake)
+        for name, value in fields.items():
+            setattr(fake.account, name, value)
+        return adapter.read_account_snapshot()
+
+    def test_distinct_values_captured(self):
+        adapter, fake = _ready()
+        snap = self._snap(adapter, fake, profit=12.5, assets=100.0,
+                          liabilities=7.0, commission_blocked=3.25)
+        assert snap.profit == pytest.approx(12.5)
+        assert snap.assets == pytest.approx(100.0)
+        assert snap.liabilities == pytest.approx(7.0)
+        assert snap.commission_blocked == pytest.approx(3.25)
+
+    def test_absent_all_none(self):
+        adapter, fake = _ready()
+        snap = self._snap(adapter, fake)
+        assert all(getattr(snap, f) is None for f in _ACCT_FIELDS)
+
+    def test_present_none_is_none(self):
+        adapter, fake = _ready()
+        snap = self._snap(adapter, fake, **{f: None for f in _ACCT_FIELDS})
+        assert all(getattr(snap, f) is None for f in _ACCT_FIELDS)
+
+    def test_explicit_zero_preserved_not_absence(self):
+        adapter, fake = _ready()
+        snap = self._snap(adapter, fake, **{f: 0.0 for f in _ACCT_FIELDS})
+        for f in _ACCT_FIELDS:
+            assert getattr(snap, f) == 0.0
+            assert getattr(snap, f) is not None
+
+    def test_partial_present_others_none(self):
+        adapter, fake = _ready()
+        snap = self._snap(adapter, fake, profit=-5.0, assets=50.0)
+        assert snap.profit == pytest.approx(-5.0)
+        assert snap.assets == pytest.approx(50.0)
+        assert snap.liabilities is None
+        assert snap.commission_blocked is None
+
+    @pytest.mark.parametrize("field", _ACCT_FIELDS)
+    @pytest.mark.parametrize(
+        "value", [True, False, "1.0", "x", object(), float("nan"),
+                  float("inf"), float("-inf"), 10 ** 400]
+    )
+    def test_invalid_value_typed_error(self, field, value):
+        adapter, fake = _ready()
+        self._base(fake)
+        setattr(fake.account, field, value)
+        with pytest.raises(MT5AccountObservationError):
+            adapter.read_account_snapshot()
+
+    @pytest.mark.parametrize("field", _ACCT_FIELDS)
+    @pytest.mark.parametrize(
+        "exc", [AttributeError("x"), RuntimeError("x"), ValueError("x")]
+    )
+    def test_defective_getter_typed_error(self, field, exc):
+        adapter, fake = _ready()
+        base = self._base(fake)
+        fake.account = _account_property_raising(base, field, exc)
+        with pytest.raises(MT5AccountObservationError):
+            adapter.read_account_snapshot()
+
+    @pytest.mark.parametrize("field", _ACCT_FIELDS)
+    def test_dynamic_valid_preserved(self, field):
+        adapter, fake = _ready()
+        base = self._base(fake)
+        fake.account = _AcctDynamic(base, field, 4.5)
+        snap = adapter.read_account_snapshot()
+        assert getattr(snap, field) == pytest.approx(4.5)
+
+    def test_original_fields_unchanged(self):
+        adapter, fake = _ready()
+        snap = self._snap(adapter, fake, profit=1.0, assets=2.0,
+                          liabilities=3.0, commission_blocked=4.0)
+        assert snap.balance == pytest.approx(10_000.0)
+        assert snap.equity == pytest.approx(10_000.0)
+        assert snap.credit == pytest.approx(0.0)
+        assert snap.currency == "USD"
+        assert snap.margin_mode == 0
+
+    def test_constructors_back_compat(self):
+        kwargs = dict(
+            server="s", login="1", login_masked="***1", currency="USD",
+            margin_mode=0, balance=1.0, credit=0.5, equity=1.5,
+        )
+        snap_kw = MT5AccountSnapshot(**kwargs)
+        assert all(getattr(snap_kw, f) is None for f in _ACCT_FIELDS)
+        snap_pos = MT5AccountSnapshot(
+            "s", "1", "***1", "USD", 0, 1.0, 0.5, 1.5
+        )
+        assert all(getattr(snap_pos, f) is None for f in _ACCT_FIELDS)
 
 
 # --------------------------------------------------------------------------

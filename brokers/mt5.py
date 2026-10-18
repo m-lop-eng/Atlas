@@ -619,6 +619,16 @@ class MT5AccountSnapshot:
     balance: float
     credit: float
     equity: float
+    # 06I-B4: valores OBSERVADOS del proveedor MT5 (`account_info()`), NO
+    # calculados por Atlas. `None` = no disponible/no capturado (NUNCA cero).
+    #   * profit: beneficio actual reportado para la cuenta.
+    #   * assets / liabilities: activos/pasivos reportados por el proveedor.
+    #   * commission_blocked: comisiones bloqueadas reportadas por el proveedor.
+    # NO son componentes sumables de equity sin una politica contable demostrada.
+    profit: float | None = None
+    assets: float | None = None
+    liabilities: float | None = None
+    commission_blocked: float | None = None
 
 
 class MT5MarketMarkError(BrokerError):
@@ -966,6 +976,22 @@ class MT5BrokerAdapter(BrokerAdapter):
             balance=_finite(getattr(info, "balance")),
             credit=_finite(credit),
             equity=_finite(getattr(info, "equity")),
+            # 06I-B4: metadatos economicos OPCIONALES, leidos INDEPENDIENTEMENTE
+            # del proveedor. Ausente/None => None (NUNCA cero); un getter
+            # defectuoso NO se degrada a ausencia. Error tipado de snapshots:
+            # `MT5AccountObservationError` (subclase de `BrokerError`).
+            profit=_read_optional_finite_attr(
+                info, "profit", error_cls=MT5AccountObservationError
+            ),
+            assets=_read_optional_finite_attr(
+                info, "assets", error_cls=MT5AccountObservationError
+            ),
+            liabilities=_read_optional_finite_attr(
+                info, "liabilities", error_cls=MT5AccountObservationError
+            ),
+            commission_blocked=_read_optional_finite_attr(
+                info, "commission_blocked", error_cls=MT5AccountObservationError
+            ),
         )
 
     # -------------------------------------------------------- marcas (06F)
