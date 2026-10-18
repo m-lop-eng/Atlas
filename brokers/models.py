@@ -191,6 +191,11 @@ class Position:
     # reporta el broker, para poder canonicalizar con el resolver sin depender del
     # fallback textual. `None` en caminos no-MT5 (SPOT/genericos).
     mt5_symbol: str | None = None
+    # ATLAS-MT5-ACCOUNTING-06I-B3: swap ACUMULADO informado por el broker para la
+    # posicion abierta (`POSITION_SWAP`). `None` = dato NO disponible o no
+    # capturado, NUNCA cero. Puede ser negativo. Solo metadato: no se suma a
+    # equity, no se deriva de dias/swap_long/swap_short ni se usa economicamente.
+    swap: float | None = None
 
 
 @dataclass(frozen=True, slots=True)

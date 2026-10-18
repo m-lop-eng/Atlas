@@ -53,6 +53,7 @@ from brokers.models import (
     BrokerPermissionError,
     OrderNotFoundError,
     OrderRejectedError,
+    Position,
     SubmitStatus,
 )
 
@@ -928,6 +929,121 @@ class TestOpenOrdersPositions:
         fake.add_position(83, symbol=MT5_SYMBOL, volume=1.0)
         with pytest.raises(BrokerError):
             adapter.get_positions()
+
+
+# --------------------------------------------------------------------------
+# 06I-B3: captura estricta del SWAP acumulado de posiciones abiertas
+# --------------------------------------------------------------------------
+
+
+_SWAP_NOT_SET = object()
+
+
+class _PosSwapRaiser:
+    """Posicion MT5 con un descriptor `swap` DEFINIDO que lanza `exc`."""
+
+    def __init__(self, base, exc):
+        self.__dict__.update(vars(base))
+        self._exc = exc
+
+    @property
+    def swap(self):
+        raise self._exc
+
+
+class _PosSwapDynamic:
+    """Posicion MT5 cuyo `swap` procede de `__getattr__` (atributo dinamico)."""
+
+    def __init__(self, base, value):
+        self.__dict__.update(vars(base))
+        self._value = value
+
+    def __getattr__(self, item):
+        if item == "swap":
+            return self._value
+        raise AttributeError(item)
+
+
+class TestPositionSwapCapture:
+    def _view(self, adapter, fake, ticket, *, swap=_SWAP_NOT_SET, **kw):
+        fake.add_position(ticket, symbol=MT5_SYMBOL, **kw)
+        if swap is not _SWAP_NOT_SET:
+            setattr(fake._positions[ticket], "swap", swap)
+        return adapter.get_positions()[0]
+
+    def test_positive_swap_preserved(self):
+        adapter, fake = _ready()
+        pos = self._view(adapter, fake, 90, swap=1.25)
+        assert pos.swap == pytest.approx(1.25)
+
+    def test_negative_swap_preserved(self):
+        adapter, fake = _ready()
+        pos = self._view(adapter, fake, 91, swap=-2.5)
+        assert pos.swap == pytest.approx(-2.5)
+
+    def test_absent_attribute_is_none(self):
+        adapter, fake = _ready()
+        pos = self._view(adapter, fake, 92)
+        assert pos.swap is None
+
+    def test_present_none_is_none(self):
+        adapter, fake = _ready()
+        pos = self._view(adapter, fake, 93, swap=None)
+        assert pos.swap is None
+
+    def test_absent_is_none_not_zero(self):
+        adapter, fake = _ready()
+        pos = self._view(adapter, fake, 94)
+        assert pos.swap is None
+        assert pos.swap != 0.0
+
+    @pytest.mark.parametrize(
+        "value", [True, False, "1.0", "x", object(), float("nan"),
+                  float("inf"), float("-inf"), 10 ** 400]
+    )
+    def test_invalid_swap_typed_error(self, value):
+        adapter, fake = _ready()
+        fake.add_position(95, symbol=MT5_SYMBOL)
+        setattr(fake._positions[95], "swap", value)
+        with pytest.raises(BrokerError):
+            adapter.get_positions()
+
+    @pytest.mark.parametrize(
+        "exc", [AttributeError("x"), RuntimeError("x"), ValueError("x")]
+    )
+    def test_defined_getter_raises_typed_error(self, exc):
+        adapter, fake = _ready()
+        fake.add_position(96, symbol=MT5_SYMBOL)
+        base = fake._positions[96]
+        fake._positions[96] = _PosSwapRaiser(base, exc)
+        with pytest.raises(BrokerError):
+            adapter.get_positions()
+
+    def test_dynamic_valid_swap_preserved(self):
+        adapter, fake = _ready()
+        fake.add_position(97, symbol=MT5_SYMBOL)
+        base = fake._positions[97]
+        fake._positions[97] = _PosSwapDynamic(base, 0.75)
+        assert adapter.get_positions()[0].swap == pytest.approx(0.75)
+
+    def test_other_fields_unchanged_with_swap(self):
+        adapter, fake = _ready()
+        pos = self._view(adapter, fake, 98, swap=3.0, volume=1.5,
+                         price_open=50_000.0, type=1)
+        assert pos.swap == pytest.approx(3.0)
+        assert pos.quantity == pytest.approx(-1.5)
+        assert pos.avg_entry_price == pytest.approx(50_000.0)
+        assert pos.instrument == ATLAS_INSTRUMENT
+        assert pos.mt5_symbol == MT5_SYMBOL
+
+    def test_position_constructors_back_compat(self):
+        old_kw = Position(
+            instrument="EURUSD", quantity=1.0, avg_entry_price=1.1,
+            updated_at=NOW,
+        )
+        assert old_kw.swap is None
+        old_pos = Position("EURUSD", 1.0, 1.1, NOW)  # posicional antiguo
+        assert old_pos.swap is None
 
 
 # --------------------------------------------------------------------------

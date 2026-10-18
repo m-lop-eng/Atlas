@@ -400,27 +400,29 @@ def _safe_attr(obj: Any, name: str, *, error_cls: type) -> Any:
         ) from exc
 
 
-def _read_optional_finite_attr(info: Any, name: str) -> float | None:
-    """Lee un campo numerico OPCIONAL de `symbol_info` con validacion ESTRICTA.
+def _read_optional_finite_attr(
+    info: Any, name: str, *, error_cls: type = BrokerInvalidOrderError
+) -> float | None:
+    """Lee un campo numerico OPCIONAL con validacion ESTRICTA.
 
     * Ausente o `None` => `None`.
-    * Acceso defectuoso a un atributo DEFINIDO => `BrokerInvalidOrderError`.
-    * No numerico (bool/str/objeto) => `BrokerInvalidOrderError`.
-    * No finito (NaN/Inf) o fuera de rango (`OverflowError`) => `BrokerInvalidOrderError`.
+    * Acceso defectuoso a un atributo DEFINIDO => `error_cls`.
+    * No numerico (bool/str/objeto) => `error_cls`.
+    * No finito (NaN/Inf) o fuera de rango (`OverflowError`) => `error_cls`.
     Reutiliza `_safe_attr` (ausencia vs getter defectuoso) y `_finite` (finitud),
-    sin una segunda implementacion divergente.
+    sin una segunda implementacion divergente. `error_cls` (por defecto
+    `BrokerInvalidOrderError`, contexto `symbol_info`) debe aceptar un unico
+    `str`; para datos de POSICIONES el contrato aplicable es `BrokerError`.
     """
-    raw = _safe_attr(info, name, error_cls=BrokerInvalidOrderError)
+    raw = _safe_attr(info, name, error_cls=error_cls)
     if raw is None:
         return None
     if isinstance(raw, bool) or not isinstance(raw, (int, float)):
-        raise BrokerInvalidOrderError(
-            f"{name} invalido (tipo {type(raw).__name__})"
-        )
+        raise error_cls(f"{name} invalido (tipo {type(raw).__name__})")
     try:
         return _finite(raw)
     except BrokerError as exc:
-        raise BrokerInvalidOrderError(f"{name} invalido ({exc})") from exc
+        raise error_cls(f"{name} invalido ({exc})") from exc
 
 
 def _read_trade_calc_mode(info: Any) -> int | None:
@@ -1741,6 +1743,11 @@ class MT5BrokerAdapter(BrokerAdapter):
                 else None
             ),
             comment=str(getattr(p, "comment", "") or ""),
+            # 06I-B3: swap ACUMULADO reportado por el broker (`POSITION_SWAP`).
+            # Validacion estricta con el error del contexto de posiciones
+            # (`BrokerError`); ausente/None => None (NUNCA cero). Puede ser
+            # negativo. Solo metadato: NO se usa economicamente aqui.
+            swap=_read_optional_finite_attr(p, "swap", error_cls=BrokerError),
         )
 
     def resolve_position(self, position_id: str) -> Position | None:
