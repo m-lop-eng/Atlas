@@ -165,6 +165,130 @@ class TestIsolation:
         assert fake.cancel_count == 0
 
 
+# ---------------------------------- 06I-B5: resolucion del NOMBRE del modo
+
+
+def _with_consts(fake, **consts):
+    for name, value in consts.items():
+        setattr(fake, name, value)
+    return fake
+
+
+class TestCalcModeNameResolution:
+    def test_raw_int_preserved_when_name_resolved(self):
+        fake = _with_consts(_fake(), SYMBOL_CALC_MODE_FOREX=0)
+        fake.symbols[INSTRUMENT].trade_calc_mode = 0
+        spec = _read(fake)
+        assert spec.trade_calc_mode == 0
+        assert spec.trade_calc_mode_name == "SYMBOL_CALC_MODE_FOREX"
+
+    @pytest.mark.parametrize(
+        "name,value",
+        [
+            ("SYMBOL_CALC_MODE_FOREX", 0),
+            ("SYMBOL_CALC_MODE_FUTURES", 1),
+            ("SYMBOL_CALC_MODE_CFD", 2),
+            ("SYMBOL_CALC_MODE_CFDINDEX", 3),
+            ("SYMBOL_CALC_MODE_CFDLEVERAGE", 4),
+            ("SYMBOL_CALC_MODE_FOREX_NO_LEVERAGE", 5),
+            ("SYMBOL_CALC_MODE_EXCH_STOCKS", 32),
+            ("SYMBOL_CALC_MODE_EXCH_BONDS", 37),
+            ("SYMBOL_CALC_MODE_SERV_COLLATERAL", 64),
+        ],
+    )
+    def test_known_constant_maps_to_exact_name(self, name, value):
+        fake = _with_consts(_fake(), **{name: value})
+        fake.symbols[INSTRUMENT].trade_calc_mode = value
+        spec = _read(fake)
+        assert spec.trade_calc_mode == value
+        assert spec.trade_calc_mode_name == name
+
+    def test_uses_module_values_not_hardcoded_table(self):
+        # La constante del modulo vale 999 (NO 0): el nombre debe resolverse por
+        # el VALOR del modulo, no por una tabla documental hardcodeada.
+        fake = _with_consts(_fake(), SYMBOL_CALC_MODE_FOREX=999)
+        fake.symbols[INSTRUMENT].trade_calc_mode = 999
+        assert _read(fake).trade_calc_mode_name == "SYMBOL_CALC_MODE_FOREX"
+        fake.symbols[INSTRUMENT].trade_calc_mode = 0
+        assert _read(fake).trade_calc_mode_name is None
+
+    def test_unknown_mode_keeps_int_and_none_name(self):
+        fake = _with_consts(_fake(), SYMBOL_CALC_MODE_FOREX=0)
+        fake.symbols[INSTRUMENT].trade_calc_mode = 4
+        spec = _read(fake)
+        assert spec.trade_calc_mode == 4
+        assert spec.trade_calc_mode_name is None
+
+    def test_35_not_inferred_as_forts(self):
+        # El modulo de prueba NO expone EXCH_FUTURES_FORTS: 35 no se etiqueta.
+        fake = _with_consts(_fake(), SYMBOL_CALC_MODE_FOREX=0)
+        fake.symbols[INSTRUMENT].trade_calc_mode = 35
+        spec = _read(fake)
+        assert spec.trade_calc_mode == 35
+        assert spec.trade_calc_mode_name is None
+
+    def test_missing_constants_no_error(self):
+        # Solo una constante presente: las ausentes no rompen la lectura.
+        fake = _with_consts(_fake(), SYMBOL_CALC_MODE_CFD=2)
+        fake.symbols[INSTRUMENT].trade_calc_mode = 2
+        assert _read(fake).trade_calc_mode_name == "SYMBOL_CALC_MODE_CFD"
+
+    def test_ambiguous_duplicate_values_not_resolved(self):
+        fake = _with_consts(
+            _fake(), SYMBOL_CALC_MODE_CFD=7, SYMBOL_CALC_MODE_CFDINDEX=7
+        )
+        fake.symbols[INSTRUMENT].trade_calc_mode = 7
+        spec = _read(fake)
+        assert spec.trade_calc_mode == 7
+        assert spec.trade_calc_mode_name is None  # ambiguedad: sin eleccion
+
+    def test_bool_constant_does_not_match(self):
+        fake = _with_consts(_fake(), SYMBOL_CALC_MODE_FOREX=True)
+        fake.symbols[INSTRUMENT].trade_calc_mode = 1
+        assert _read(fake).trade_calc_mode_name is None
+
+    def test_non_int_constant_does_not_match(self):
+        fake = _with_consts(_fake(), SYMBOL_CALC_MODE_FOREX="0")
+        fake.symbols[INSTRUMENT].trade_calc_mode = 0
+        assert _read(fake).trade_calc_mode_name is None
+
+    def test_module_without_constants_yields_none(self):
+        fake = _fake()
+        fake.symbols[INSTRUMENT].trade_calc_mode = 3
+        spec = _read(fake)
+        assert spec.trade_calc_mode == 3
+        assert spec.trade_calc_mode_name is None
+
+    def test_calc_mode_none_keeps_name_none(self):
+        fake = _with_consts(_fake(), SYMBOL_CALC_MODE_FOREX=0)
+        fake.symbols[INSTRUMENT].trade_calc_mode = None
+        spec = _read(fake)
+        assert spec.trade_calc_mode is None
+        assert spec.trade_calc_mode_name is None
+
+    def test_old_positional_constructor_still_works(self):
+        spec = MT5SymbolSpec(
+            "EURUSD", "EURUSD", True, 0.01, 0.01, 100.0, 0.00001, 0.00001,
+            1.0, 100000.0, "EUR", "USD", "USD", SYMBOL_TRADE_MODE_FULL, 1, 5,
+        )
+        assert spec.trade_calc_mode is None
+        assert spec.trade_calc_mode_name is None
+
+    def test_other_contracts_unchanged(self):
+        fake = _with_consts(_fake(), SYMBOL_CALC_MODE_FOREX=0)
+        fake.symbols[INSTRUMENT].trade_calc_mode = 0
+        fake.symbols[INSTRUMENT].trade_tick_value = 2.5
+        fake.symbols[INSTRUMENT].trade_tick_value_profit = 2.5
+        fake.symbols[INSTRUMENT].trade_tick_value_loss = 3.5
+        spec = _read(fake)
+        assert spec.trade_mode == SYMBOL_TRADE_MODE_FULL
+        assert spec.trade_tick_value == pytest.approx(2.5)
+        assert spec.trade_tick_value_profit == pytest.approx(2.5)
+        assert spec.trade_tick_value_loss == pytest.approx(3.5)
+        atlas = instrument_spec_from_mt5(spec, atlas_instrument_id="EURUSD")
+        assert not hasattr(atlas, "trade_calc_mode_name")
+
+
 # ---------------------------------- 06I-B1: tick value profit/loss
 
 

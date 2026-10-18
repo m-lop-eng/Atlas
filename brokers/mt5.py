@@ -290,6 +290,14 @@ class MT5SymbolSpec:
     # valorar se decidira en una fase posterior.
     trade_tick_value_profit: float | None = None
     trade_tick_value_loss: float | None = None
+    # 06I-B5: nombre SIMBOLICO resuelto de `trade_calc_mode` a partir de las
+    # constantes publicas del modulo MT5 inyectado (p.ej.
+    # `SYMBOL_CALC_MODE_FOREX`). `None` = no se pudo resolver UN nombre unico
+    # (ausente/desconocido/ambiguo) => NUNCA se inventa un modo.
+    # `trade_calc_mode` conserva SIEMPRE el entero ORIGINAL capturado.
+    # El nombre es metadata de IDENTIFICACION: NO declara soporte economico ni
+    # autoriza valoracion.
+    trade_calc_mode_name: str | None = None
 
 
 def instrument_spec_from_mt5(
@@ -449,6 +457,56 @@ def _read_trade_calc_mode(info: Any) -> int | None:
     return raw
 
 
+# 06I-B5: lista EXPLICITA de nombres de constantes reconocidas (documentadas por
+# MetaQuotes; identificadas en la auditoria 06I-B2). Es un LIMITE de
+# reconocimiento de nombres, NO una whitelist economica ni una tabla de enteros
+# deducida del orden de la documentacion. Reconocer un nombre NO implica soporte
+# de valoracion.
+_TRADE_CALC_MODE_CONSTANT_NAMES: tuple[str, ...] = (
+    "SYMBOL_CALC_MODE_FOREX",
+    "SYMBOL_CALC_MODE_FOREX_NO_LEVERAGE",
+    "SYMBOL_CALC_MODE_FUTURES",
+    "SYMBOL_CALC_MODE_CFD",
+    "SYMBOL_CALC_MODE_CFDINDEX",
+    "SYMBOL_CALC_MODE_CFDLEVERAGE",
+    "SYMBOL_CALC_MODE_EXCH_STOCKS",
+    "SYMBOL_CALC_MODE_EXCH_FUTURES",
+    "SYMBOL_CALC_MODE_EXCH_FUTURES_FORTS",
+    "SYMBOL_CALC_MODE_EXCH_OPTIONS",
+    "SYMBOL_CALC_MODE_EXCH_OPTIONS_MARGIN",
+    "SYMBOL_CALC_MODE_EXCH_BONDS",
+    "SYMBOL_CALC_MODE_EXCH_STOCKS_MOEX",
+    "SYMBOL_CALC_MODE_EXCH_BONDS_MOEX",
+    "SYMBOL_CALC_MODE_SERV_COLLATERAL",
+)
+
+
+def _resolve_trade_calc_mode_name(mt5: Any, value: int | None) -> str | None:
+    """Resuelve el NOMBRE de constante `SYMBOL_CALC_MODE_*` para `value`.
+
+    * Compara por VALOR con las constantes REALES del modulo `mt5` inyectado;
+      NUNCA usa una tabla de enteros deducida del orden documental.
+    * Cada candidata se acepta solo si su valor es `int` y NO `bool`.
+    * Devuelve un nombre SOLO si hay EXACTAMENTE una coincidencia; sin modulo,
+      constante ausente, sin coincidencia o ambiguedad => `None`.
+    * Un fallo de acceso a una constante se trata como "no disponible" (nunca se
+      inventa un sustituto). No convierte str/float a int para coincidir.
+    """
+    if mt5 is None or isinstance(value, bool) or not isinstance(value, int):
+        return None
+    matches: list[str] = []
+    for name in _TRADE_CALC_MODE_CONSTANT_NAMES:
+        try:
+            constant = getattr(mt5, name)
+        except Exception:  # noqa: BLE001 - constante no disponible/defectuosa
+            continue
+        if isinstance(constant, bool) or not isinstance(constant, int):
+            continue
+        if constant == value:
+            matches.append(name)
+    return matches[0] if len(matches) == 1 else None
+
+
 def _load_mt5():
     try:
         import MetaTrader5 as mt5  # type: ignore[import-not-found]
@@ -503,6 +561,7 @@ def read_mt5_symbol_spec(
         raise BrokerInvalidOrderError(
             f"simbolo {mt5_name!r} no operable (trade_mode={trade_mode})"
         )
+    _calc_mode = _read_trade_calc_mode(info)
     spec = MT5SymbolSpec(
         strategy_instrument=strategy_instrument,
         name=mt5_name,
@@ -520,13 +579,16 @@ def read_mt5_symbol_spec(
         trade_mode=trade_mode,
         filling_mode=int(getattr(info, "filling_mode", filling_mode_default)),
         digits=int(getattr(info, "digits", 0)),
-        trade_calc_mode=_read_trade_calc_mode(info),
+        trade_calc_mode=_calc_mode,
         trade_tick_value_profit=_read_optional_finite_attr(
             info, "trade_tick_value_profit"
         ),
         trade_tick_value_loss=_read_optional_finite_attr(
             info, "trade_tick_value_loss"
         ),
+        # 06I-B5: nombre SIMBOLICO resuelto con el modulo MT5 INYECTADO (`mt5`),
+        # no con una tabla de enteros. `None` si no se resuelve un nombre unico.
+        trade_calc_mode_name=_resolve_trade_calc_mode_name(mt5, _calc_mode),
     )
     if spec.volume_min <= 0 or spec.volume_step <= 0 or spec.volume_max < spec.volume_min:
         raise BrokerInvalidOrderError(
