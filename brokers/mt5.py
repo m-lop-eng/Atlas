@@ -278,6 +278,12 @@ class MT5SymbolSpec:
     trade_mode: int
     filling_mode: int
     digits: int
+    # 06I-A: modo de CALCULO del instrumento reportado por MT5
+    # (`SYMBOL_TRADE_CALC_MODE`). `None` = desconocido/ausente. NO se deriva de
+    # `trade_mode`. Un entero no negativo no reconocido se conserva TAL CUAL (la
+    # futura politica de valoracion decidira si es admisible); NO implica que sea
+    # apto para valorar.
+    trade_calc_mode: int | None = None
 
 
 def instrument_spec_from_mt5(
@@ -357,6 +363,28 @@ def _finite(value: Any) -> float:
 _ATTR_UNDEFINED = object()
 
 
+def _read_trade_calc_mode(info: Any) -> int | None:
+    """Lee `trade_calc_mode` (SYMBOL_TRADE_CALC_MODE) con validacion ESTRICTA.
+
+    * Ausente o `None` => `None` (desconocido; NUNCA un modo por defecto).
+    * Tipo invalido (bool/str/float/objeto) o entero negativo =>
+      `BrokerInvalidOrderError` (no se convierte en silencio).
+    * Entero `>= 0` (reconocido o no) se conserva TAL CUAL; conservarlo NO
+      significa que sea apto para valorar (eso lo decide la futura politica).
+    No se deriva de `trade_mode`.
+    """
+    raw = getattr(info, "trade_calc_mode", None)
+    if raw is None:
+        return None
+    if isinstance(raw, bool) or not isinstance(raw, int):
+        raise BrokerInvalidOrderError(
+            f"trade_calc_mode invalido (tipo {type(raw).__name__})"
+        )
+    if raw < 0:
+        raise BrokerInvalidOrderError(f"trade_calc_mode invalido: {raw!r}")
+    return raw
+
+
 def _load_mt5():
     try:
         import MetaTrader5 as mt5  # type: ignore[import-not-found]
@@ -428,6 +456,7 @@ def read_mt5_symbol_spec(
         trade_mode=trade_mode,
         filling_mode=int(getattr(info, "filling_mode", filling_mode_default)),
         digits=int(getattr(info, "digits", 0)),
+        trade_calc_mode=_read_trade_calc_mode(info),
     )
     if spec.volume_min <= 0 or spec.volume_step <= 0 or spec.volume_max < spec.volume_min:
         raise BrokerInvalidOrderError(
