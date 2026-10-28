@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import inspect
 import math
+import time
 import zlib
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
@@ -669,6 +670,10 @@ class MT5AccountSnapshot:
     Fuente unica: `MetaTrader5.account_info()` (lectura). `credit` se lee del campo
     reportado y NO se sustituye por cero si falta. NO calcula equity de mercado
     completa: `equity` es el valor reportado por el broker.
+
+    06K1: `observed_at` es la hora LOCAL de captura de la respuesta y el intervalo
+    monotono mide SOLO la llamada a `account_info()`. Ninguno de los dos es un
+    timestamp del servidor de trading.
     """
 
     server: str
@@ -691,6 +696,15 @@ class MT5AccountSnapshot:
     assets: float | None = None
     liabilities: float | None = None
     commission_blocked: float | None = None
+    # ATLAS-MT5-ACCOUNTING-06K1: metadatos temporales OBSERVADOS de la captura.
+    # `observed_at` es la hora LOCAL del reloj inyectado inmediatamente despues
+    # de una respuesta satisfactoria de `account_info()`. NO es un timestamp del
+    # servidor de trading ni demuestra cuando calculo internamente la cuenta.
+    # `None` = no obtenido de forma valida (NUNCA se sustituye por otra fecha).
+    observed_at: datetime | None = None
+    # Intervalo monotono de la llamada a `account_info()` (solo la llamada).
+    read_started_monotonic: float | None = None
+    read_finished_monotonic: float | None = None
 
 
 class MT5MarketMarkError(BrokerError):
@@ -720,6 +734,15 @@ class MT5MarketMark:
         determinar de forma fiable (NO se inventa con la hora local).
       * `received_at`: hora local de RECEPCION (reloj inyectado), UTC. Distinta de
         `tick_time` y de cualquier calculo posterior de equity.
+      * `tick_time_seconds` / `tick_time_msc`: valores CRUDOS de `tick.time` y
+        `tick.time_msc`, tal como los reporta MT5. Se conservan separados de
+        `tick_time` (normalizado) para no perder procedencia. `None` = ausente.
+      * `tick_flags`: valor CRUDO de `tick.flags`, sin interpretar ni deducir
+        frescura de bid/ask. `None` = ausente.
+      * `read_started_monotonic` / `read_finished_monotonic`: intervalo del reloj
+        monotono inyectado alrededor de `symbol_info_tick()`. Mide la duracion de
+        la LLAMADA al API, no necesariamente la antiguedad de la cotizacion en el
+        servidor. `None` = medicion no disponible.
     """
 
     atlas_instrument: str
@@ -729,6 +752,11 @@ class MT5MarketMark:
     last: float | None
     tick_time: datetime | None
     received_at: datetime
+    tick_time_seconds: int | None = None
+    tick_time_msc: int | None = None
+    tick_flags: int | None = None
+    read_started_monotonic: float | None = None
+    read_finished_monotonic: float | None = None
 
 
 class MT5BrokerAdapter(BrokerAdapter):
@@ -748,6 +776,7 @@ class MT5BrokerAdapter(BrokerAdapter):
         *,
         mt5: Any | None = None,
         clock: Callable[[], datetime] = _utc_now,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         if not isinstance(config, MT5Config):
             raise MT5ConfigError("config debe ser MT5Config")
@@ -756,6 +785,7 @@ class MT5BrokerAdapter(BrokerAdapter):
         self.config = config
         self._credentials = credentials
         self._clock = clock
+        self._monotonic = monotonic
         self._mt5 = mt5
         self._state = "DISCONNECTED"
         self._cid_to_ticket: dict[str, int] = {}
@@ -1001,16 +1031,22 @@ class MT5BrokerAdapter(BrokerAdapter):
         `credit` ausente NO se sustituye por cero).
         """
         self._require_ready()
+        mt5 = self._module()
+        read_started = self._monotonic_reading()
         try:
-            info = self._module().account_info()
+            info = mt5.account_info()
         except BrokerError:
             raise
         except Exception as exc:  # noqa: BLE001 - transporte/consulta incierta
             raise BrokerConnectionError(
                 f"account_info fallo ({type(exc).__name__})"
             ) from exc
+        read_finished = self._monotonic_reading()
         if info is None:
             raise BrokerConnectionError("account_info() no disponible")
+        # 06K1: hora LOCAL de captura de la respuesta; nunca la hora del broker
+        # ni `AccountState.as_of` (otra llamada). Si es invalida => None.
+        observed_at = self._observed_at_utc()
         server = getattr(info, "server", None)
         if not isinstance(server, str) or not server.strip():
             raise MT5AccountObservationError("servidor no observable en account_info()")
@@ -1054,6 +1090,9 @@ class MT5BrokerAdapter(BrokerAdapter):
             commission_blocked=_read_optional_finite_attr(
                 info, "commission_blocked", error_cls=MT5AccountObservationError
             ),
+            observed_at=observed_at,
+            read_started_monotonic=read_started,
+            read_finished_monotonic=read_finished,
         )
 
     # -------------------------------------------------------- marcas (06F)
@@ -1087,6 +1126,44 @@ class MT5BrokerAdapter(BrokerAdapter):
                 f"tick con {field_name} invalido ({exc})"
             ) from exc
 
+    def _monotonic_reading(self) -> float | None:
+        """Lectura monotona valida, o `None` (nunca se sustituye por reloj de pared)."""
+        try:
+            value = self._monotonic()
+        except Exception:  # noqa: BLE001 - evidencia temporal best-effort
+            return None
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        try:
+            result = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if not math.isfinite(result):
+            return None
+        return result
+
+    def _observed_at_utc(self) -> datetime | None:
+        """Hora local de captura normalizada a UTC, o `None` si no es valida.
+
+        Se usa para snapshots de cuenta: una hora invalida NO se inventa ni se
+        sustituye por otra fuente. Distinta de `AccountState.as_of`.
+        """
+        try:
+            value = self._clock()
+        except Exception:  # noqa: BLE001 - evidencia temporal best-effort
+            return None
+        if not isinstance(value, datetime):
+            return None
+        try:
+            if value.tzinfo is None:
+                return None
+            offset = value.utcoffset()
+            if offset is None or not isinstance(offset, timedelta):
+                return None
+            return value.astimezone(timezone.utc)
+        except Exception:  # noqa: BLE001 - datetime defectuoso
+            return None
+
     def _received_at_utc(self) -> datetime:
         value = self._clock()
         if (
@@ -1100,9 +1177,12 @@ class MT5BrokerAdapter(BrokerAdapter):
         return value.astimezone(timezone.utc)
 
     @classmethod
-    def _tick_time(cls, tick: Any) -> datetime | None:
-        """Hora del TICK del servidor en UTC, o `None` si no esta disponible.
+    def _tick_time_fields(
+        cls, tick: Any
+    ) -> tuple[datetime | None, int | None, int | None]:
+        """Normaliza el tick y conserva los valores CRUDOS de `time`/`time_msc`.
 
+        Devuelve `(tick_time_utc, raw_time_seconds, raw_time_msc)`.
         `time_msc` (ms) es autoritativo si existe; si tambien hay `time` (s), se
         exige coherencia (`time_msc // 1000 == time`). Ausentes ambos => `None`
         (NO se usa la hora local). Valores malformados => `MT5MarketMarkDataError`.
@@ -1119,28 +1199,43 @@ class MT5BrokerAdapter(BrokerAdapter):
                 raise MT5MarketMarkDataError(f"tick con {field_name} invalido")
             return value
 
+        sec_value: int | None = None
+        msc_value: int | None = None
+        if raw_sec is not None:
+            sec_value = _as_epoch(raw_sec, "time")
         if raw_msc is not None:
-            msc = _as_epoch(raw_msc, "time_msc")
-            if raw_sec is not None and _as_epoch(raw_sec, "time") != msc // 1000:
+            msc_value = _as_epoch(raw_msc, "time_msc")
+            if sec_value is not None and sec_value != msc_value // 1000:
                 raise MT5MarketMarkDataError(
                     "tick con time/time_msc incoherentes"
                 )
             try:
-                base = datetime.fromtimestamp(msc // 1000, tz=timezone.utc)
+                base = datetime.fromtimestamp(
+                    msc_value // 1000, tz=timezone.utc
+                )
             except (OverflowError, OSError, ValueError) as exc:
                 raise MT5MarketMarkDataError(
-                    f"tick con time_msc fuera de rango: {msc!r}"
+                    f"tick con time_msc fuera de rango: {msc_value!r}"
                 ) from exc
-            return base + timedelta(milliseconds=msc % 1000)
-        if raw_sec is not None:
-            sec = _as_epoch(raw_sec, "time")
+            return (
+                base + timedelta(milliseconds=msc_value % 1000),
+                sec_value,
+                msc_value,
+            )
+        if sec_value is not None:
             try:
-                return datetime.fromtimestamp(sec, tz=timezone.utc)
+                value = datetime.fromtimestamp(sec_value, tz=timezone.utc)
             except (OverflowError, OSError, ValueError) as exc:
                 raise MT5MarketMarkDataError(
-                    f"tick con time fuera de rango: {sec!r}"
+                    f"tick con time fuera de rango: {sec_value!r}"
                 ) from exc
-        return None
+            return value, sec_value, None
+        return None, None, None
+
+    @classmethod
+    def _tick_time(cls, tick: Any) -> datetime | None:
+        """Hora del TICK normalizada (compatibilidad); ver `_tick_time_fields`."""
+        return cls._tick_time_fields(tick)[0]
 
     def read_market_mark(
         self, atlas_instrument: str, *, require_tick_time: bool = False
@@ -1162,6 +1257,7 @@ class MT5BrokerAdapter(BrokerAdapter):
                 f"instrumento Atlas sin mapping MT5 explicito: {atlas_instrument!r}"
             )
         mt5 = self._module()
+        read_started = self._monotonic_reading()
         try:
             tick = mt5.symbol_info_tick(mt5_symbol)
         except BrokerError:
@@ -1170,6 +1266,7 @@ class MT5BrokerAdapter(BrokerAdapter):
             raise MT5MarketMarkUnavailableError(
                 f"symbol_info_tick fallo ({type(exc).__name__})"
             ) from exc
+        read_finished = self._monotonic_reading()
         if tick is None:
             raise MT5MarketMarkUnavailableError(
                 f"sin tick disponible para {mt5_symbol!r} (simbolo no disponible; "
@@ -1182,7 +1279,17 @@ class MT5BrokerAdapter(BrokerAdapter):
             raise MT5MarketMarkDataError(
                 "tick sin precios utilizables (bid/ask/last ausentes)"
             )
-        tick_time = self._tick_time(tick)
+        tick_flags = self._tick_attr(tick, "flags")
+        if tick_flags is not None and (
+            isinstance(tick_flags, bool) or not isinstance(tick_flags, int)
+        ):
+            raise MT5MarketMarkDataError(
+                "tick con flags invalido (tipo "
+                f"{type(tick_flags).__name__})"
+            )
+        tick_time, tick_time_seconds, tick_time_msc = self._tick_time_fields(
+            tick
+        )
         if require_tick_time and tick_time is None:
             raise MT5MarketMarkDataError(
                 "tick sin timestamp de mercado verificable"
@@ -1195,6 +1302,11 @@ class MT5BrokerAdapter(BrokerAdapter):
             last=last,
             tick_time=tick_time,
             received_at=self._received_at_utc(),
+            tick_time_seconds=tick_time_seconds,
+            tick_time_msc=tick_time_msc,
+            tick_flags=tick_flags,
+            read_started_monotonic=read_started,
+            read_finished_monotonic=read_finished,
         )
 
     # ---------------------------------------------------------------- simbolos

@@ -11,7 +11,7 @@ RECONCILIATION. No usa sleeps.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -80,6 +80,7 @@ class FakeMT5:
             login=123456, balance=10_000.0, equity=10_000.0,
             margin_free=9_000.0, currency="USD", margin_mode=0,
             trade_allowed=True, trade_expert=True, trade_mode=0,
+            server="MetaQuotes-Demo", credit=0.0,
         )
         self.last_error_value = (0, "ok")
         self.symbols: dict = {}
@@ -329,13 +330,21 @@ def _credentials() -> MT5Credentials:
     return MT5Credentials(login=123456, password=PASSWORD_CANARY, server="demo")
 
 
-def _adapter(fake: FakeMT5 | None = None, **cfg) -> tuple[MT5BrokerAdapter, FakeMT5]:
+def _adapter(
+    fake: FakeMT5 | None = None,
+    *,
+    clock=lambda: NOW,
+    monotonic=lambda: 0.0,
+    **cfg,
+) -> tuple[MT5BrokerAdapter, FakeMT5]:
     fake = fake or FakeMT5()
     if MT5_SYMBOL not in fake.symbols:
         fake.add_symbol(MT5_SYMBOL)
     if MT5_SYMBOL not in fake.ticks:
         fake.add_tick(MT5_SYMBOL, bid=49_999.0, ask=50_001.0)
-    adapter = MT5BrokerAdapter(_config(**cfg), _credentials(), mt5=fake, clock=lambda: NOW)
+    adapter = MT5BrokerAdapter(
+        _config(**cfg), _credentials(), mt5=fake, clock=clock, monotonic=monotonic
+    )
     return adapter, fake
 
 
@@ -617,6 +626,271 @@ class TestAccountFinancialMetadata:
             "s", "1", "***1", "USD", 0, 1.0, 0.5, 1.5
         )
         assert all(getattr(snap_pos, f) is None for f in _ACCT_FIELDS)
+
+
+class TestAccountTemporalMetadata:
+    def test_observed_at_uses_injected_clock_after_account_info(self):
+        observed = datetime(2026, 9, 1, 12, 0, 1, tzinfo=UTC)
+        events: list[tuple[str, object]] = []
+        mono_values = iter([100.0, 100.5])
+
+        def monotonic():
+            value = next(mono_values)
+            events.append(("monotonic", value))
+            return value
+
+        def clock():
+            events.append(("clock", None))
+            return observed
+
+        fake = FakeMT5()
+        original = fake.account_info
+
+        def wrapped_account_info():
+            events.append(("account_info", None))
+            return original()
+
+        fake.account_info = wrapped_account_info
+        adapter, _ = _adapter(fake=fake, clock=clock, monotonic=monotonic)
+        adapter.connect()
+        events.clear()
+        snap = adapter.read_account_snapshot()
+        assert events == [
+            ("monotonic", 100.0),
+            ("account_info", None),
+            ("monotonic", 100.5),
+            ("clock", None),
+        ]
+        assert snap.read_started_monotonic == 100.0
+        assert snap.read_finished_monotonic == 100.5
+        assert snap.observed_at == observed
+
+    def test_observed_at_is_not_account_state_as_of(self):
+        state_time = datetime(2026, 9, 1, 12, 0, 0, tzinfo=UTC)
+        snapshot_time = datetime(2026, 9, 1, 12, 0, 5, tzinfo=UTC)
+        values = iter([state_time, snapshot_time])
+        adapter, _ = _adapter(clock=lambda: next(values))
+        adapter.connect()
+        state = adapter.get_account_state()
+        snap = adapter.read_account_snapshot()
+        assert state.as_of == state_time
+        assert snap.observed_at == snapshot_time
+        assert snap.observed_at != state.as_of
+
+    @pytest.mark.parametrize(
+        "clock",
+        [
+            lambda: None,
+            lambda: "not-a-datetime",
+            lambda: datetime(2026, 1, 1, 12, 0, 0),  # naive
+        ],
+    )
+    def test_invalid_wall_clock_keeps_observed_at_none(self, clock):
+        adapter, _ = _adapter(clock=clock)
+        adapter.connect()
+        snap = adapter.read_account_snapshot()
+        assert snap.observed_at is None
+        assert snap.balance == pytest.approx(10_000.0)
+        assert snap.credit == pytest.approx(0.0)
+        assert snap.equity == pytest.approx(10_000.0)
+
+    def test_raising_wall_clock_keeps_observed_at_none(self):
+        def clock():
+            raise RuntimeError("wall clock failure")
+
+        calls = []
+        fake = FakeMT5()
+        original = fake.account_info
+
+        def wrapped():
+            calls.append("account_info")
+            return original()
+
+        fake.account_info = wrapped
+        adapter, _ = _adapter(fake=fake, clock=clock)
+        adapter.connect()
+        calls.clear()
+        snap = adapter.read_account_snapshot()
+        assert calls == ["account_info"]
+        assert snap.observed_at is None
+        assert snap.balance == pytest.approx(10_000.0)
+
+    @pytest.mark.parametrize(
+        "values",
+        [
+            (None, None),
+            (float("nan"), float("inf")),
+            ("x", object()),
+        ],
+    )
+    def test_invalid_monotonic_readings_kept_none(self, values):
+        seq = iter(values)
+        adapter, _ = _adapter(monotonic=lambda: next(seq))
+        adapter.connect()
+        snap = adapter.read_account_snapshot()
+        assert snap.read_started_monotonic is None
+        assert snap.read_finished_monotonic is None
+        assert snap.observed_at == NOW
+
+    def test_monotonic_exception_kept_none(self):
+        def monotonic():
+            raise RuntimeError("monotonic failure")
+
+        adapter, _ = _adapter(monotonic=monotonic)
+        adapter.connect()
+        snap = adapter.read_account_snapshot()
+        assert snap.read_started_monotonic is None
+        assert snap.read_finished_monotonic is None
+        assert snap.observed_at == NOW
+
+    def test_monotonic_integer_overflow_keeps_snapshot(self):
+        calls = []
+        fake = FakeMT5()
+        original = fake.account_info
+
+        def wrapped():
+            calls.append("account_info")
+            return original()
+
+        fake.account_info = wrapped
+        adapter, _ = _adapter(
+            fake=fake, monotonic=lambda: 10**400
+        )
+        adapter.connect()
+        calls.clear()
+        snap = adapter.read_account_snapshot()
+        assert calls == ["account_info"]
+        assert snap.read_started_monotonic is None
+        assert snap.read_finished_monotonic is None
+        assert snap.observed_at == NOW
+        assert snap.balance == pytest.approx(10_000.0)
+        assert snap.credit == pytest.approx(0.0)
+        assert snap.equity == pytest.approx(10_000.0)
+
+    def test_monotonic_exception_at_start_keeps_snapshot(self):
+        calls = []
+        first = True
+        fake = FakeMT5()
+        original = fake.account_info
+
+        def wrapped():
+            calls.append("account_info")
+            return original()
+
+        def monotonic():
+            nonlocal first
+            if first:
+                first = False
+                raise RuntimeError("start clock failure")
+            return 100.0
+
+        fake.account_info = wrapped
+        adapter, _ = _adapter(
+            fake=fake, monotonic=monotonic
+        )
+        adapter.connect()
+        calls.clear()
+        snap = adapter.read_account_snapshot()
+        assert calls == ["account_info"]
+        assert snap.read_started_monotonic is None
+        assert snap.read_finished_monotonic == 100.0
+        assert snap.observed_at == NOW
+        assert snap.balance == pytest.approx(10_000.0)
+
+    def test_monotonic_exception_at_finish_keeps_snapshot(self):
+        calls = []
+        count = 0
+        fake = FakeMT5()
+        original = fake.account_info
+
+        def wrapped():
+            calls.append("account_info")
+            return original()
+
+        def monotonic():
+            nonlocal count
+            count += 1
+            if count == 1:
+                return 100.0
+            raise RuntimeError("finish clock failure")
+
+        fake.account_info = wrapped
+        adapter, _ = _adapter(
+            fake=fake, monotonic=monotonic
+        )
+        adapter.connect()
+        calls.clear()
+        snap = adapter.read_account_snapshot()
+        assert calls == ["account_info"]
+        assert snap.read_started_monotonic == 100.0
+        assert snap.read_finished_monotonic is None
+        assert snap.observed_at == NOW
+        assert snap.balance == pytest.approx(10_000.0)
+
+    def test_defective_datetime_utcoffset_runtime_error_yields_none(self):
+        class BadDatetime(datetime):
+            def utcoffset(self):
+                raise RuntimeError("utcoffset failure")
+
+        value = BadDatetime(2026, 9, 1, 12, 0, 0, tzinfo=UTC)
+        calls = []
+        fake = FakeMT5()
+        original = fake.account_info
+
+        def wrapped():
+            calls.append("account_info")
+            return original()
+
+        fake.account_info = wrapped
+        adapter, _ = _adapter(fake=fake, clock=lambda: value)
+        adapter.connect()
+        calls.clear()
+        snap = adapter.read_account_snapshot()
+        assert calls == ["account_info"]
+        assert snap.observed_at is None
+        assert snap.balance == pytest.approx(10_000.0)
+        assert snap.credit == pytest.approx(0.0)
+        assert snap.equity == pytest.approx(10_000.0)
+
+    def test_defective_datetime_utcoffset_wrong_type_yields_none(self):
+        class BadDatetime(datetime):
+            def utcoffset(self):
+                return "not-a-timedelta"
+
+        value = BadDatetime(2026, 9, 1, 12, 0, 0, tzinfo=UTC)
+        adapter, _ = _adapter(clock=lambda: value)
+        adapter.connect()
+        snap = adapter.read_account_snapshot()
+        assert snap.observed_at is None
+        assert snap.balance == pytest.approx(10_000.0)
+
+    def test_timezone_aware_datetime_normalizes_to_utc(self):
+        source = datetime(
+            2026, 9, 1, 14, 0, 0,
+            tzinfo=timezone(timedelta(hours=2)),
+        )
+        adapter, _ = _adapter(clock=lambda: source)
+        adapter.connect()
+        snap = adapter.read_account_snapshot()
+        assert snap.observed_at == datetime(2026, 9, 1, 12, 0, 0, tzinfo=UTC)
+
+    def test_default_metadata_does_not_change_account_values(self):
+        adapter, _ = _ready()
+        snap = adapter.read_account_snapshot()
+        assert snap.observed_at == NOW
+        assert snap.read_started_monotonic == 0.0
+        assert snap.read_finished_monotonic == 0.0
+        assert snap.balance == pytest.approx(10_000.0)
+        assert snap.credit == pytest.approx(0.0)
+        assert snap.equity == pytest.approx(10_000.0)
+        assert snap.currency == "USD"
+        assert snap.margin_mode == 0
+
+    def test_absent_account_response_still_raises(self):
+        adapter, fake = _ready()
+        fake.account = None
+        with pytest.raises(BrokerConnectionError):
+            adapter.read_account_snapshot()
 
 
 # --------------------------------------------------------------------------

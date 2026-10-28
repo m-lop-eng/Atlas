@@ -30,12 +30,21 @@ UTC = timezone.utc
 EPOCH = 1_700_000_000  # segundos
 
 
-def _mk(fake: FakeMT5, symbol_map, *, clock=lambda: NOW, connect=True) -> MT5BrokerAdapter:
+def _mk(
+    fake: FakeMT5,
+    symbol_map,
+    *,
+    clock=lambda: NOW,
+    monotonic=lambda: 0.0,
+    connect=True,
+) -> MT5BrokerAdapter:
     cfg = MT5Config(
         provider="mt5", environment=MT5Environment.DEMO, symbol_map=symbol_map
     )
     creds = MT5Credentials(login=42, password="not-a-real-password", server="demo")
-    adapter = MT5BrokerAdapter(cfg, creds, mt5=fake, clock=clock)
+    adapter = MT5BrokerAdapter(
+        cfg, creds, mt5=fake, clock=clock, monotonic=monotonic
+    )
     if connect:
         adapter.connect()
     return adapter
@@ -364,3 +373,234 @@ class TestTickAttributeAccess:
         message = str(info.value)
         assert "bid" in message
         assert "password" not in message.lower()
+
+
+class TestTickFlags:
+    def test_flags_are_captured_raw(self):
+        fake = _fake()
+        _tick(fake, INSTRUMENT, time=EPOCH, flags=3)
+        mark = _mk(fake, {INSTRUMENT: INSTRUMENT}).read_market_mark(INSTRUMENT)
+        assert mark.tick_flags == 3
+
+    def test_absent_flags_is_none(self):
+        fake = _fake()
+        _tick(fake, INSTRUMENT, time=EPOCH)
+        mark = _mk(fake, {INSTRUMENT: INSTRUMENT}).read_market_mark(INSTRUMENT)
+        assert mark.tick_flags is None
+
+    def test_defective_flags_getter_is_typed_error(self):
+        fake = _fake()
+        fake.ticks[INSTRUMENT] = _property_attr_error_tick(
+            "flags", bid=1.1, ask=1.2, time=EPOCH
+        )
+        adapter = _mk(fake, {INSTRUMENT: INSTRUMENT})
+        with pytest.raises(MT5MarketMarkDataError):
+            adapter.read_market_mark(INSTRUMENT)
+
+    @pytest.mark.parametrize("value", [True, False, 1.5, "3", object()])
+    def test_invalid_flags_type_is_typed_error(self, value):
+        fake = _fake()
+        _tick(fake, INSTRUMENT, time=EPOCH, flags=value)
+        adapter = _mk(fake, {INSTRUMENT: INSTRUMENT})
+        with pytest.raises(MT5MarketMarkDataError):
+            adapter.read_market_mark(INSTRUMENT)
+
+
+class TestTemporalMetadata:
+    def test_raw_time_fields_preserved(self):
+        fake = _fake()
+        _tick(fake, INSTRUMENT, time=EPOCH, time_msc=EPOCH * 1000 + 250)
+        mark = _mk(fake, {INSTRUMENT: INSTRUMENT}).read_market_mark(INSTRUMENT)
+        assert mark.tick_time_seconds == EPOCH
+        assert mark.tick_time_msc == EPOCH * 1000 + 250
+        expected = datetime.fromtimestamp(EPOCH, tz=UTC).replace(
+            microsecond=250_000
+        )
+        assert mark.tick_time == expected
+        assert mark.bid == pytest.approx(1.0999)
+        assert mark.ask == pytest.approx(1.1001)
+        assert mark.received_at == NOW
+
+    def test_raw_time_fields_absent_are_none(self):
+        fake = _fake()
+        _tick(fake, INSTRUMENT)  # sin time/time_msc
+        mark = _mk(fake, {INSTRUMENT: INSTRUMENT}).read_market_mark(INSTRUMENT)
+        assert mark.tick_time is None
+        assert mark.tick_time_seconds is None
+        assert mark.tick_time_msc is None
+        assert mark.received_at == NOW
+
+    def test_raw_time_seconds_only_preserved(self):
+        fake = _fake()
+        _tick(fake, INSTRUMENT, time=EPOCH)
+        mark = _mk(fake, {INSTRUMENT: INSTRUMENT}).read_market_mark(INSTRUMENT)
+        assert mark.tick_time_seconds == EPOCH
+        assert mark.tick_time_msc is None
+        assert mark.tick_time == datetime.fromtimestamp(EPOCH, tz=UTC)
+
+    def test_monotonic_span_around_symbol_info_tick(self):
+        fake = _fake()
+        _tick(fake, INSTRUMENT, time=EPOCH)
+        events = []
+        values = iter([10.0, 10.25])
+
+        def monotonic():
+            value = next(values)
+            events.append(("monotonic", value))
+            return value
+
+        original = fake.symbol_info_tick
+
+        def wrapped(name):
+            events.append(("tick", name))
+            return original(name)
+
+        fake.symbol_info_tick = wrapped
+        adapter = _mk(
+            fake, {INSTRUMENT: INSTRUMENT}, monotonic=monotonic
+        )
+        mark = adapter.read_market_mark(INSTRUMENT)
+        assert mark.read_started_monotonic == 10.0
+        assert mark.read_finished_monotonic == 10.25
+        assert events == [
+            ("monotonic", 10.0),
+            ("tick", INSTRUMENT),
+            ("monotonic", 10.25),
+        ]
+
+    @pytest.mark.parametrize(
+        "values",
+        [
+            (None, None),
+            (float("nan"), float("inf")),
+            ("x", object()),
+        ],
+    )
+    def test_invalid_monotonic_readings_are_none(self, values):
+        fake = _fake()
+        _tick(fake, INSTRUMENT, time=EPOCH)
+        seq = iter(values)
+        adapter = _mk(
+            fake, {INSTRUMENT: INSTRUMENT}, monotonic=lambda: next(seq)
+        )
+        mark = adapter.read_market_mark(INSTRUMENT)
+        assert mark.read_started_monotonic is None
+        assert mark.read_finished_monotonic is None
+        assert mark.tick_time is not None
+
+    def test_monotonic_exception_is_none(self):
+        fake = _fake()
+        _tick(fake, INSTRUMENT, time=EPOCH)
+
+        def monotonic():
+            raise RuntimeError("monotonic failure")
+
+        adapter = _mk(
+            fake, {INSTRUMENT: INSTRUMENT}, monotonic=monotonic
+        )
+        mark = adapter.read_market_mark(INSTRUMENT)
+        assert mark.read_started_monotonic is None
+        assert mark.read_finished_monotonic is None
+        assert mark.tick_time is not None
+
+    def test_monotonic_integer_overflow_is_none_and_api_still_called(self):
+        fake = _fake()
+        _tick(fake, INSTRUMENT, time=EPOCH)
+        called = []
+        original = fake.symbol_info_tick
+
+        def wrapped(name):
+            called.append(name)
+            return original(name)
+
+        fake.symbol_info_tick = wrapped
+        adapter = _mk(
+            fake,
+            {INSTRUMENT: INSTRUMENT},
+            monotonic=lambda: 10**400,
+        )
+        mark = adapter.read_market_mark(INSTRUMENT)
+        assert called == [INSTRUMENT]
+        assert mark.read_started_monotonic is None
+        assert mark.read_finished_monotonic is None
+        assert mark.read_started_monotonic != 0.0
+        assert mark.read_finished_monotonic != 0.0
+        assert mark.tick_time == datetime.fromtimestamp(EPOCH, tz=UTC)
+        assert mark.received_at == NOW
+        assert mark.bid == pytest.approx(1.0999)
+        assert mark.ask == pytest.approx(1.1001)
+
+    def test_monotonic_exception_at_start_still_calls_api(self):
+        fake = _fake()
+        _tick(fake, INSTRUMENT, time=EPOCH)
+        called = []
+        original = fake.symbol_info_tick
+        first = True
+
+        def wrapped(name):
+            called.append(name)
+            return original(name)
+
+        def monotonic():
+            nonlocal first
+            if first:
+                first = False
+                raise RuntimeError("start clock failure")
+            return 20.0
+
+        fake.symbol_info_tick = wrapped
+        adapter = _mk(
+            fake, {INSTRUMENT: INSTRUMENT}, monotonic=monotonic
+        )
+        mark = adapter.read_market_mark(INSTRUMENT)
+        assert called == [INSTRUMENT]
+        assert mark.read_started_monotonic is None
+        assert mark.read_finished_monotonic == 20.0
+        assert mark.tick_time is not None
+
+    def test_monotonic_exception_at_finish_keeps_mark_valid(self):
+        fake = _fake()
+        _tick(fake, INSTRUMENT, time=EPOCH)
+        called = []
+        original = fake.symbol_info_tick
+        calls = 0
+
+        def wrapped(name):
+            called.append(name)
+            return original(name)
+
+        def monotonic():
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return 20.0
+            raise RuntimeError("finish clock failure")
+
+        fake.symbol_info_tick = wrapped
+        adapter = _mk(
+            fake, {INSTRUMENT: INSTRUMENT}, monotonic=monotonic
+        )
+        mark = adapter.read_market_mark(INSTRUMENT)
+        assert called == [INSTRUMENT]
+        assert mark.read_started_monotonic == 20.0
+        assert mark.read_finished_monotonic is None
+        assert mark.tick_time == datetime.fromtimestamp(EPOCH, tz=UTC)
+        assert mark.received_at == NOW
+        assert mark.bid == pytest.approx(1.0999)
+        assert mark.ask == pytest.approx(1.1001)
+
+    def test_invalid_monotonic_does_not_fill_missing_tick_time(self):
+        fake = _fake()
+        _tick(fake, INSTRUMENT)  # sin time/time_msc
+        adapter = _mk(
+            fake,
+            {INSTRUMENT: INSTRUMENT},
+            monotonic=lambda: 10**400,
+        )
+        mark = adapter.read_market_mark(INSTRUMENT)
+        assert mark.tick_time is None
+        assert mark.tick_time_seconds is None
+        assert mark.tick_time_msc is None
+        assert mark.read_started_monotonic is None
+        assert mark.read_finished_monotonic is None
+        assert mark.received_at == NOW
