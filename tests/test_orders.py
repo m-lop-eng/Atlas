@@ -84,6 +84,34 @@ class TestOrderCreation:
             manager.create_order(**kwargs)
 
 
+class TestStrictQuantityValidation:
+    @pytest.mark.parametrize(
+        "quantity",
+        [None, True, False, "0.1", float("nan"), float("inf"), float("-inf"), 0, -1],
+    )
+    def test_order_rejects_invalid_quantity(self, quantity) -> None:
+        with pytest.raises(ValueError):
+            Order(**_make(quantity=quantity))
+
+    @pytest.mark.parametrize(
+        "quantity",
+        [None, True, False, "0.1", float("nan"), float("inf"), float("-inf"), 0, -1],
+    )
+    def test_manager_rejects_invalid_quantity_without_max(self, quantity) -> None:
+        manager = OrderManager(_max_quantity=None)
+        with pytest.raises(OrderStateError):
+            manager.create_order(**_make(quantity=quantity))
+        assert manager.orders == {}
+
+    def test_valid_numeric_quantities_still_create(self) -> None:
+        manager = OrderManager(_max_quantity=None)
+        for value in (2, 0.1):
+            order = manager.create_order(
+                **_make(client_order_id=f"VALID-{value}", quantity=value)
+            )
+            assert order.quantity == pytest.approx(float(value))
+
+
 class TestOrderTransitions:
     def test_lifecycle(self) -> None:
         manager = OrderManager()

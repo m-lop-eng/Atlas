@@ -13,7 +13,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field, replace
 
-from .order import Fill, Order, OrderStatus
+from .order import Fill, Order, OrderStatus, validate_quantity
 
 
 class OrderStateError(ValueError):
@@ -137,6 +137,7 @@ class OrderManager:
         """
         if not client_order_id:
             raise OrderStateError("client_order_id es obligatorio (idempotencia)")
+        quantity = validate_quantity(quantity, error_cls=OrderStateError)
 
         active = [
             o

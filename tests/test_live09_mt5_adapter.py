@@ -933,6 +933,80 @@ class TestSymbol:
 # --------------------------------------------------------------------------
 
 
+class TestSymbolVolumeMetadata:
+    def _spec_or_raise(self, fake):
+        adapter, _ = _adapter(fake)
+        adapter.connect()
+        return adapter._symbol_spec(ATLAS_INSTRUMENT)
+
+    @pytest.mark.parametrize("field", ["volume_min", "volume_step", "volume_max"])
+    def test_missing_required_volume_field_is_typed(self, field):
+        fake = FakeMT5()
+        fake.add_symbol(MT5_SYMBOL)
+        delattr(fake.symbols[MT5_SYMBOL], field)
+        with pytest.raises(BrokerInvalidOrderError):
+            self._spec_or_raise(fake)
+
+    @pytest.mark.parametrize(
+        "field,value",
+        [
+            ("volume_min", True),
+            ("volume_step", False),
+            ("volume_max", "100"),
+            ("volume_min", None),
+            ("volume_min", float("nan")),
+            ("volume_step", float("inf")),
+            ("volume_max", float("-inf")),
+        ],
+    )
+    def test_invalid_volume_metadata_type_or_value_is_typed(self, field, value):
+        fake = FakeMT5()
+        fake.add_symbol(MT5_SYMBOL)
+        setattr(fake.symbols[MT5_SYMBOL], field, value)
+        with pytest.raises(BrokerInvalidOrderError):
+            self._spec_or_raise(fake)
+
+    @pytest.mark.parametrize(
+        "over",
+        [
+            {"volume_min": 0.0},
+            {"volume_min": -0.01},
+            {"volume_step": 0.0},
+            {"volume_step": -0.01},
+            {"volume_min": 10.0, "volume_max": 1.0},
+        ],
+    )
+    def test_incoherent_volume_metadata_is_typed(self, over):
+        fake = FakeMT5()
+        fake.add_symbol(MT5_SYMBOL, **over)
+        with pytest.raises(BrokerInvalidOrderError):
+            self._spec_or_raise(fake)
+
+    def test_volume_getter_exception_is_typed(self):
+        class BadInfo(SimpleNamespace):
+            @property
+            def volume_min(self):
+                raise RuntimeError("getter failure")
+
+        fake = FakeMT5()
+        fake.add_symbol(MT5_SYMBOL)
+        base = fake.symbols[MT5_SYMBOL]
+        fake.symbols[MT5_SYMBOL] = BadInfo(**vars(base))
+        with pytest.raises(BrokerInvalidOrderError):
+            self._spec_or_raise(fake)
+
+    def test_symbol_info_exception_is_typed(self):
+        fake = FakeMT5()
+        fake.add_symbol(MT5_SYMBOL)
+
+        def fail(name):
+            raise RuntimeError("symbol_info failure")
+
+        fake.symbol_info = fail
+        with pytest.raises(BrokerConnectionError):
+            self._spec_or_raise(fake)
+
+
 class TestSubmit:
     def test_order_check_rejection_no_send(self):
         adapter, fake = _ready()
@@ -985,6 +1059,24 @@ class TestSubmit:
         adapter, fake = _ready()
         with pytest.raises(BrokerInvalidOrderError):
             adapter.submit_order(_order(quantity=0.001))
+        assert fake.send_count == 0
+
+    @pytest.mark.parametrize(
+        "quantity",
+        [True, "0.1", float("nan"), float("inf"), float("-inf")],
+    )
+    def test_volume_non_numeric_or_non_finite_rejected(self, quantity):
+        adapter, fake = _ready()
+        spec = adapter._symbol_spec(ATLAS_INSTRUMENT)
+        with pytest.raises(BrokerInvalidOrderError):
+            adapter._validate_volume(spec, quantity)
+        assert fake.send_count == 0
+
+    def test_volume_above_max_rejected(self):
+        adapter, fake = _ready()
+        fake.symbols[MT5_SYMBOL].volume_max = 0.10
+        with pytest.raises(BrokerInvalidOrderError):
+            adapter.submit_order(_order(quantity=0.11))
         assert fake.send_count == 0
 
     def test_volume_not_aligned_rejected(self):

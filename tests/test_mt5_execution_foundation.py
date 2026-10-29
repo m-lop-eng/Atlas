@@ -48,6 +48,7 @@ from risk.types import AccountRiskState
 from brokers.models import (
     BrokerConnectionError,
     BrokerError,
+    BrokerInvalidOrderError,
     BrokerOrderState,
     SubmitStatus,
 )
@@ -449,6 +450,445 @@ def _submit(coord, cid="C-1", *, side=OrderSide.BUY, quantity=0.1, is_entry=True
         client_order_id=cid, order_type=OrderType.MARKET, is_entry=is_entry,
         reduce_only=reduce_only,
     )
+
+
+# --------------------------------------------------------------------------
+# 08B: validacion estricta de cantidad y lattice
+# --------------------------------------------------------------------------
+
+
+class TestStrictSubmitQuantity:
+    @pytest.mark.parametrize(
+        "quantity",
+        [None, True, False, "0.1", float("nan"), float("inf"),
+         float("-inf"), 0, -0.1],
+    )
+    def test_invalid_quantity_has_no_journal_or_send(
+        self, tmp_path, quantity
+    ):
+        journal = IntentJournal.initialize(tmp_path / "j.json")
+        coord, _, fake = _coord(journal=journal)
+        with pytest.raises(ExecutionBlockedError) as ei:
+            _submit(coord, "C-BAD", quantity=quantity)
+        assert ei.value.stage == "quantity"
+        assert fake.send_count == 0
+        assert len(journal) == 0
+
+    def test_reduce_rejects_bool_string_and_non_finite(self, tmp_path):
+        for bad in (True, "0.5", None, float("nan"), float("inf"),
+                    float("-inf"), 0, -0.1):
+            journal = IntentJournal.initialize(tmp_path / f"j-{bad!r}.json")
+            coord, _, fake = _coord(journal=journal)
+            fake.add_position(
+                600, volume=0.5, price_open=1.1, type=ORDER_TYPE_BUY
+            )
+            with pytest.raises(ExecutionBlockedError) as ei:
+                coord.reduce_position(quantity=bad)
+            assert ei.value.stage == "quantity"
+            assert fake.send_count == 0
+            assert len(journal) == 0
+
+    def test_close_rejects_off_lattice_observed_volume(self, tmp_path):
+        journal = IntentJournal.initialize(tmp_path / "j.json")
+        fake = _fake()
+        fake.add_symbol(
+            INSTRUMENT, volume_min=0.05, volume_step=0.02, volume_max=0.50
+        )
+        coord, _, _ = _coord(
+            journal=journal,
+            fake=fake,
+            spec=_spec_stepged(step=0.02, lo=0.05, hi=0.50),
+        )
+        fake.add_position(600, volume=0.06, price_open=1.1, type=ORDER_TYPE_BUY)
+        with pytest.raises(ExecutionBlockedError) as ei:
+            coord.close_position()
+        assert ei.value.stage == "quantity"
+        assert fake.send_count == 0
+        assert len(journal) == 0
+
+
+class TestPreSendMetadataFailure:
+    def _bad_getter_env(self, tmp_path):
+        class BadInfo(SimpleNamespace):
+            @property
+            def volume_min(self):
+                raise RuntimeError("metadata getter failure")
+
+        journal = IntentJournal.initialize(tmp_path / "j.json")
+        fake = _fake()
+        base = fake.symbols[INSTRUMENT]
+        fake.symbols[INSTRUMENT] = BadInfo(**vars(base))
+        coord, _, fake = _coord(journal=journal, fake=fake)
+        return journal, coord, fake
+
+    def test_volume_getter_failure_is_terminal_pre_send(self, tmp_path):
+        journal, coord, fake = self._bad_getter_env(tmp_path)
+        with pytest.raises(BrokerInvalidOrderError):
+            _submit(coord, "C-META")
+        assert fake.send_count == 0
+        intent = journal.get("C-META")
+        assert intent is not None and intent.state == "REJECTED"
+        assert intent.terminal is True
+
+    def test_symbol_info_exception_is_terminal_pre_send(self, tmp_path):
+        journal = IntentJournal.initialize(tmp_path / "j.json")
+        fake = _fake()
+
+        def fail(name):
+            raise RuntimeError("symbol_info failure")
+
+        fake.symbol_info = fail
+        coord, _, fake = _coord(journal=journal, fake=fake)
+        with pytest.raises(BrokerConnectionError):
+            _submit(coord, "C-META-INFO")
+        assert fake.send_count == 0
+        intent = journal.get("C-META-INFO")
+        assert intent is not None and intent.state == "FAILED"
+        assert intent.terminal is True
+
+
+class Test08DPreSendExceptionClassification:
+    def _env(self, tmp_path, fake=None):
+        journal = IntentJournal.initialize(tmp_path / "j.json")
+        coord, adapter, fake = _coord(journal=journal, fake=fake)
+        return journal, coord, adapter, fake
+
+    def test_symbol_info_tick_exception_is_failed_pre_send(self, tmp_path):
+        fake = _fake()
+
+        def fail_tick(name):
+            raise RuntimeError("tick call failure")
+
+        fake.symbol_info_tick = fail_tick
+        journal, coord, _, fake = self._env(tmp_path, fake)
+        with pytest.raises(BrokerConnectionError):
+            _submit(coord, "C-TICK")
+        assert fake.send_count == 0
+        intent = journal.get("C-TICK")
+        assert intent is not None and intent.state == "FAILED"
+        assert intent.terminal is True
+
+    @pytest.mark.parametrize(
+        "side,attribute", [(OrderSide.BUY, "ask"), (OrderSide.SELL, "bid")]
+    )
+    def test_tick_price_getter_exception_is_failed_pre_send(
+        self, tmp_path, side, attribute
+    ):
+        class BadTick(SimpleNamespace):
+            def __getattribute__(self, name):
+                if name == attribute:
+                    raise RuntimeError(f"{attribute} getter failure")
+                return super().__getattribute__(name)
+
+        fake = _fake()
+        base = fake.ticks[INSTRUMENT]
+        fake.ticks[INSTRUMENT] = BadTick(**vars(base))
+        journal, coord, _, fake = self._env(tmp_path, fake)
+        with pytest.raises(BrokerConnectionError):
+            _submit(coord, f"C-PRICE-{attribute}", side=side)
+        assert fake.send_count == 0
+        intent = journal.get(f"C-PRICE-{attribute}")
+        assert intent is not None and intent.state == "FAILED"
+        assert intent.terminal is True
+
+    def test_check_retcode_getter_exception_is_failed_pre_send(self, tmp_path):
+        class BadCheck:
+            @property
+            def retcode(self):
+                raise RuntimeError("retcode getter failure")
+
+        fake = _fake()
+        calls = {"check": 0}
+
+        def bad_check(request):
+            calls["check"] += 1
+            return BadCheck()
+
+        fake.order_check = bad_check
+        journal, coord, _, fake = self._env(tmp_path, fake)
+        with pytest.raises(BrokerConnectionError):
+            _submit(coord, "C-CHECK")
+        assert calls["check"] == 1
+        assert fake.send_count == 0
+        intent = journal.get("C-CHECK")
+        assert intent is not None and intent.state == "FAILED"
+        assert intent.terminal is True
+
+    def test_check_retcode_conversion_failure_is_failed_pre_send(self, tmp_path):
+        fake = _fake()
+        fake.order_check = lambda request: SimpleNamespace(retcode="not-an-int")
+        journal, coord, _, fake = self._env(tmp_path, fake)
+        with pytest.raises(BrokerConnectionError):
+            _submit(coord, "C-CHECK-CONV")
+        assert fake.send_count == 0
+        intent = journal.get("C-CHECK-CONV")
+        assert intent is not None and intent.state == "FAILED"
+        assert intent.terminal is True
+
+    def test_account_margin_mode_getter_exception_is_failed_pre_send(
+        self, tmp_path
+    ):
+        class BadAccount(SimpleNamespace):
+            @property
+            def margin_mode(self):
+                raise RuntimeError("margin_mode getter failure")
+
+        fake = _fake()
+        fake.account = BadAccount(**vars(fake.account))
+        journal, coord, _, fake = self._env(tmp_path, fake)
+        with pytest.raises(BrokerConnectionError):
+            _submit(coord, "C-MODE")
+        assert fake.send_count == 0
+        intent = journal.get("C-MODE")
+        assert intent is not None and intent.state == "FAILED"
+        assert intent.terminal is True
+
+    def test_post_send_exception_remains_unknown_and_no_resend(self, tmp_path):
+        fake = _fake()
+        fake.send_mode = "raise"
+        journal, coord, _, fake = self._env(tmp_path, fake)
+        out = _submit(coord, "C-POST")
+        assert out.submission.status is SubmitStatus.UNKNOWN
+        assert fake.send_count == 1
+        intent = journal.get("C-POST")
+        assert intent is not None and intent.state == "UNKNOWN"
+        with pytest.raises(UnresolvedIntentsError):
+            _submit(coord, "C-POST-NEXT")
+        assert fake.send_count == 1
+
+
+class Test08FRetcodeClassification:
+    def _env(self, tmp_path, fake=None):
+        journal = IntentJournal.initialize(tmp_path / "j.json")
+        coord, adapter, fake = _coord(journal=journal, fake=fake)
+        return journal, coord, adapter, fake
+
+    @pytest.mark.parametrize(
+        "bad_retcode", ["0", 0.0, True, None, object()]
+    )
+    def test_order_check_invalid_retcode_is_failed_pre_send(
+        self, tmp_path, bad_retcode
+    ):
+        fake = _fake()
+        fake.check_retcode = bad_retcode
+        journal, coord, _, fake = self._env(tmp_path, fake)
+        with pytest.raises(BrokerConnectionError):
+            _submit(coord, "C-CHECK-TYPE")
+        assert fake.check_count == 1
+        assert fake.send_count == 0
+        intent = journal.get("C-CHECK-TYPE")
+        assert intent is not None and intent.state == "FAILED"
+        assert intent.terminal is True
+
+    def test_order_check_zero_integer_proceeds_to_send(self, tmp_path):
+        fake = _fake()
+        fake.check_retcode = 0
+        journal, coord, _, fake = self._env(tmp_path, fake)
+        out = _submit(coord, "C-CHECK-ZERO")
+        assert out.allowed is True
+        assert out.submission.status is SubmitStatus.CONFIRMED
+        assert fake.check_count == 1
+        assert fake.send_count == 1
+        assert journal.get("C-CHECK-ZERO").state == "FILLED"
+
+    @pytest.mark.parametrize(
+        "bad_retcode", [None, "0", 0.0, True]
+    )
+    def test_post_send_invalid_retcode_is_unknown(
+        self, tmp_path, bad_retcode
+    ):
+        fake = _fake()
+        calls = {"send": 0}
+
+        def malformed_send(request):
+            calls["send"] += 1
+            return SimpleNamespace(
+                retcode=bad_retcode, order=0, deal=0, volume=0.0, price=0.0
+            )
+
+        fake.order_send = malformed_send
+        journal, coord, _, fake = self._env(tmp_path, fake)
+        out = _submit(coord, "C-SEND-TYPE")
+        assert calls["send"] == 1
+        assert out.submission.status is SubmitStatus.UNKNOWN
+        intent = journal.get("C-SEND-TYPE")
+        assert intent is not None and intent.state == "UNKNOWN"
+        assert intent.terminal is False
+        with pytest.raises(UnresolvedIntentsError):
+            _submit(coord, "C-SEND-TYPE-NEXT")
+        assert calls["send"] == 1
+
+    def test_post_send_unknown_integer_retcode_is_unknown(self, tmp_path):
+        fake = _fake()
+        calls = {"send": 0}
+
+        def unknown_send(request):
+            calls["send"] += 1
+            return SimpleNamespace(
+                retcode=999, order=0, deal=0, volume=0.0, price=0.0
+            )
+
+        fake.order_send = unknown_send
+        journal, coord, _, fake = self._env(tmp_path, fake)
+        out = _submit(coord, "C-SEND-999")
+        assert calls["send"] == 1
+        assert out.submission.status is SubmitStatus.UNKNOWN
+        intent = journal.get("C-SEND-999")
+        assert intent is not None and intent.state == "UNKNOWN"
+        assert intent.terminal is False
+        with pytest.raises(UnresolvedIntentsError):
+            _submit(coord, "C-SEND-999-NEXT")
+        assert calls["send"] == 1
+
+    def test_post_send_known_reject_retcode_remains_rejected(self, tmp_path):
+        fake = _fake()
+        fake.send_mode = "reject"
+        journal, coord, _, fake = self._env(tmp_path, fake)
+        out = _submit(coord, "C-SEND-REJECT")
+        assert out.allowed is True
+        assert out.submission.status is SubmitStatus.REJECTED
+        assert fake.send_count == 1
+        intent = journal.get("C-SEND-REJECT")
+        assert intent is not None and intent.state == "REJECTED"
+        assert intent.terminal is True
+
+    def test_order_check_unknown_integer_is_pre_send_rejected(
+        self, tmp_path
+    ):
+        fake = _fake()
+        fake.check_retcode = 999
+        journal, coord, _, fake = self._env(tmp_path, fake)
+        out = _submit(coord, "C-CHECK-999")
+        assert out.submission.status is SubmitStatus.REJECTED
+        assert fake.check_count == 1
+        assert fake.send_count == 0
+        order = list(coord._order_manager.orders.values())[0]
+        intent = journal.get("C-CHECK-999")
+        assert order.status is OrderStatus.REJECTED
+        assert intent is not None and intent.state == "REJECTED"
+        assert intent.terminal is True
+        assert intent.state != "UNKNOWN"
+
+    def test_post_send_zero_integer_is_unknown_and_blocks(
+        self, tmp_path
+    ):
+        fake = _fake()
+        calls = {"send": 0}
+
+        def zero_send(request):
+            calls["send"] += 1
+            return SimpleNamespace(
+                retcode=0, order=0, deal=0, volume=0.0, price=0.0
+            )
+
+        fake.order_send = zero_send
+        journal, coord, _, fake = self._env(tmp_path, fake)
+        out = _submit(coord, "C-SEND-ZERO")
+        assert calls["send"] == 1
+        assert out.submission.status is SubmitStatus.UNKNOWN
+        order = list(coord._order_manager.orders.values())[0]
+        intent = journal.get("C-SEND-ZERO")
+        assert order.status is OrderStatus.UNKNOWN
+        assert intent is not None and intent.state == "UNKNOWN"
+        assert intent.terminal is False
+        with pytest.raises(UnresolvedIntentsError):
+            _submit(coord, "C-SEND-ZERO-NEXT")
+        assert calls["send"] == 1
+
+    def test_post_send_retcode_getter_exception_is_unknown_and_blocks(
+        self, tmp_path
+    ):
+        fake = _fake()
+        calls = {"send": 0}
+
+        class BadResult:
+            @property
+            def retcode(self):
+                raise RuntimeError("send retcode getter failure")
+
+        def getter_failure_send(request):
+            calls["send"] += 1
+            return BadResult()
+
+        fake.order_send = getter_failure_send
+        journal, coord, _, fake = self._env(tmp_path, fake)
+        out = _submit(coord, "C-SEND-GETTER")
+        assert calls["send"] == 1
+        assert out.submission.status is SubmitStatus.UNKNOWN
+        order = list(coord._order_manager.orders.values())[0]
+        intent = journal.get("C-SEND-GETTER")
+        assert order.status is OrderStatus.UNKNOWN
+        assert intent is not None and intent.state == "UNKNOWN"
+        assert intent.terminal is False
+        with pytest.raises(UnresolvedIntentsError):
+            _submit(coord, "C-SEND-GETTER-NEXT")
+        assert calls["send"] == 1
+
+
+class TestVolumeLatticeConsistency:
+    VALUES = (0.05, 0.06, 0.07, 0.09, 0.10)
+    VALID = (0.05, 0.07, 0.09)
+
+    def _coord(self, tmp_path, *, name="j"):
+        journal = IntentJournal.initialize(tmp_path / f"{name}.json")
+        fake = _fake()
+        fake.add_symbol(
+            INSTRUMENT, volume_min=0.05, volume_step=0.02, volume_max=0.50
+        )
+        coord, adapter, fake = _coord(
+            journal=journal,
+            fake=fake,
+            spec=_spec_stepged(step=0.02, lo=0.05, hi=0.50),
+        )
+        return journal, coord, adapter, fake
+
+    def test_adapter_and_coordinator_agree_on_open(self, tmp_path):
+        for value in self.VALUES:
+            journal, coord, adapter, fake = self._coord(
+                tmp_path, name=f"open-{value}"
+            )
+            if value in self.VALID:
+                out = _submit(coord, f"C-{value}", quantity=value)
+                assert out.allowed is True
+                assert fake.send_count == 1
+                assert fake.last_request["volume"] == pytest.approx(value)
+            else:
+                with pytest.raises(ExecutionBlockedError) as ei:
+                    _submit(coord, f"C-{value}", quantity=value)
+                assert ei.value.stage == "quantity"
+                assert fake.send_count == 0
+                assert len(journal) == 0
+
+    def test_reduce_uses_same_lattice(self, tmp_path):
+        for value in self.VALUES:
+            journal, coord, adapter, fake = self._coord(
+                tmp_path, name=f"reduce-{value}"
+            )
+            fake.add_position(
+                600, volume=0.50, price_open=1.1, type=ORDER_TYPE_BUY
+            )
+            if value in self.VALID:
+                out = coord.reduce_position(quantity=value)
+                assert out.allowed is True
+                assert fake.send_count == 1
+                assert fake.last_request["volume"] == pytest.approx(value)
+            else:
+                with pytest.raises(ExecutionBlockedError) as ei:
+                    coord.reduce_position(quantity=value)
+                assert ei.value.stage == "quantity"
+                assert fake.send_count == 0
+                assert len(journal) == 0
+
+    def test_adapter_rejects_same_lattice(self, tmp_path):
+        _, _, adapter, fake = self._coord(tmp_path, name="adapter")
+        spec = adapter._symbol_spec(INSTRUMENT)
+        for value in self.VALUES:
+            if value in self.VALID:
+                adapter._validate_volume(spec, value)
+            else:
+                with pytest.raises(BrokerInvalidOrderError):
+                    adapter._validate_volume(spec, value)
+        assert fake.send_count == 0
 
 
 # --------------------------------------------------------------------------

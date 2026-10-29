@@ -57,6 +57,7 @@ from execution.order import (
     Order,
     OrderSide,
     OrderType,
+    validate_quantity_lattice,
 )
 
 from brokers.base import BrokerAdapter
@@ -128,6 +129,16 @@ _FUNDS_RETCODES = frozenset({10019})
 _MARKET_CLOSED_RETCODES = frozenset({10018, 10017, 10026, 10027, 10032})
 _RATE_LIMIT_RETCODES = frozenset({10024, 10033, 10034})
 _PERMISSION_RETCODES = frozenset({10017, 10026, 10027, 10032, 10042, 10043, 10044})
+# 10006 = TRADE_RETCODE_REJECT (rechazo oficial ya usado por los dobles/tests).
+# Cualquier otro entero no listado se considera DESCONOCIDO, no rechazo.
+_KNOWN_REJECT_RETCODES = (
+    frozenset({10006})
+    | _INVALID_RETCODES
+    | _FUNDS_RETCODES
+    | _MARKET_CLOSED_RETCODES
+    | _RATE_LIMIT_RETCODES
+    | _PERMISSION_RETCODES
+)
 
 MT5_COMMENT_MAX = 31
 
@@ -434,6 +445,28 @@ def _read_optional_finite_attr(
         raise error_cls(f"{name} invalido ({exc})") from exc
 
 
+def _read_required_finite_attr(
+    info: Any, name: str, *, error_cls: type = BrokerInvalidOrderError
+) -> float:
+    """Lee un campo NUMERICO OBLIGATORIO con ausencia/tipo/finitud estrictos.
+
+    ORDER-08B: los metadatos de volumen no pueden degradarse a ceros ni
+    aceptar bool/str por coercion. Un getter defectuoso o un campo ausente
+    produce el error tipado de contexto (`symbol_info`).
+    """
+    raw = _safe_attr(info, name, error_cls=error_cls)
+    if raw is None:
+        raise error_cls(f"{name} ausente en metadata del simbolo")
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        raise error_cls(
+            f"{name} invalido (tipo {type(raw).__name__}; se requiere numero)"
+        )
+    try:
+        return _finite(raw)
+    except BrokerError as exc:
+        raise error_cls(f"{name} invalido ({exc})") from exc
+
+
 def _read_trade_calc_mode(info: Any) -> int | None:
     """Lee `trade_calc_mode` (SYMBOL_TRADE_CALC_MODE) con validacion ESTRICTA.
 
@@ -542,55 +575,92 @@ def read_mt5_symbol_spec(
 
     `require_operable=False` permite inspeccionar un simbolo no operable.
     """
-    info = mt5.symbol_info(mt5_name)
+    try:
+        info = mt5.symbol_info(mt5_name)
+    except BrokerError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - consulta de metadata incierta
+        raise BrokerConnectionError(
+            f"symbol_info fallo ({type(exc).__name__})"
+        ) from exc
     if info is None:
         raise BrokerInvalidOrderError(f"simbolo MT5 inexistente: {mt5_name!r}")
-    visible = bool(getattr(info, "visible", True))
+    try:
+        visible = bool(getattr(info, "visible", True))
+    except Exception as exc:  # noqa: BLE001 - getter defectuoso
+        raise BrokerInvalidOrderError(
+            f"metadata visible ilegible ({type(exc).__name__})"
+        ) from exc
     if not visible and select_if_invisible:
         try:
             mt5.symbol_select(mt5_name, True)
         except Exception:  # noqa: BLE001
             pass
-        info = mt5.symbol_info(mt5_name)
-        if info is None or not bool(getattr(info, "visible", False)):
+        try:
+            info = mt5.symbol_info(mt5_name)
+        except BrokerError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - consulta incierta
+            raise BrokerConnectionError(
+                f"symbol_info fallo ({type(exc).__name__})"
+            ) from exc
+        try:
+            visible_after_select = bool(getattr(info, "visible", False))
+        except Exception as exc:  # noqa: BLE001 - getter defectuoso
+            raise BrokerInvalidOrderError(
+                f"metadata visible ilegible ({type(exc).__name__})"
+            ) from exc
+        if info is None or not visible_after_select:
             raise BrokerInvalidOrderError(
                 f"simbolo MT5 no visible/operable: {mt5_name!r}"
             )
         visible = True
-    trade_mode = int(getattr(info, "trade_mode", -1))
+    try:
+        trade_mode = int(getattr(info, "trade_mode", -1))
+    except Exception as exc:  # noqa: BLE001 - getter/conversion defectuoso
+        raise BrokerInvalidOrderError(
+            f"metadata trade_mode ilegible ({type(exc).__name__})"
+        ) from exc
     if require_operable and trade_mode != SYMBOL_TRADE_MODE_FULL:
         raise BrokerInvalidOrderError(
             f"simbolo {mt5_name!r} no operable (trade_mode={trade_mode})"
         )
     _calc_mode = _read_trade_calc_mode(info)
-    spec = MT5SymbolSpec(
-        strategy_instrument=strategy_instrument,
-        name=mt5_name,
-        visible=visible,
-        volume_min=_finite(getattr(info, "volume_min")),
-        volume_step=_finite(getattr(info, "volume_step")),
-        volume_max=_finite(getattr(info, "volume_max")),
-        point=_finite(getattr(info, "point")),
-        trade_tick_size=_finite(getattr(info, "trade_tick_size", 0.0)),
-        trade_tick_value=_finite(getattr(info, "trade_tick_value", 0.0)),
-        trade_contract_size=_finite(getattr(info, "trade_contract_size", 0.0)),
-        currency_base=str(getattr(info, "currency_base", "")),
-        currency_profit=str(getattr(info, "currency_profit", "")),
-        currency_margin=str(getattr(info, "currency_margin", "")),
-        trade_mode=trade_mode,
-        filling_mode=int(getattr(info, "filling_mode", filling_mode_default)),
-        digits=int(getattr(info, "digits", 0)),
-        trade_calc_mode=_calc_mode,
-        trade_tick_value_profit=_read_optional_finite_attr(
-            info, "trade_tick_value_profit"
-        ),
-        trade_tick_value_loss=_read_optional_finite_attr(
-            info, "trade_tick_value_loss"
-        ),
-        # 06I-B5: nombre SIMBOLICO resuelto con el modulo MT5 INYECTADO (`mt5`),
-        # no con una tabla de enteros. `None` si no se resuelve un nombre unico.
-        trade_calc_mode_name=_resolve_trade_calc_mode_name(mt5, _calc_mode),
-    )
+    try:
+        spec = MT5SymbolSpec(
+            strategy_instrument=strategy_instrument,
+            name=mt5_name,
+            visible=visible,
+            volume_min=_read_required_finite_attr(info, "volume_min"),
+            volume_step=_read_required_finite_attr(info, "volume_step"),
+            volume_max=_read_required_finite_attr(info, "volume_max"),
+            point=_finite(getattr(info, "point")),
+            trade_tick_size=_finite(getattr(info, "trade_tick_size", 0.0)),
+            trade_tick_value=_finite(getattr(info, "trade_tick_value", 0.0)),
+            trade_contract_size=_finite(getattr(info, "trade_contract_size", 0.0)),
+            currency_base=str(getattr(info, "currency_base", "")),
+            currency_profit=str(getattr(info, "currency_profit", "")),
+            currency_margin=str(getattr(info, "currency_margin", "")),
+            trade_mode=trade_mode,
+            filling_mode=int(getattr(info, "filling_mode", filling_mode_default)),
+            digits=int(getattr(info, "digits", 0)),
+            trade_calc_mode=_calc_mode,
+            trade_tick_value_profit=_read_optional_finite_attr(
+                info, "trade_tick_value_profit"
+            ),
+            trade_tick_value_loss=_read_optional_finite_attr(
+                info, "trade_tick_value_loss"
+            ),
+            # 06I-B5: nombre SIMBOLICO resuelto con el modulo MT5 INYECTADO (`mt5`),
+            # no con una tabla de enteros. `None` si no se resuelve un nombre unico.
+            trade_calc_mode_name=_resolve_trade_calc_mode_name(mt5, _calc_mode),
+        )
+    except BrokerError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - metadata no tipada => pre-send seguro
+        raise BrokerInvalidOrderError(
+            f"metadata de simbolo ilegible ({type(exc).__name__})"
+        ) from exc
     if spec.volume_min <= 0 or spec.volume_step <= 0 or spec.volume_max < spec.volume_min:
         raise BrokerInvalidOrderError(
             f"metadata de volumen invalida para {mt5_name!r}"
@@ -978,7 +1048,12 @@ class MT5BrokerAdapter(BrokerAdapter):
             raise BrokerConnectionError(
                 "account_info() sin respuesta: modo de cuenta no verificable"
             )
-        raw = getattr(info, "margin_mode", None)
+        try:
+            raw = getattr(info, "margin_mode", None)
+        except Exception as exc:  # noqa: BLE001 - getter defectuoso pre-send
+            raise BrokerConnectionError(
+                f"margin_mode ilegible ({type(exc).__name__}): modo no verificable"
+            ) from exc
         if raw is None:
             raise BrokerPermissionError(
                 "cuenta sin margin_mode: modo de cuenta no verificable"
@@ -1331,23 +1406,18 @@ class MT5BrokerAdapter(BrokerAdapter):
         return spec
 
     def _validate_volume(self, spec: MT5SymbolSpec, quantity: float) -> None:
-        """Valida volumen contra min/step/max. NUNCA muta la cantidad."""
-        qty = _finite(quantity)
-        if qty <= 0:
-            raise BrokerInvalidOrderError(f"quantity invalida: {quantity!r}")
-        if qty < spec.volume_min - 1e-9:
-            raise BrokerInvalidOrderError(
-                f"quantity {qty} < volume_min {spec.volume_min}"
-            )
-        if qty > spec.volume_max + 1e-9:
-            raise BrokerInvalidOrderError(
-                f"quantity {qty} > volume_max {spec.volume_max}"
-            )
-        steps = (qty - spec.volume_min) / spec.volume_step
-        if abs(steps - round(steps)) > 1e-6:
-            raise BrokerInvalidOrderError(
-                f"quantity {qty} no alineada a volume_step {spec.volume_step}"
-            )
+        """Valida volumen contra min/step/max. NUNCA muta la cantidad.
+
+        ORDER-08B: misma regla de lattice que el coordinador, anclada en
+        `volume_min` (los volumenes validos son min + N*step).
+        """
+        validate_quantity_lattice(
+            quantity,
+            minimum=spec.volume_min,
+            maximum=spec.volume_max,
+            step=spec.volume_step,
+            error_cls=BrokerInvalidOrderError,
+        )
 
     # -------------------------------------------------------- submit / lookup
 
@@ -1526,17 +1596,38 @@ class MT5BrokerAdapter(BrokerAdapter):
         # reduce_only NO se ignora: un cierre no es una entrada MARKET opuesta.
         position_ticket: int | None = None
         if order.reduce_only:
-            position_ticket = self._prepare_reduce_only(order, spec)
+            try:
+                position_ticket = self._prepare_reduce_only(order, spec)
+            except BrokerError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - preparacion pre-send
+                raise BrokerConnectionError(
+                    f"reduce_only pre-send fallo ({type(exc).__name__})"
+                ) from exc
         mt5 = self._module()
-        tick = mt5.symbol_info_tick(spec.name)
+        try:
+            tick = mt5.symbol_info_tick(spec.name)
+        except BrokerError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - getter/consulta pre-send
+            raise BrokerConnectionError(
+                f"symbol_info_tick fallo ({type(exc).__name__})"
+            ) from exc
         if tick is None:
             raise BrokerConnectionError(f"sin tick para {spec.name!r}")
-        if order.side is OrderSide.BUY:
-            order_type = ORDER_TYPE_BUY
-            price = _finite(getattr(tick, "ask"))
-        else:
-            order_type = ORDER_TYPE_SELL
-            price = _finite(getattr(tick, "bid"))
+        try:
+            if order.side is OrderSide.BUY:
+                order_type = ORDER_TYPE_BUY
+                price = _finite(getattr(tick, "ask"))
+            else:
+                order_type = ORDER_TYPE_SELL
+                price = _finite(getattr(tick, "bid"))
+        except BrokerError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - getter defectuoso pre-send
+            raise BrokerConnectionError(
+                f"tick price ilegible ({type(exc).__name__})"
+            ) from exc
         request = {
             "action": TRADE_ACTION_DEAL,
             "symbol": spec.name,
@@ -1562,7 +1653,18 @@ class MT5BrokerAdapter(BrokerAdapter):
             ) from exc
         if check is None:
             raise BrokerConnectionError("order_check sin respuesta")
-        check_code = int(getattr(check, "retcode", -1))
+        try:
+            raw_check_code = getattr(check, "retcode", None)
+        except Exception as exc:  # noqa: BLE001 - retcode ilegible pre-send
+            raise BrokerConnectionError(
+                f"order_check retcode ilegible ({type(exc).__name__})"
+            ) from exc
+        if isinstance(raw_check_code, bool) or not isinstance(raw_check_code, int):
+            raise BrokerConnectionError(
+                "order_check retcode invalido: se requiere int no booleano, "
+                f"recibido {type(raw_check_code).__name__}"
+            )
+        check_code = raw_check_code
         if check_code != 0:
             return OrderSubmission(
                 client_order_id=cid,
@@ -1588,7 +1690,18 @@ class MT5BrokerAdapter(BrokerAdapter):
                 detail="order_send sin respuesta",
             )
         try:
-            retcode = int(getattr(result, "retcode", -1))
+            raw_retcode = getattr(result, "retcode", None)
+            if isinstance(raw_retcode, bool) or not isinstance(raw_retcode, int):
+                return OrderSubmission(
+                    client_order_id=cid,
+                    status=SubmitStatus.UNKNOWN,
+                    broker_order=None,
+                    detail=(
+                        "order_send: retcode invalido/no interpretable "
+                        f"({type(raw_retcode).__name__})"
+                    ),
+                )
+            retcode = raw_retcode
             if retcode in _DONE_RETCODES:
                 # Semantica distinta por codigo, derivada del estado real via lookup:
                 #   DONE -> FILLED; DONE_PARTIAL -> PARTIALLY_FILLED; PLACED -> SUBMITTED
@@ -1612,11 +1725,20 @@ class MT5BrokerAdapter(BrokerAdapter):
                     broker_order=None,
                     detail=f"retcode incierto={retcode}",
                 )
+            if retcode in _KNOWN_REJECT_RETCODES:
+                return OrderSubmission(
+                    client_order_id=cid,
+                    status=SubmitStatus.REJECTED,
+                    broker_order=None,
+                    detail=self._reject_detail(retcode),
+                )
+            # ORDER-08F: un entero no reconocido NO demuestra rechazo. Como
+            # order_send ya se invoco, la unica clasificacion segura es UNKNOWN.
             return OrderSubmission(
                 client_order_id=cid,
-                status=SubmitStatus.REJECTED,
+                status=SubmitStatus.UNKNOWN,
                 broker_order=None,
-                detail=self._reject_detail(retcode),
+                detail=f"order_send: retcode desconocido={retcode}",
             )
         except Exception as exc:  # noqa: BLE001 - order_send ya se invoco
             # ORDER-07B: un fallo de interpretacion POST-SEND es ambiguo, nunca

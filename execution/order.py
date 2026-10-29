@@ -5,6 +5,7 @@ El OrderManager traduce este modelo hacia cada broker mediante adapters.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
@@ -18,6 +19,100 @@ PURPOSE_REDUCE = "REDUCE"
 _KNOWN_PURPOSES = frozenset({PURPOSE_OPEN, PURPOSE_CLOSE, PURPOSE_REDUCE})
 
 _order_seq = count(1)
+
+_QUANTITY_EPS = 1e-9
+_STEP_TOLERANCE = 1e-6
+
+
+def validate_quantity(value: object, *, error_cls: type[Exception] = ValueError) -> float:
+    """Valida una cantidad numerica real, positiva y finita.
+
+    ORDER-08B: `bool` es rechazado aunque sea subtipo de `int`; no se aceptan
+    strings ni conversiones implicitas. El retorno es `float` solo despues de
+    validar el valor original.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise error_cls(
+            f"quantity invalida: se requiere int/float no booleano, "
+            f"recibido {value!r}"
+        )
+    try:
+        qty = float(value)
+    except (OverflowError, TypeError, ValueError) as exc:
+        raise error_cls(f"quantity invalida: {value!r}") from exc
+    if not math.isfinite(qty):
+        raise error_cls(f"quantity debe ser finita, recibido {value!r}")
+    if qty <= 0:
+        raise error_cls(f"quantity debe ser positivo, recibido {value!r}")
+    return qty
+
+
+def validate_quantity_lattice(
+    value: object,
+    *,
+    minimum: object | None = None,
+    maximum: object | None = None,
+    step: object | None = None,
+    error_cls: type[Exception] = ValueError,
+) -> float:
+    """Valida cantidad y lattice con ancla en `minimum`.
+
+    Convencion ORDER-08B: si `minimum` esta disponible, los volumenes validos
+    son `minimum + N*step`; si no, el ancla es cero. Es la misma regla usada
+    por el adapter y por la reduccion coordinada. La tolerancia es la existente
+    en el proyecto (1e-9 para limites, 1e-6 para pasos).
+    """
+    qty = validate_quantity(value, error_cls=error_cls)
+
+    def _metadata(raw: object, name: str) -> float:
+        if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+            raise error_cls(
+                f"{name} invalido: se requiere int/float no booleano, "
+                f"recibido {raw!r}"
+            )
+        try:
+            parsed = float(raw)
+        except (OverflowError, TypeError, ValueError) as exc:
+            raise error_cls(f"{name} invalido: {raw!r}") from exc
+        if not math.isfinite(parsed):
+            raise error_cls(f"{name} debe ser finito, recibido {raw!r}")
+        return parsed
+
+    min_value: float | None = None
+    max_value: float | None = None
+    step_value: float | None = None
+    if minimum is not None:
+        min_value = _metadata(minimum, "quantity_min")
+        if min_value < 0:
+            raise error_cls("quantity_min debe ser >= 0")
+    if maximum is not None:
+        max_value = _metadata(maximum, "quantity_max")
+        if max_value <= 0:
+            raise error_cls("quantity_max debe ser > 0")
+    if step is not None:
+        step_value = _metadata(step, "quantity_step")
+        if step_value <= 0:
+            raise error_cls("quantity_step debe ser > 0")
+    if (
+        min_value is not None
+        and max_value is not None
+        and max_value < min_value - _QUANTITY_EPS
+    ):
+        raise error_cls("quantity_max debe ser >= quantity_min")
+
+    if min_value is not None and qty < min_value - _QUANTITY_EPS:
+        raise error_cls(f"quantity {qty} < quantity_min {min_value}")
+    if max_value is not None and qty > max_value + _QUANTITY_EPS:
+        raise error_cls(f"quantity {qty} > quantity_max {max_value}")
+    if step_value is not None:
+        anchor = min_value if min_value is not None else 0.0
+        steps = (qty - anchor) / step_value
+        if abs(steps - round(steps)) > _STEP_TOLERANCE:
+            raise error_cls(
+                f"quantity {qty} no alineada al step {step_value} "
+                f"(ancla {anchor})"
+            )
+    return qty
 
 
 def reset_order_sequence() -> None:
@@ -120,8 +215,7 @@ class Order:
             object.__setattr__(self, "order_id", f"ORD-{next(_order_seq):010d}")
         if not self.strategy_id or not self.account_id or not self.instrument:
             raise ValueError("strategy_id, account_id e instrument son obligatorios")
-        if self.quantity <= 0:
-            raise ValueError(f"quantity debe ser positivo, recibido {self.quantity}")
+        validate_quantity(self.quantity, error_cls=ValueError)
         purpose = str(self.purpose)
         if purpose not in _KNOWN_PURPOSES:
             raise ValueError(f"purpose desconocido: {self.purpose!r}")

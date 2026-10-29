@@ -28,7 +28,6 @@ Garantias clave (no cambian LIVE-02..LIVE-09; son capas ADITIVAS):
 
 from __future__ import annotations
 
-import math
 import secrets
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -55,6 +54,7 @@ from execution.order import (
     OrderSide,
     OrderStatus,
     OrderType,
+    validate_quantity_lattice,
 )
 from execution.order_manager import OrderManager, OrderStateError
 
@@ -1002,28 +1002,16 @@ class LiveExecutionCoordinator:
         return f"{prefix}_unknown"
 
     def _validate_reduce_quantity(self, quantity) -> float:
-        try:
-            q = float(quantity)
-        except (TypeError, ValueError):
-            raise ExecutionBlockedError("quantity", f"cantidad invalida: {quantity!r}")
-        if not math.isfinite(q) or q <= 0:
-            raise ExecutionBlockedError("quantity", f"cantidad no positiva: {quantity!r}")
         spec = self._instrument_spec
-        if spec.quantity_min is not None and q < spec.quantity_min - 1e-9:
-            raise ExecutionBlockedError(
-                "quantity", f"cantidad {q} < quantity_min {spec.quantity_min}"
+        try:
+            return validate_quantity_lattice(
+                quantity,
+                minimum=spec.quantity_min,
+                maximum=spec.quantity_max,
+                step=spec.quantity_step,
             )
-        if spec.quantity_max is not None and q > spec.quantity_max + 1e-9:
-            raise ExecutionBlockedError(
-                "quantity", f"cantidad {q} > quantity_max {spec.quantity_max}"
-            )
-        if spec.quantity_step is not None and spec.quantity_step > 0:
-            steps = q / spec.quantity_step
-            if abs(steps - round(steps)) > 1e-6:
-                raise ExecutionBlockedError(
-                    "quantity", f"cantidad {q} no alineada al step {spec.quantity_step}"
-                )
-        return q
+        except ValueError as exc:
+            raise ExecutionBlockedError("quantity", str(exc)) from exc
 
     # --------------------------------------------------------------- submit
 
@@ -1045,6 +1033,16 @@ class LiveExecutionCoordinator:
         """Ejecuta la ruta segura completa. Levanta `ExecutionBlockedError` en veto."""
         if not client_order_id or not str(client_order_id).strip():
             raise ExecutionBlockedError("identity", "client_order_id obligatorio")
+        spec = self._instrument_spec
+        try:
+            quantity = validate_quantity_lattice(
+                quantity,
+                minimum=spec.quantity_min,
+                maximum=spec.quantity_max,
+                step=spec.quantity_step,
+            )
+        except ValueError as exc:
+            raise ExecutionBlockedError("quantity", str(exc)) from exc
 
         now = self._clock()
         # 1-8: gates obligatorios, en orden, TODOS antes de tocar el broker.
@@ -1532,7 +1530,15 @@ class LiveExecutionCoordinator:
         net = float(pos.quantity)
         side = OrderSide.SELL if net > 0 else OrderSide.BUY  # lado reductor
         if operation == OPERATION_CLOSE:
-            qty = available
+            try:
+                qty = validate_quantity_lattice(
+                    available,
+                    minimum=self._instrument_spec.quantity_min,
+                    maximum=self._instrument_spec.quantity_max,
+                    step=self._instrument_spec.quantity_step,
+                )
+            except ValueError as exc:
+                raise ExecutionBlockedError("quantity", str(exc)) from exc
         else:
             if requested_q > available + 1e-9:
                 raise ExecutionBlockedError(
