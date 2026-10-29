@@ -43,6 +43,7 @@ from execution.intent_journal import (
     IntentJournal,
     IntentJournalError,
     OrderIntent,
+    SUBMIT_PROTOCOL_VERSION,
     recover_pending_cancels,
     recover_pending_intents,
 )
@@ -52,6 +53,7 @@ from execution.order import (
     PURPOSE_REDUCE,
     Order,
     OrderSide,
+    OrderStatus,
     OrderType,
 )
 from execution.order_manager import OrderManager, OrderStateError
@@ -400,6 +402,80 @@ class LiveExecutionCoordinator:
             status is not None
             and str(getattr(status, "value", status)) != "RECONCILIATION_OK"
         )
+
+    # --------------------------------------------------------- fallos ORDER-07B
+
+    def _reject_order(self, order: Order, reason: str) -> None:
+        """Rechazo terminal de una orden que aun no tiene intent persistido."""
+        try:
+            self._order_manager.reject(order.order_id, reason)
+        except OrderStateError:
+            pass
+
+    def _mark_pre_send_rejected(self, order: Order, reason: str) -> None:
+        try:
+            self._order_manager.reject(order.order_id, reason)
+        except OrderStateError:
+            pass
+        try:
+            self._journal.mark_state(order.client_order_id, "REJECTED")
+        except IntentJournalError:
+            pass
+
+    def _mark_pre_send_failed(self, order: Order, reason: str) -> None:
+        try:
+            self._order_manager.mark_failed(order.order_id, reason)
+        except OrderStateError:
+            pass
+        try:
+            self._journal.mark_state(order.client_order_id, "FAILED")
+        except IntentJournalError:
+            pass
+
+    def _mark_ambiguous(self, order: Order, reason: str) -> None:
+        try:
+            self._order_manager.mark_unknown(order.order_id)
+        except OrderStateError:
+            pass
+        try:
+            self._journal.mark_state(order.client_order_id, "UNKNOWN")
+        except IntentJournalError:
+            pass
+
+    def _sync_order_from_broker(self, order: Order, broker_order) -> None:
+        """Refleja el estado agregado del broker en OrderManager (best-effort).
+
+        El journal ya es autoridad persistente; este sync evita que OrderManager
+        quede atrasado. No inventa fills: usa cantidades/precios observados.
+        """
+        if broker_order is None:
+            return
+        try:
+            raw_state = getattr(broker_order, "state", None)
+            value = getattr(raw_state, "value", raw_state)
+            state = OrderStatus(str(value))
+        except (TypeError, ValueError):
+            return
+        fills = tuple(getattr(broker_order, "fills", ()) or ())
+        commission = None
+        if fills:
+            try:
+                commission = sum(
+                    float(getattr(f, "commission", 0.0) or 0.0)
+                    for f in fills
+                )
+            except (TypeError, ValueError):
+                commission = None
+        try:
+            self._order_manager.sync_broker_state(
+                order.order_id,
+                state=state,
+                filled_quantity=getattr(broker_order, "filled_quantity", None),
+                average_fill_price=getattr(broker_order, "avg_fill_price", None),
+                commission=commission,
+            )
+        except (KeyError, OrderStateError, TypeError, ValueError):
+            pass
 
     # ------------------------------------------------------------------ gates
 
@@ -878,21 +954,50 @@ class LiveExecutionCoordinator:
             )
         if submission.broker_order is not None:
             self._record_broker_identity(op_id, submission.broker_order)
+            self._sync_order_from_broker(order, submission.broker_order)
         verdict = self._confirm_close_reduce(operation, op_id)
         if verdict == "full":
+            try:
+                self._order_manager.sync_broker_state(
+                    order.order_id,
+                    state=OrderStatus.FILLED,
+                    filled_quantity=order.quantity,
+                )
+            except (KeyError, OrderStateError):
+                pass
             self._journal.mark_state(op_id, "FILLED", broker_order_id=broker_id)
             return "closed" if operation == OPERATION_CLOSE else "reduced"
         if verdict == "partial":
+            try:
+                self._order_manager.sync_broker_state(
+                    order.order_id,
+                    state=OrderStatus.PARTIALLY_FILLED,
+                    filled_quantity=getattr(
+                        submission.broker_order, "filled_quantity", None
+                    ),
+                )
+            except (KeyError, OrderStateError):
+                pass
             self._journal.mark_state(
                 op_id, "PARTIALLY_FILLED", broker_order_id=broker_id
             )
             return f"{prefix}_partial"
         if verdict == "rejected":
+            try:
+                self._order_manager.reject(
+                    order.order_id, "el broker no ejecuto la operacion"
+                )
+            except OrderStateError:
+                pass
             self._journal.mark_state(op_id, "REJECTED", broker_order_id=broker_id)
             raise ExecutionBlockedError(
                 f"{prefix}_rejected", "el broker no ejecuto la operacion"
             )
         # Sin evidencia autoritativa suficiente: SIN RESOLVER (no falso exito).
+        try:
+            self._order_manager.mark_unknown(order.order_id)
+        except OrderStateError:
+            pass
         self._journal.mark_state(op_id, "UNKNOWN", broker_order_id=broker_id)
         return f"{prefix}_unknown"
 
@@ -977,20 +1082,29 @@ class LiveExecutionCoordinator:
             raise ExecutionBlockedError("order_manager", str(exc)) from exc
 
         # Exposicion proyectada (F-03), justo antes de persistir/enviar.
+        # ORDER-07B: si el gate rechaza, la orden NO puede quedar CREATED
+        # huerfana en OrderManager (ni bloquear una identidad posterior).
         if self._projected_gate is not None:
             try:
                 self._projected_gate(order)
-            except ExecutionBlockedError:
+            except ExecutionBlockedError as exc:
+                self._reject_order(order, str(exc))
                 raise
             except Exception as exc:  # noqa: BLE001 - gate ajeno => fail-closed
+                reason = f"{type(exc).__name__}: {exc}"
+                self._reject_order(order, reason)
                 raise ExecutionBlockedError(
-                    "projected_exposure", f"{type(exc).__name__}: {exc}"
+                    "projected_exposure", reason
                 ) from exc
 
         # Intent journal WRITE-AHEAD (obligatorio). Fallo => NO submit.
         try:
             intent = self._journal.begin(
-                OrderIntent.from_order(order, run_id=self._run_id)
+                OrderIntent.from_order(
+                    order,
+                    run_id=self._run_id,
+                    protocol_version=SUBMIT_PROTOCOL_VERSION,
+                )
             )
         except IntentJournalError as exc:
             try:
@@ -1001,12 +1115,36 @@ class LiveExecutionCoordinator:
                 pass
             raise ExecutionBlockedError("journal_persist", str(exc)) from exc
 
-        # Autorizacion de capacidad + envio.
-        self._order_manager.approve(order.order_id)
-        self._order_manager.submit(order.order_id)
-        self._gate.approve(client_order_id, token=self._token)
+        # ORDER-07B: preparacion pre-send. Cualquier fallo aqui es un fallo
+        # operativo DEMOSTRADO sin envio => FAILED (no UNKNOWN, no CREATED).
         try:
+            self._order_manager.approve(order.order_id)
+            self._order_manager.mark_submitting(order.order_id)
+        except OrderStateError as exc:
+            self._mark_pre_send_failed(order, f"order_manager: {exc}")
+            raise ExecutionBlockedError("order_manager", str(exc)) from exc
+        try:
+            self._journal.mark_state(client_order_id, "SUBMITTING")
+        except IntentJournalError as exc:
+            self._mark_pre_send_failed(order, f"journal submitting: {exc}")
+            raise ExecutionBlockedError("journal_persist", str(exc)) from exc
+
+        # Frontera durable ya escrita: a partir de aqui el envio pudo ocurrir.
+        try:
+            self._gate.approve(client_order_id, token=self._token)
             submission = self._broker.submit_order(order)
+        except ExecutionNotAuthorizedError as exc:
+            self._mark_pre_send_failed(order, str(exc))
+            raise
+        except OrderRejectedError as exc:
+            self._mark_pre_send_rejected(order, str(exc))
+            raise
+        except BrokerError as exc:
+            self._mark_pre_send_failed(order, str(exc))
+            raise
+        except Exception as exc:  # noqa: BLE001 - fase no demostrable => ambiguo
+            self._mark_ambiguous(order, f"{type(exc).__name__}: {exc}")
+            raise
         finally:
             self._gate.consume(client_order_id, token=self._token)
 
@@ -1031,6 +1169,7 @@ class LiveExecutionCoordinator:
                 submission.broker_order.state.value,
                 broker_order_id=submission.broker_order.broker_order_id,
             )
+            self._sync_order_from_broker(order, submission.broker_order)
             return
         if submission.status is SubmitStatus.REJECTED:
             try:
@@ -1076,7 +1215,7 @@ class LiveExecutionCoordinator:
                 pass
 
     def _adopt_target_state(self, target_cid: str, broker_order) -> None:
-        """Adopta el estado AUTORITATIVO del broker para el objetivo (journal)."""
+        """Adopta el estado AUTORITATIVO del broker para el objetivo."""
         intent = self._journal.get(target_cid)
         state = getattr(getattr(broker_order, "state", None), "value", None)
         if intent is None or not state or intent.terminal:
@@ -1085,6 +1224,9 @@ class LiveExecutionCoordinator:
             self._journal.mark_state(target_cid, state)
         except IntentJournalError:
             pass
+        order = self._order_by_client_id(target_cid)
+        if order is not None:
+            self._sync_order_from_broker(order, broker_order)
 
     def cancel_pending(
         self, *, client_order_id: str, operation_id: str | None = None
@@ -1196,29 +1338,49 @@ class LiveExecutionCoordinator:
                 current.broker_order_id or target_intent.broker_order_id
             ),
             run_id=self._run_id,
+            protocol_version=SUBMIT_PROTOCOL_VERSION,
         )
         try:
             intent = self._journal.begin(cancel_intent)
         except IntentJournalError as exc:
             raise ExecutionBlockedError("journal_persist", str(exc)) from exc
+        try:
+            self._journal.mark_state(op_id, "SUBMITTING")
+        except IntentJournalError as exc:
+            raise ExecutionBlockedError("journal_persist", str(exc)) from exc
 
         # 6) Autorizacion de capacidad `CANCEL` + llamada al broker.
-        self._gate.approve_operation(
-            OPERATION_CANCEL, op_id=op_id, target=target_cid, token=self._token
-        )
         try:
+            self._gate.approve_operation(
+                OPERATION_CANCEL, op_id=op_id, target=target_cid, token=self._token
+            )
             broker_order = self._broker.cancel_order(
                 target_cid, operation_id=op_id
             )
         except OrderRejectedError as exc:
             self._journal.mark_state(op_id, "REJECTED")
             raise ExecutionBlockedError("cancel_rejected", str(exc)) from exc
+        except ExecutionNotAuthorizedError as exc:
+            self._journal.mark_state(op_id, "FAILED")
+            raise ExecutionBlockedError("cancel_not_authorized", str(exc)) from exc
         except OrderNotFoundError as exc:
             # NOT_FOUND no prueba nada: permanece sin resolver (sin suposicion).
             raise ExecutionBlockedError(
                 "cancel_not_found", "el broker no conoce entonces la orden"
             ) from exc
         except BrokerConnectionError as exc:
+            self._journal.mark_state(op_id, "UNKNOWN")
+            raise ExecutionBlockedError(
+                "cancel_unknown", "resultado incierto: resolver por lookup"
+            ) from exc
+        except BrokerError as exc:
+            # Post-send no interpretable (p.ej. fallo de mapeo del broker):
+            # ambiguo, nunca "no enviado".
+            self._journal.mark_state(op_id, "UNKNOWN")
+            raise ExecutionBlockedError(
+                "cancel_unknown", "resultado no interpretable: resolver por lookup"
+            ) from exc
+        except Exception as exc:  # noqa: BLE001 - fase no demostrable => ambiguo
             self._journal.mark_state(op_id, "UNKNOWN")
             raise ExecutionBlockedError(
                 "cancel_unknown", "resultado incierto: resolver por lookup"
@@ -1252,8 +1414,31 @@ class LiveExecutionCoordinator:
                 "cancel_target_filled",
                 "la orden se ejecuto: no cancelada; se preservan los fills",
             )
-        # Aun SUBMITTED/PARTIALLY_FILLED tras cancelar: sin resolver, sin reenvio.
+        if state in (BrokerOrderState.REJECTED, BrokerOrderState.EXPIRED):
+            self._journal.mark_state(
+                op_id, "REJECTED",
+                broker_order_id=getattr(broker_order, "broker_order_id", None),
+            )
+            self._adopt_target_state(target_cid, broker_order)
+            raise ExecutionBlockedError(
+                "cancel_target_terminal",
+                f"orden en estado {state.value}: cancelacion no aplicable",
+            )
+        if state in (
+            BrokerOrderState.SUBMITTED,
+            BrokerOrderState.PARTIALLY_FILLED,
+        ):
+            # El broker sigue mostrando la orden activa: la cancelacion NO se
+            # confirma y el objetivo conserva su estado real.
+            self._journal.mark_state(op_id, "UNKNOWN")
+            self._adopt_target_state(target_cid, broker_order)
+            raise ExecutionBlockedError(
+                "cancel_target_active",
+                f"orden sigue {state.value}: cancelacion sin confirmar",
+            )
+        # UNKNOWN u otro estado no concluyente: ambiguo, sin cancelacion.
         self._journal.mark_state(op_id, "UNKNOWN")
+        self._adopt_target_state(target_cid, broker_order)
         raise ExecutionBlockedError(
             "cancel_unknown",
             f"estado tras cancelar {getattr(state, 'value', state)}: sin resolver",
@@ -1392,6 +1577,7 @@ class LiveExecutionCoordinator:
                 available_quantity=available,
                 target_position_id=target_position_id,
                 run_id=self._run_id,
+                protocol_version=SUBMIT_PROTOCOL_VERSION,
             )
         else:
             candidate = OrderIntent.for_reduce(
@@ -1402,6 +1588,7 @@ class LiveExecutionCoordinator:
                 available_quantity=available,
                 target_position_id=target_position_id,
                 run_id=self._run_id,
+                protocol_version=SUBMIT_PROTOCOL_VERSION,
             )
         try:
             intent = self._journal.begin(candidate)
@@ -1414,14 +1601,36 @@ class LiveExecutionCoordinator:
                 pass
             raise ExecutionBlockedError("journal_persist", str(exc)) from exc
 
-        # 7) Gate por (kind, op_id, target=instrument) + envio + consumo seguro.
-        self._order_manager.approve(order.order_id)
-        self._order_manager.submit(order.order_id)
-        self._gate.approve_operation(
-            kind, op_id=op_id, target=instrument, token=self._token
-        )
+        # 7) Frontera durable SUBMITTING + gate + envio.
         try:
+            self._order_manager.approve(order.order_id)
+            self._order_manager.mark_submitting(order.order_id)
+        except OrderStateError as exc:
+            self._mark_pre_send_failed(order, f"order_manager: {exc}")
+            raise ExecutionBlockedError("order_manager", str(exc)) from exc
+        try:
+            self._journal.mark_state(op_id, "SUBMITTING")
+        except IntentJournalError as exc:
+            self._mark_pre_send_failed(order, f"journal submitting: {exc}")
+            raise ExecutionBlockedError("journal_persist", str(exc)) from exc
+
+        try:
+            self._gate.approve_operation(
+                kind, op_id=op_id, target=instrument, token=self._token
+            )
             submission = self._broker.submit_order(order)
+        except ExecutionNotAuthorizedError as exc:
+            self._mark_pre_send_failed(order, str(exc))
+            raise
+        except OrderRejectedError as exc:
+            self._mark_pre_send_rejected(order, str(exc))
+            raise
+        except BrokerError as exc:
+            self._mark_pre_send_failed(order, str(exc))
+            raise
+        except Exception as exc:  # noqa: BLE001 - fase no demostrable => ambiguo
+            self._mark_ambiguous(order, f"{type(exc).__name__}: {exc}")
+            raise
         finally:
             self._gate.consume_operation(
                 kind, op_id=op_id, target=instrument, token=self._token

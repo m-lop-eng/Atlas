@@ -111,6 +111,11 @@ _V3_ONLY_FIELDS = (
 # (vinculacion durable cid -> posicion).
 _V4_ONLY_FIELDS = ("position_id",)
 
+# ORDER-07B: protocolo de frontera durable de envio. Los intents nuevos marcan
+# este metadato por registro; los journals heredados (sin el) siguen el
+# tratamiento conservador anterior (lookup; un CREATED no prueba "nunca enviado").
+SUBMIT_PROTOCOL_VERSION = "ORDER-07B"
+
 # MT5-DEMO-EXECUTION-CONTROLS-02A/02B: tipo de operacion del intent.
 OPERATION_OPEN = "OPEN"
 OPERATION_CANCEL = "CANCEL"
@@ -224,6 +229,9 @@ class OrderIntent:
     # v4 (HEDGING-01): POSITION_IDENTIFIER resultante de una APERTURA (identidad
     # estable de la posicion propiedad de Atlas). NO es `target_position_id`.
     position_id: str | None = None
+    # ORDER-07B: protocolo por registro. `None` = journal heredado (sin frontera
+    # SUBMITTING); `SUBMIT_PROTOCOL_VERSION` = intent con frontera durable.
+    protocol_version: str | None = None
 
     @property
     def terminal(self) -> bool:
@@ -235,7 +243,12 @@ class OrderIntent:
         return not self.terminal
 
     @staticmethod
-    def from_order(order, *, run_id: str | None = None) -> "OrderIntent":
+    def from_order(
+        order,
+        *,
+        run_id: str | None = None,
+        protocol_version: str | None = None,
+    ) -> "OrderIntent":
         """Construye el intent MINIMO a partir de una `Order` (sin secrets).
 
         02B: el `purpose` tipado de la orden determina la `operation` del intent
@@ -269,6 +282,7 @@ class OrderIntent:
                 order.created_at.isoformat() if order.created_at is not None else None
             ),
             operation=operation,
+            protocol_version=protocol_version,
         )
 
     @staticmethod
@@ -282,6 +296,7 @@ class OrderIntent:
         quantity: float,
         target_broker_order_id: str | int | None = None,
         run_id: str | None = None,
+        protocol_version: str | None = None,
     ) -> "OrderIntent":
         """Construye el intent DURABLE de una operacion de cancelacion (02A).
 
@@ -308,6 +323,7 @@ class OrderIntent:
                 if target_broker_order_id is not None
                 else None
             ),
+            protocol_version=protocol_version,
         )
 
     @staticmethod
@@ -320,6 +336,7 @@ class OrderIntent:
         target_position_id: str | int | None = None,
         order_type: str = "MARKET",
         run_id: str | None = None,
+        protocol_version: str | None = None,
     ) -> "OrderIntent":
         """Intent DURABLE de un CIERRE total (02B). `operation=CLOSE`.
 
@@ -343,6 +360,7 @@ class OrderIntent:
                 str(target_position_id) if target_position_id is not None else None
             ),
             available_quantity=float(available_quantity),
+            protocol_version=protocol_version,
         )
 
     @staticmethod
@@ -356,6 +374,7 @@ class OrderIntent:
         target_position_id: str | int | None = None,
         order_type: str = "MARKET",
         run_id: str | None = None,
+        protocol_version: str | None = None,
     ) -> "OrderIntent":
         """Intent DURABLE de una REDUCCION parcial (02B). `operation=REDUCE`.
 
@@ -377,10 +396,11 @@ class OrderIntent:
                 str(target_position_id) if target_position_id is not None else None
             ),
             available_quantity=float(available_quantity),
+            protocol_version=protocol_version,
         )
 
     def to_dict(self) -> dict:
-        return {
+        result = {
             "client_order_id": self.client_order_id,
             "order_id": self.order_id,
             "instrument": self.instrument,
@@ -407,6 +427,9 @@ class OrderIntent:
             "available_quantity": self.available_quantity,
             "position_id": self.position_id,
         }
+        if self.protocol_version is not None:
+            result["protocol_version"] = self.protocol_version
+        return result
 
     @staticmethod
     def from_dict(d: dict) -> "OrderIntent":
@@ -474,6 +497,16 @@ class OrderIntent:
                 raise IntentJournalCorruptionError(
                     f"position_id invalido: {position_id!r} (requiere str no vacio)"
                 )
+        protocol_version = d.get("protocol_version")
+        if protocol_version is not None:
+            if (
+                not isinstance(protocol_version, str)
+                or not protocol_version.strip()
+            ):
+                raise IntentJournalCorruptionError(
+                    "protocol_version invalido (requiere str no vacio)"
+                )
+            protocol_version = protocol_version.strip()
         return OrderIntent(
             client_order_id=cid,
             order_id=order_id,
@@ -500,6 +533,7 @@ class OrderIntent:
             target_position_id=target_pos,
             available_quantity=available,
             position_id=position_id,
+            protocol_version=protocol_version,
         )
 
 
@@ -852,6 +886,9 @@ class IntentJournal:
             target_position_id=intent.target_position_id,
             available_quantity=intent.available_quantity,
             position_id=base.get("position_id", intent.position_id),
+            protocol_version=base.get(
+                "protocol_version", intent.protocol_version
+            ),
         )
 
     def to_dict(self) -> dict:
@@ -1025,12 +1062,24 @@ def recover_pending_intents(
 
     outcomes: list[IntentRecoveryOutcome] = []
     for intent in journal.unresolved():
+        cid = intent.client_order_id
+        # ORDER-07B: un CREATED nuevo acredita que NO se cruzo la frontera de
+        # envio. Puede terminalizarse sin lookup. Un CREATED heredado (sin
+        # protocol_version) NO prueba nada y sigue el camino conservador.
+        if (
+            intent.state == "CREATED"
+            and intent.protocol_version == SUBMIT_PROTOCOL_VERSION
+        ):
+            journal.mark_state(cid, "FAILED")
+            outcomes.append(
+                IntentRecoveryOutcome(cid, "PRE_SEND_FAILED", "FAILED")
+            )
+            continue
         # 02A/02B: la resolucion de cancelaciones es un flujo SEPARADO
         # (`recover_pending_cancels`). Aqui se resuelven los intents que SON una
         # orden de broker: OPEN, CLOSE y REDUCE (todos con cid<->ticket propio).
         if intent.operation == OPERATION_CANCEL:
             continue
-        cid = intent.client_order_id
         try:
             bro = broker.get_order(cid)
         except OrderNotFoundError:
@@ -1109,6 +1158,29 @@ def recover_pending_cancels(
             continue
         op_id = intent.client_order_id
         target = intent.target_client_order_id
+
+        def _mark_target(state: str, broker_order_id: str | None = None) -> None:
+            if not target:
+                return
+            target_intent = journal.get(target)
+            if target_intent is None or target_intent.terminal:
+                return
+            try:
+                journal.mark_state(
+                    target, state, broker_order_id=broker_order_id
+                )
+            except IntentJournalError:
+                pass
+
+        if (
+            intent.state == "CREATED"
+            and intent.protocol_version == SUBMIT_PROTOCOL_VERSION
+        ):
+            journal.mark_state(op_id, "FAILED")
+            outcomes.append(
+                IntentRecoveryOutcome(op_id, "PRE_SEND_FAILED", "FAILED")
+            )
+            continue
         if not target:
             outcomes.append(
                 IntentRecoveryOutcome(op_id, "NOT_FOUND", intent.state)
@@ -1137,6 +1209,7 @@ def recover_pending_cancels(
             )
             continue
         if bro.state is BrokerOrderState.UNKNOWN:
+            _mark_target("UNKNOWN", bro.broker_order_id)
             outcomes.append(
                 IntentRecoveryOutcome(op_id, "BROKER_UNKNOWN", intent.state)
             )
@@ -1145,6 +1218,7 @@ def recover_pending_cancels(
             journal.mark_state(
                 op_id, "CANCELLED", broker_order_id=bro.broker_order_id
             )
+            _mark_target("CANCELLED", bro.broker_order_id)
             outcomes.append(
                 IntentRecoveryOutcome(
                     op_id, "RESOLVED_CANCELLED", "CANCELLED",
@@ -1157,6 +1231,7 @@ def recover_pending_cancels(
             journal.mark_state(
                 op_id, "REJECTED", broker_order_id=bro.broker_order_id
             )
+            _mark_target("FILLED", bro.broker_order_id)
             outcomes.append(
                 IntentRecoveryOutcome(
                     op_id, "TARGET_FILLED", "REJECTED",
@@ -1168,6 +1243,7 @@ def recover_pending_cancels(
             BrokerOrderState.SUBMITTED,
             BrokerOrderState.PARTIALLY_FILLED,
         ):
+            _mark_target(bro.state.value, bro.broker_order_id)
             outcomes.append(
                 IntentRecoveryOutcome(
                     op_id, "TARGET_ACTIVE", intent.state,
@@ -1177,6 +1253,7 @@ def recover_pending_cancels(
             continue
         # REJECTED/EXPIRED: objetivo terminal sin exposicion pendiente.
         journal.mark_state(op_id, "REJECTED", broker_order_id=bro.broker_order_id)
+        _mark_target(bro.state.value, bro.broker_order_id)
         outcomes.append(
             IntentRecoveryOutcome(
                 op_id, "TARGET_TERMINAL", "REJECTED",
@@ -1203,6 +1280,7 @@ __all__ = [
     "SCHEMA_VERSION",
     "SCHEMA_VERSION_V1",
     "SCHEMA_VERSION_V2",
+    "SUBMIT_PROTOCOL_VERSION",
     "recover_pending_cancels",
     "recover_pending_intents",
 ]

@@ -179,6 +179,7 @@ class HedgingFakeMT5(FakeMT5):
             self._deals[deal_ticket] = SimpleNamespace(
                 ticket=deal_ticket, order=order_ticket, volume=filled, price=price,
                 commission=0.0, time=1_700_000_000,
+                position_id=identifier,
             )
         return SimpleNamespace(
             retcode=10009, order=order_ticket, deal=deal_ticket,

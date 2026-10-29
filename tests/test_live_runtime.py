@@ -23,11 +23,17 @@ from tests.test_mt5_execution_foundation import (
     FakeSessions,
     passing_admission,
 )
+from tests.test_mt5_hedging_restricted import (
+    HedgingAccountingFakeMT5,
+    _adapter as _hedging_adapter,
+    _hedge_runtime,
+)
 
 from execution.instrument import InstrumentSpec
 from execution.intent_journal import (
     OPERATION_CLOSE,
     OPERATION_OPEN,
+    SUBMIT_PROTOCOL_VERSION,
     IntentJournal,
     OrderIntent,
 )
@@ -60,9 +66,9 @@ from brokers.mt5 import (
 from brokers.models import (
     BrokerConnectionError,
     BrokerFill,
-    BrokerInvalidOrderError,
     BrokerOrder,
     BrokerOrderState,
+    SubmitStatus,
 )
 
 UTC = timezone.utc
@@ -218,6 +224,22 @@ class TestStartup:
         assert rep.reconciliation.status.value == "RECONCILIATION_OK"
         # secuencia: journal migrado + ledger persistido
         assert store.exists
+
+    def test_initialize_terminalizes_new_created_without_send(self, tmp_path):
+        journal = IntentJournal.initialize(tmp_path / "j.json")
+        journal.begin(
+            OrderIntent.from_order(
+                _open_order("O-NEW-CREATED"),
+                protocol_version=SUBMIT_PROTOCOL_VERSION,
+            )
+        )
+        rt, adapter, fake, ledger, journal, store = _runtime(
+            tmp_path, journal=journal
+        )
+        rep = rt.initialize()
+        assert rep.ready is True
+        assert journal.get("O-NEW-CREATED").state == "FAILED"
+        assert fake.send_count == 0
 
     def test_initialize_rejects_missing_mapping(self, tmp_path):
         rt, adapter, fake, ledger, journal, store = _runtime(tmp_path, symbol_map={})
@@ -629,16 +651,18 @@ class TestPostSendSymbolResolutionFailure:
         assert rt.initialize().ready is True
 
         # 1) La operacion SI llego al broker (efecto externo) pero la resolucion
-        #    posterior falla: el error tipado se propaga (no es exito).
-        with pytest.raises(BrokerInvalidOrderError):
-            rt.submit(side=OrderSide.BUY, quantity=0.1, strategy_id="s",
-                      strategy_version="1.0.0", client_order_id="P-1")
+        #    posterior falla: ORDER-07B lo refleja como UNKNOWN (nunca como
+        #    "no enviado" ni como rechazo).
+        out = rt.submit(side=OrderSide.BUY, quantity=0.1, strategy_id="s",
+                        strategy_version="1.0.0", client_order_id="P-1")
+        assert out.submission.status is SubmitStatus.UNKNOWN
+        assert journal.get("P-1").state == "UNKNOWN"
         assert fake.send_count == 1
 
         # 2) El runtime NO autoriza una nueva operacion hasta la recuperacion:
         #    el intent WRITE-AHEAD previo queda sin resolver y bloquea el envio.
         sends = fake.send_count
-        with pytest.raises(ExecutionBlockedError):
+        with pytest.raises((ExecutionBlockedError, RuntimeNotReadyError)):
             rt.submit(side=OrderSide.BUY, quantity=0.1, strategy_id="s",
                       strategy_version="1.0.0", client_order_id="P-2")
         assert fake.send_count == sends  # sin segundo order_send
@@ -647,3 +671,637 @@ class TestPostSendSymbolResolutionFailure:
         # 3) La recuperacion NO limpia la incertidumbre en silencio.
         assert rt.initialize().ready is False
         assert len(journal.unresolved()) == 1
+
+class _CancelFilledRaceFake(AccountingFakeMT5):
+    """Cancelacion aceptada pero el broker ejecuta la orden durante la carrera."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.events: list[str] = []
+        self.sent_cancel = False
+
+    def _send_remove(self, request):
+        self.events.append("cancel_send")
+        self.sent_cancel = True
+        ticket = int(request["order"])
+        order = self._open_orders.pop(ticket, None)
+        if order is not None:
+            order.state = ORDER_STATE_FILLED
+            order.volume_current = 0.0
+            self._orders[ticket] = order
+            self.add_deal(
+                ticket + 10_000, ticket,
+                volume=order.volume_initial, price=order.price_open,
+            )
+            signed = (
+                float(order.volume_initial)
+                if int(order.type) == 0
+                else -float(order.volume_initial)
+            )
+            self._account_fill(INSTRUMENT, signed, float(order.price_open))
+        return SimpleNamespace(
+            retcode=10009, order=ticket, deal=0, volume=0.0, price=0.0
+        )
+
+    def order_send(self, request):
+        if request.get("action") != TRADE_ACTION_REMOVE:
+            self.events.append("order_send")
+        return super().order_send(request)
+
+
+class TestOrder07DCancelFillRace:
+    def _setup(self, tmp_path):
+        journal = IntentJournal.initialize(tmp_path / "j.json")
+        journal.begin(OrderIntent.from_order(_open_order("O-RACE")))
+        fake = _CancelFilledRaceFake()
+        rt, adapter, fake, ledger, journal, store = _runtime(
+            tmp_path, fake=fake, journal=journal
+        )
+        fake.add_open_order(
+            800, magic=adapter._magic_for("O-RACE"),
+            comment=adapter._comment_for("O-RACE"),
+            volume=0.1, price=ASK,
+        )
+        adapter._remember("O-RACE", 800)
+        assert rt.initialize().ready is True
+        return rt, adapter, fake, ledger, journal, store
+
+    def test_cancel_fill_race_applies_fill_before_return(self, tmp_path):
+        rt, adapter, fake, ledger, journal, store = self._setup(tmp_path)
+        with pytest.raises(ExecutionBlockedError) as ei:
+            rt.cancel_pending(client_order_id="O-RACE")
+        assert ei.value.stage == "cancel_target_filled"
+        assert journal.get("O-RACE").state == "FILLED"
+        assert journal.get("CANCEL:O-RACE").state == "REJECTED"
+        assert ledger.position(INSTRUMENT).quantity == pytest.approx(0.1)
+        assert fake._net[INSTRUMENT][0] == pytest.approx(0.1)
+        assert fake.events == ["cancel_send"]
+
+    def test_new_order_waits_for_fill_apply_and_reconcile(self, tmp_path, monkeypatch):
+        rt, adapter, fake, ledger, journal, store = self._setup(tmp_path)
+        events = []
+        fake.events = events
+        orig_apply = LiveExecutionRuntime._apply_known_fills
+        orig_reconcile = LiveExecutionRuntime.reconcile_now
+
+        def wrapped_apply(self):
+            events.append("apply")
+            return orig_apply(self)
+
+        def wrapped_reconcile(self):
+            events.append("reconcile")
+            return orig_reconcile(self)
+
+        monkeypatch.setattr(LiveExecutionRuntime, "_apply_known_fills", wrapped_apply)
+        monkeypatch.setattr(LiveExecutionRuntime, "reconcile_now", wrapped_reconcile)
+        fake.events.clear()
+        with pytest.raises(ExecutionBlockedError) as ei:
+            rt.cancel_pending(client_order_id="O-RACE")
+        assert ei.value.stage == "cancel_target_filled"
+        # El fill se aplica y la reconciliacion se completa antes de volver.
+        assert events == ["apply", "cancel_send", "apply", "reconcile"]
+        assert ledger.position(INSTRUMENT).quantity == pytest.approx(0.1)
+
+        sends = fake.send_count
+        out = rt.submit(
+            side=OrderSide.BUY, quantity=0.1, strategy_id="s",
+            strategy_version="1.0.0", client_order_id="AFTER-RACE",
+        )
+        assert out.allowed is True
+        assert fake.send_count == sends + 1
+        assert "order_send" in fake.events
+        assert fake.events.index("order_send") > fake.events.index("cancel_send")
+
+    def test_reconciliation_failure_blocks_new_send(self, tmp_path, monkeypatch):
+        rt, adapter, fake, ledger, journal, store = self._setup(tmp_path)
+        orig_apply = LiveExecutionRuntime._apply_known_fills
+
+        def wrapped_apply(self):
+            if fake.sent_cancel:
+                raise RuntimeError("forced apply failure")
+            return orig_apply(self)
+
+        monkeypatch.setattr(LiveExecutionRuntime, "_apply_known_fills", wrapped_apply)
+        with pytest.raises(ExecutionBlockedError) as ei:
+            rt.cancel_pending(client_order_id="O-RACE")
+        assert ei.value.stage == "cancel_target_filled"
+        assert rt._post_operation_failed is True
+
+        sends = fake.send_count
+        with pytest.raises(RuntimeNotReadyError):
+            rt.submit(
+                side=OrderSide.BUY, quantity=0.1, strategy_id="s",
+                strategy_version="1.0.0", client_order_id="BLOCKED",
+            )
+        assert fake.send_count == sends
+
+        # La recuperacion vuelve a aplicar/reconciliar y libera el bloqueo.
+        monkeypatch.undo()
+        assert rt.initialize().ready is True
+        out = rt.submit(
+            side=OrderSide.BUY, quantity=0.1, strategy_id="s",
+            strategy_version="1.0.0", client_order_id="AFTER-RECOVERY",
+        )
+        assert out.allowed is True
+        assert ledger.position(INSTRUMENT).quantity == pytest.approx(0.2)
+
+    def test_repeated_reconcile_does_not_duplicate_fill(self, tmp_path):
+        rt, adapter, fake, ledger, journal, store = self._setup(tmp_path)
+        with pytest.raises(ExecutionBlockedError):
+            rt.cancel_pending(client_order_id="O-RACE")
+        sends = fake.send_count
+        rt._apply_known_fills()
+        rt._apply_known_fills()
+        rt.reconcile_now()
+        assert ledger.position(INSTRUMENT).quantity == pytest.approx(0.1)
+        assert fake.send_count == sends
+        assert journal.get("O-RACE").state == "FILLED"
+
+class _HedgingCancelFilledRace(HedgingAccountingFakeMT5):
+    """Cancelacion aceptada y ejecutada: crea posicion HEDGING con identidad."""
+
+    def __init__(
+        self, *, ambiguous=False, external_only=False,
+        missing_position_id=False, wrong_fill_order=False,
+        incomplete_history=False,
+    ) -> None:
+        super().__init__()
+        self.ambiguous = ambiguous
+        self.external_only = external_only
+        self.missing_position_id = missing_position_id
+        self.wrong_fill_order = wrong_fill_order
+        self.incomplete_history = incomplete_history
+        self.sent_cancel = False
+
+    def _send_remove(self, request):
+        self.cancel_count += 1
+        self.sent_cancel = True
+        ticket = int(request["order"])
+        order = self._open_orders.pop(ticket, None)
+        if order is not None:
+            order.state = ORDER_STATE_FILLED
+            order.volume_current = 0.0
+            self._orders[ticket] = order
+            volume = float(order.volume_initial)
+            price = float(order.price_open)
+            deal_ticket = ticket + 10_000
+            if self.ambiguous:
+                part = volume / 2.0
+                self.add_deal(deal_ticket, ticket, volume=part, price=price)
+                if not self.missing_position_id:
+                    self._deals[deal_ticket].position_id = ticket
+                if self.wrong_fill_order:
+                    self._deals[deal_ticket].order = ticket + 999
+                deal_ticket_2 = ticket + 10_001
+                self.add_deal(
+                    deal_ticket_2, ticket, volume=part, price=price
+                )
+                if not self.missing_position_id:
+                    self._deals[deal_ticket_2].position_id = ticket + 1
+                if self.wrong_fill_order:
+                    self._deals[deal_ticket_2].order = ticket + 999
+                identifiers = (ticket, ticket + 1)
+            else:
+                if not self.incomplete_history:
+                    self.add_deal(
+                        deal_ticket, ticket, volume=volume, price=price
+                    )
+                    if not self.missing_position_id:
+                        self._deals[deal_ticket].position_id = ticket
+                    if self.wrong_fill_order:
+                        self._deals[deal_ticket].order = ticket + 999
+                identifiers = (
+                    (ticket + 777,) if self.external_only else (ticket,)
+                )
+            for identifier in identifiers:
+                self._hedges.append({
+                    "ticket": identifier, "identifier": identifier,
+                    "symbol": INSTRUMENT, "type": int(order.type),
+                    "volume": volume, "price_open": price,
+                    "magic": order.magic, "comment": order.comment,
+                    "time": 1_700_000_000,
+                })
+            signed = volume if int(order.type) == ORDER_TYPE_BUY else -volume
+            self._net[INSTRUMENT] = [signed, price]
+            self._mark = price
+            self.account.balance -= signed * price * self._cs(INSTRUMENT)
+            self.account.equity = (
+                self.account.balance
+                + signed * self._mark * self._cs(INSTRUMENT)
+            )
+        return SimpleNamespace(
+            retcode=10009, order=ticket, deal=0, volume=0.0, price=0.0
+        )
+
+
+class TestOrder07EHedgingOwnership:
+    def _setup(
+        self, tmp_path, *, ambiguous=False, external_only=False,
+        missing_position_id=False, wrong_fill_order=False,
+        incomplete_history=False,
+    ):
+        fake = _HedgingCancelFilledRace(
+            ambiguous=ambiguous,
+            external_only=external_only,
+            missing_position_id=missing_position_id,
+            wrong_fill_order=wrong_fill_order,
+            incomplete_history=incomplete_history,
+        )
+        fake.add_symbol(INSTRUMENT)
+        fake.add_tick(INSTRUMENT, bid=1.0999, ask=1.1001)
+        journal = IntentJournal.initialize(tmp_path / "j.json")
+        journal.begin(OrderIntent.from_order(_open_order("O-HRACE")))
+        adapter = _hedging_adapter(fake, allow=True)
+        rt = _hedge_runtime(
+            journal, adapter, tmp_path / "ledger.json",
+            lambda: {INSTRUMENT: fake._mark},
+        )
+        fake.add_open_order(
+            900, symbol=INSTRUMENT,
+            magic=adapter._magic_for("O-HRACE"),
+            comment=adapter._comment_for("O-HRACE"),
+            volume=0.1, price=1.1,
+        )
+        adapter._remember("O-HRACE", 900)
+        assert rt.initialize().ready is True
+        return rt, adapter, fake, journal, tmp_path / "ledger.json"
+
+    def test_filled_cancel_links_hedging_position(self, tmp_path):
+        rt, adapter, fake, journal, ledger_path = self._setup(tmp_path)
+        with pytest.raises(ExecutionBlockedError) as ei:
+            rt.cancel_pending(client_order_id="O-HRACE")
+        assert ei.value.stage == "cancel_target_filled"
+        assert journal.get("O-HRACE").state == "FILLED"
+        assert journal.get("O-HRACE").position_id == "900"
+        assert journal.find_by_position_id("900")[0].client_order_id == "O-HRACE"
+        assert rt.ledger.position(INSTRUMENT).quantity == pytest.approx(0.1)
+        assert len(fake._hedges) == 1 and fake._hedges[0]["identifier"] == 900
+        assert fake.send_count == 0  # sin envios adicionales por la cancelacion
+        assert journal.get("CANCEL:O-HRACE").state == "REJECTED"
+
+    def test_ambiguous_position_blocks_and_keeps_fill_once(self, tmp_path):
+        rt, adapter, fake, journal, ledger_path = self._setup(
+            tmp_path, ambiguous=True
+        )
+        with pytest.raises(ExecutionBlockedError) as ei:
+            rt.cancel_pending(client_order_id="O-HRACE")
+        assert ei.value.stage == "cancel_target_filled"
+        assert journal.get("O-HRACE").state == "FILLED"
+        assert journal.get("O-HRACE").position_id is None
+        assert rt.ledger.position(INSTRUMENT).quantity == pytest.approx(0.1)
+        assert rt._post_operation_failed is True
+        with pytest.raises(RuntimeNotReadyError):
+            rt.submit(
+                side=OrderSide.BUY, quantity=0.1, strategy_id="s",
+                strategy_version="1.0.0", client_order_id="AFTER-AMBIG",
+            )
+        assert fake.send_count == 0
+
+    def test_link_persistence_failure_blocks_and_restart_stays_unlinked(
+        self, tmp_path, monkeypatch
+    ):
+        rt, adapter, fake, journal, ledger_path = self._setup(tmp_path)
+        original_link = IntentJournal.link_position
+
+        def fail_link(self, client_order_id, position_id):
+            raise RuntimeError("forced link persistence failure")
+
+        monkeypatch.setattr(IntentJournal, "link_position", fail_link)
+        with pytest.raises(ExecutionBlockedError) as ei:
+            rt.cancel_pending(client_order_id="O-HRACE")
+        assert ei.value.stage == "cancel_target_filled"
+        assert journal.get("O-HRACE").state == "FILLED"
+        assert journal.get("O-HRACE").position_id is None
+        assert rt.ledger.position(INSTRUMENT).quantity == pytest.approx(0.1)
+        assert rt._post_operation_failed is True
+        with pytest.raises(RuntimeNotReadyError):
+            rt.submit(
+                side=OrderSide.BUY, quantity=0.1, strategy_id="s",
+                strategy_version="1.0.0", client_order_id="AFTER-LINK-FAIL",
+            )
+        assert fake.send_count == 0
+
+        monkeypatch.setattr(IntentJournal, "link_position", original_link)
+        rt2 = _hedge_runtime(
+            IntentJournal(journal.path), _hedging_adapter(fake, allow=True),
+            ledger_path, lambda: {INSTRUMENT: fake._mark},
+        )
+        rep = rt2.initialize()
+        assert rep.ready is False and rep.stage == "ownership"
+        assert journal.get("O-HRACE").position_id is None
+
+    def test_restart_recovers_persisted_link_without_duplicate_fill(self, tmp_path):
+        rt, adapter, fake, journal, ledger_path = self._setup(tmp_path)
+        with pytest.raises(ExecutionBlockedError):
+            rt.cancel_pending(client_order_id="O-HRACE")
+        linked = journal.get("O-HRACE").position_id
+        assert linked == "900"
+        assert rt.ledger.position(INSTRUMENT).quantity == pytest.approx(0.1)
+
+        rt2 = _hedge_runtime(
+            IntentJournal(journal.path), _hedging_adapter(fake, allow=True),
+            ledger_path, lambda: {INSTRUMENT: fake._mark},
+        )
+        rep = rt2.initialize()
+        assert rep.ready is True
+        assert journal.get("O-HRACE").position_id == linked
+        assert rt2.ledger.position(INSTRUMENT).quantity == pytest.approx(0.1)
+        assert fake.send_count == 0
+
+    def test_unlinked_restart_is_not_adopted(self, tmp_path):
+        fake = _HedgingCancelFilledRace()
+        fake.add_symbol(INSTRUMENT)
+        fake.add_tick(INSTRUMENT, bid=1.0999, ask=1.1001)
+        journal = IntentJournal.initialize(tmp_path / "j.json")
+        journal.begin(OrderIntent.from_order(_open_order("O-UNLINKED")))
+        journal.mark_state("O-UNLINKED", "FILLED")
+        fake.add_hedge_position(
+            identifier=777, ticket=777, symbol=INSTRUMENT,
+            volume=0.1, price=1.1,
+        )
+        rt = _hedge_runtime(
+            journal, _hedging_adapter(fake, allow=True),
+            tmp_path / "ledger.json", lambda: {INSTRUMENT: 1.1},
+        )
+        rep = rt.initialize()
+        assert rep.ready is False and rep.stage == "ownership"
+        assert journal.get("O-UNLINKED").position_id is None
+        assert fake.send_count == 0
+
+    def test_ownership_resolution_is_idempotent(self, tmp_path):
+        rt, adapter, fake, journal, ledger_path = self._setup(tmp_path)
+        with pytest.raises(ExecutionBlockedError):
+            rt.cancel_pending(client_order_id="O-HRACE")
+        first_link = journal.get("O-HRACE").position_id
+        sends = fake.send_count
+        rt._reconcile_after_cancel_filled("O-HRACE")
+        rt._reconcile_after_cancel_filled("O-HRACE")
+        assert journal.get("O-HRACE").position_id == first_link
+        assert journal.get("O-HRACE").state == "FILLED"
+        assert rt.ledger.position(INSTRUMENT).quantity == pytest.approx(0.1)
+        assert fake.send_count == sends
+
+class _PreLinkedCancelFilledRace(HedgingAccountingFakeMT5):
+    def __init__(self, *, deal_position_id=800) -> None:
+        super().__init__()
+        self.deal_position_id = deal_position_id
+
+    def _send_remove(self, request):
+        self.cancel_count += 1
+        ticket = int(request["order"])
+        order = self._open_orders.pop(ticket, None)
+        if order is not None:
+            order.state = ORDER_STATE_FILLED
+            order.volume_current = 0.0
+            self._orders[ticket] = order
+            deal_ticket = ticket + 10_000
+            self.add_deal(
+                deal_ticket, ticket,
+                volume=order.volume_initial, price=order.price_open,
+            )
+            self._deals[deal_ticket].position_id = self.deal_position_id
+        return SimpleNamespace(
+            retcode=10009, order=ticket, deal=0, volume=0.0, price=0.0
+        )
+
+
+class TestOrder07EPreLinkedOwnership:
+    def test_race_preserves_existing_hedging_link(self, tmp_path):
+        fake = _PreLinkedCancelFilledRace()
+        fake.add_symbol(INSTRUMENT)
+        fake.add_tick(INSTRUMENT, bid=1.0999, ask=1.1001)
+        journal = IntentJournal.initialize(tmp_path / "j.json")
+        journal.begin(OrderIntent.from_order(_open_order("O-PRELINKED")))
+        adapter = _hedging_adapter(fake, allow=True)
+        rt = _hedge_runtime(
+            journal, adapter, tmp_path / "ledger.json",
+            lambda: {INSTRUMENT: fake._mark},
+        )
+        fake.add_open_order(
+            901, symbol=INSTRUMENT,
+            magic=adapter._magic_for("O-PRELINKED"),
+            comment=adapter._comment_for("O-PRELINKED"),
+            volume=0.1, price=1.1,
+        )
+        adapter._remember("O-PRELINKED", 901)
+        assert rt.initialize().ready is True
+        # La posicion y el vinculo existen antes de la carrera de cancelacion.
+        fake.add_hedge_position(
+            identifier=800, ticket=800, symbol=INSTRUMENT,
+            volume=0.1, price=1.1,
+        )
+        journal.link_position("O-PRELINKED", "800")
+        with pytest.raises(ExecutionBlockedError) as ei:
+            rt.cancel_pending(client_order_id="O-PRELINKED")
+        assert ei.value.stage == "cancel_target_filled"
+        assert journal.get("O-PRELINKED").state == "FILLED"
+        assert journal.get("O-PRELINKED").position_id == "800"
+        assert journal.find_by_position_id("800")[0].client_order_id == "O-PRELINKED"
+        assert rt.ledger.position(INSTRUMENT).quantity == pytest.approx(0.1)
+        assert fake.send_count == 0
+
+class TestOrder07FStartupOwnershipGuard:
+    def _journal_filled_open(self, tmp_path, cid="O-FILLED"):
+        journal = IntentJournal.initialize(tmp_path / "j.json")
+        journal.begin(OrderIntent.from_order(_open_order(cid)))
+        journal.mark_state(cid, "FILLED")
+        return journal
+
+    def _hedging_empty(self):
+        fake = HedgingAccountingFakeMT5()
+        fake.add_symbol(INSTRUMENT)
+        fake.add_tick(INSTRUMENT, bid=1.0999, ask=1.1001)
+        return fake
+
+    def test_open_filled_without_position_id_blocks_startup(self, tmp_path):
+        journal = self._journal_filled_open(tmp_path)
+        fake = self._hedging_empty()
+        adapter = _hedging_adapter(fake, allow=True)
+        rt = _hedge_runtime(
+            journal, adapter, tmp_path / "ledger.json",
+            lambda: {INSTRUMENT: fake._mark},
+        )
+        rep = rt.initialize()
+        assert rep.ready is False and rep.stage == "ownership"
+        assert journal.get("O-FILLED").state == "FILLED"
+        assert journal.get("O-FILLED").position_id is None
+        assert fake.send_count == 0
+        with pytest.raises(RuntimeNotReadyError):
+            rt.submit(
+                side=OrderSide.BUY, quantity=0.1, strategy_id="s",
+                strategy_version="1.0.0", client_order_id="BLOCKED",
+            )
+        assert fake.send_count == 0
+
+    def test_block_survives_restart_using_same_journal(self, tmp_path):
+        journal = self._journal_filled_open(tmp_path)
+        fake = self._hedging_empty()
+        adapter = _hedging_adapter(fake, allow=True)
+        rt = _hedge_runtime(
+            journal, adapter, tmp_path / "ledger.json",
+            lambda: {INSTRUMENT: fake._mark},
+        )
+        assert rt.initialize().ready is False
+
+        rt2 = _hedge_runtime(
+            IntentJournal(journal.path),
+            _hedging_adapter(fake, allow=True),
+            tmp_path / "ledger.json",
+            lambda: {INSTRUMENT: fake._mark},
+        )
+        rep = rt2.initialize()
+        assert rep.ready is False and rep.stage == "ownership"
+        with pytest.raises(RuntimeNotReadyError):
+            rt2.submit(
+                side=OrderSide.BUY, quantity=0.1, strategy_id="s",
+                strategy_version="1.0.0", client_order_id="BLOCKED-2",
+            )
+        assert fake.send_count == 0
+
+    def test_valid_persisted_position_link_does_not_block(self, tmp_path):
+        fake = HedgingAccountingFakeMT5()
+        fake.add_symbol(INSTRUMENT)
+        fake.add_tick(INSTRUMENT, bid=1.0999, ask=1.1001)
+        journal = IntentJournal.initialize(tmp_path / "j.json")
+        adapter = _hedging_adapter(fake, allow=True)
+        rt = _hedge_runtime(
+            journal, adapter, tmp_path / "ledger.json",
+            lambda: {INSTRUMENT: fake._mark},
+        )
+        assert rt.initialize().ready is True
+        out = rt.submit(
+            side=OrderSide.BUY, quantity=0.1, strategy_id="s",
+            strategy_version="1.0.0", client_order_id="LINKED-START",
+        )
+        assert out.allowed is True
+        assert journal.get("LINKED-START").position_id is not None
+
+        rt2 = _hedge_runtime(
+            IntentJournal(journal.path),
+            _hedging_adapter(fake, allow=True),
+            tmp_path / "ledger.json",
+            lambda: {INSTRUMENT: fake._mark},
+        )
+        rep = rt2.initialize()
+        assert rep.ready is True
+        assert journal.get("LINKED-START").position_id is not None
+
+    def test_netting_does_not_require_hedging_position_id(self, tmp_path):
+        journal = self._journal_filled_open(tmp_path, cid="O-NET")
+        fake = AccountingFakeMT5()
+        fake.add_symbol(INSTRUMENT)
+        fake.add_tick(INSTRUMENT, bid=BID, ask=ASK)
+        rt, adapter, fake, ledger, journal, store = _runtime(
+            tmp_path, fake=fake, journal=journal
+        )
+        rep = rt.initialize()
+        assert rep.ready is True
+        assert journal.get("O-NET").position_id is None
+        assert fake.send_count == 0
+
+    def test_visible_unlinked_position_does_not_clear_pending_ownership(self, tmp_path):
+        journal = self._journal_filled_open(tmp_path)
+        fake = self._hedging_empty()
+        fake.add_hedge_position(
+            identifier=777, ticket=777, symbol=INSTRUMENT,
+            volume=0.1, price=1.1,
+        )
+        adapter = _hedging_adapter(fake, allow=True)
+        rt = _hedge_runtime(
+            journal, adapter, tmp_path / "ledger.json",
+            lambda: {INSTRUMENT: fake._mark},
+        )
+        rep = rt.initialize()
+        assert rep.ready is False and rep.stage == "ownership"
+        assert journal.get("O-FILLED").position_id is None
+        with pytest.raises(RuntimeNotReadyError):
+            rt.submit(
+                side=OrderSide.BUY, quantity=0.1, strategy_id="s",
+                strategy_version="1.0.0", client_order_id="NOT-ADOPTED",
+            )
+        assert fake.send_count == 0
+
+class TestOrder07GAuthoritativeLink:
+    def _setup(self, tmp_path, **kwargs):
+        return TestOrder07EHedgingOwnership()._setup(tmp_path, **kwargs)
+
+    def test_external_unique_position_is_not_linked(self, tmp_path):
+        rt, adapter, fake, journal, ledger_path = self._setup(
+            tmp_path, external_only=True
+        )
+        with pytest.raises(ExecutionBlockedError) as ei:
+            rt.cancel_pending(client_order_id="O-HRACE")
+        assert ei.value.stage == "cancel_target_filled"
+        assert journal.get("O-HRACE").state == "FILLED"
+        assert journal.get("O-HRACE").position_id is None
+        assert rt.ledger.position(INSTRUMENT).quantity == pytest.approx(0.1)
+        assert rt._post_operation_failed is True
+        assert [p["identifier"] for p in fake._hedges] == [1677]
+        assert fake.send_count == 0
+
+    def test_missing_position_identity_blocks(self, tmp_path):
+        rt, adapter, fake, journal, ledger_path = self._setup(
+            tmp_path, missing_position_id=True
+        )
+        with pytest.raises(ExecutionBlockedError):
+            rt.cancel_pending(client_order_id="O-HRACE")
+        assert journal.get("O-HRACE").state == "FILLED"
+        assert journal.get("O-HRACE").position_id is None
+        assert rt.ledger.position(INSTRUMENT).quantity == pytest.approx(0.1)
+        assert rt._post_operation_failed is True
+        assert fake.send_count == 0
+
+    def test_fill_for_other_order_blocks(self, tmp_path):
+        rt, adapter, fake, journal, ledger_path = self._setup(
+            tmp_path, wrong_fill_order=True
+        )
+        with pytest.raises(ExecutionBlockedError):
+            rt.cancel_pending(client_order_id="O-HRACE")
+        assert journal.get("O-HRACE").state == "FILLED"
+        assert journal.get("O-HRACE").position_id is None
+        assert rt._post_operation_failed is True
+        assert fake.send_count == 0
+
+    def test_incomplete_history_blocks(self, tmp_path):
+        rt, adapter, fake, journal, ledger_path = self._setup(
+            tmp_path, incomplete_history=True
+        )
+        with pytest.raises(ExecutionBlockedError):
+            rt.cancel_pending(client_order_id="O-HRACE")
+        assert journal.get("O-HRACE").state == "FILLED"
+        assert journal.get("O-HRACE").position_id is None
+        assert rt._post_operation_failed is True
+        assert fake.send_count == 0
+
+    def test_contradictory_deal_identity_blocks_without_replacing_link(self, tmp_path):
+        fake = _PreLinkedCancelFilledRace(deal_position_id=900)
+        fake.add_symbol(INSTRUMENT)
+        fake.add_tick(INSTRUMENT, bid=1.0999, ask=1.1001)
+        journal = IntentJournal.initialize(tmp_path / "j.json")
+        journal.begin(OrderIntent.from_order(_open_order("O-CONTRADICTION")))
+        adapter = _hedging_adapter(fake, allow=True)
+        rt = _hedge_runtime(
+            journal, adapter, tmp_path / "ledger.json",
+            lambda: {INSTRUMENT: fake._mark},
+        )
+        fake.add_open_order(
+            901, symbol=INSTRUMENT,
+            magic=adapter._magic_for("O-CONTRADICTION"),
+            comment=adapter._comment_for("O-CONTRADICTION"),
+            volume=0.1, price=1.1,
+        )
+        adapter._remember("O-CONTRADICTION", 901)
+        assert rt.initialize().ready is True
+        fake.add_hedge_position(
+            identifier=800, ticket=800, symbol=INSTRUMENT,
+            volume=0.1, price=1.1,
+        )
+        journal.link_position("O-CONTRADICTION", "800")
+        with pytest.raises(ExecutionBlockedError) as ei:
+            rt.cancel_pending(client_order_id="O-CONTRADICTION")
+        assert ei.value.stage == "cancel_target_filled"
+        assert journal.get("O-CONTRADICTION").state == "FILLED"
+        assert journal.get("O-CONTRADICTION").position_id == "800"
+        assert rt._post_operation_failed is True
+        assert rt.ledger.position(INSTRUMENT).quantity == pytest.approx(0.1)
+        assert fake.send_count == 0

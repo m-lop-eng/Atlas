@@ -1215,21 +1215,22 @@ class TestOrderSymbolConsumerRegression:
             adapter.get_open_orders()  # NO devuelve una lista parcial
 
     # ---- fallo POST-SEND (efecto externo ya ocurrido) --------------------
-    def test_submit_post_send_unmapped_raises_no_order(self):
+    def test_submit_post_send_unmapped_returns_unknown_no_order(self):
         adapter, fake = _adapter(_UnmappedSymbolAfterSend())
         adapter.connect()
-        with pytest.raises(BrokerInvalidOrderError):
-            adapter.submit_order(_order(cid="S-UNMAP"))
+        sub = adapter.submit_order(_order(cid="S-UNMAP"))
+        assert sub.status is SubmitStatus.UNKNOWN
+        assert sub.broker_order is None
         assert fake.send_count == 1  # order_send SI ocurrio (efecto externo)
 
-    def test_cancel_post_send_unmapped_raises_no_order(self):
+    def test_cancel_post_send_unmapped_is_ambiguous_no_order(self):
         adapter, fake = _ready()
         cid = "CANC-UNMAP"
         fake.add_open_order(
             401, symbol=_UNMAPPED_MT5_SYMBOL,
             magic=adapter._magic_for(cid), comment=adapter._comment_for(cid),
         )
-        with pytest.raises(BrokerInvalidOrderError):
+        with pytest.raises(BrokerConnectionError):
             adapter.cancel_order(cid)
         # La cancelacion SI se ejecuto en el broker antes del fallo de resolucion.
         assert fake._orders[401].state == ORDER_STATE_CANCELED
@@ -1817,3 +1818,61 @@ class TestOrderHistoryLookup:
         _, fake = _ready()
         with pytest.raises(TypeError):
             fake.history_deals_get(order=1)
+
+class _CancelAckButActiveFake(FakeMT5):
+    def _send_remove(self, request):
+        ticket = int(request["order"])
+        return SimpleNamespace(retcode=10009, order=ticket, deal=0, volume=0.0, price=0.0)
+
+
+class TestCancelAckNoInference:
+    def test_ack_active_returns_observed_state(self):
+        fake = _CancelAckButActiveFake()
+        fake.add_open_order(
+            990, symbol=MT5_SYMBOL, magic=0, comment=""
+        )
+        adapter, fake = _adapter(fake)
+        adapter.connect()
+        adapter._remember("CANCEL-ACK-ACTIVE", 990)
+        result = adapter.cancel_order("CANCEL-ACK-ACTIVE")
+        assert result.state is BrokerOrderState.SUBMITTED
+        assert fake._open_orders[990].state == ORDER_STATE_PLACED
+
+class TestDealFillPositionIdentity:
+    @staticmethod
+    def _deal(**over):
+        values = dict(
+            order=123, ticket=456, volume=0.1, price=1.1,
+            time=1_700_000_000, commission=0.5, position_id=900,
+        )
+        values.update(over)
+        return SimpleNamespace(**values)
+
+    def test_deal_position_id_captured_with_order_identity(self):
+        fill = MT5BrokerAdapter._deal_to_fill(self._deal())
+        assert fill.broker_order_id == "123"
+        assert fill.fill_sequence == 456
+        assert fill.position_id == "900"
+
+    def test_missing_deal_position_id_stays_none(self):
+        deal = self._deal()
+        del deal.position_id
+        fill = MT5BrokerAdapter._deal_to_fill(deal)
+        assert fill.position_id is None
+
+    @pytest.mark.parametrize(
+        "value", [None, 0, -1, True, 1.5, "900", object()]
+    )
+    def test_invalid_deal_position_id_stays_none(self, value):
+        fill = MT5BrokerAdapter._deal_to_fill(
+            self._deal(position_id=value)
+        )
+        assert fill.position_id is None
+
+    def test_broker_fill_constructor_back_compat(self):
+        from brokers.models import BrokerFill
+        fill = BrokerFill(
+            "123", 0.1, 1.1, datetime.fromtimestamp(1_700_000_000, tz=UTC),
+            0.5, 456,
+        )
+        assert fill.position_id is None

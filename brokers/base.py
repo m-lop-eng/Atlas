@@ -53,19 +53,31 @@ class BrokerAdapter(ABC):
     def submit_order(self, order: Order) -> OrderSubmission:
         """Envía una orden y devuelve su disposición.
 
+        Contrato de fase (ORDER-07B): una implementación que ya invocó
+        `order_send`/el transporte de envío NUNCA debe propagar una excepción
+        como si no hubiera enviado. Un fallo posterior de interpretación debe
+        devolver `UNKNOWN` (o una excepción tipada que declare inequívocamente
+        `send_attempted=True`). Las excepciones pre-send demostradas pueden
+        propagarse con los tipos existentes.
+
         Returns:
             OrderSubmission: CONFIRMED / REJECTED con la vista broker; o
             UNKNOWN si la respuesta no pudo determinarse (resolver luego).
 
         Raises:
-            BrokerConnectionError: sin conexión con el broker.
-            OrderRejectedError: rechazo explícito del broker.
+            BrokerConnectionError: sin conexión con el broker (pre-send).
+            OrderRejectedError: rechazo explícito/validación pre-send.
         """
 
     @abstractmethod
     def cancel_order(self, client_order_id: str) -> BrokerOrder:
         """Cancela una orden pendiente. Raises OrderNotFoundError si no
         existe; OrderRejectedError si ya no se puede cancelar (p. ej. llena).
+
+        ORDER-07C: el retorno debe ser el estado OBSERVADO del broker. Un
+        retcode de aceptacion no demuestra cancelacion: no se infiere
+        `CANCELLED`; si el estado sigue activo/ambiguo, el coordinador debe
+        tratarlo como no confirmado.
         """
 
     @abstractmethod

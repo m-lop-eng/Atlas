@@ -28,6 +28,7 @@ from execution.intent_journal import (
     SCHEMA_VERSION,
     SCHEMA_VERSION_V1,
     SCHEMA_VERSION_V2,
+    SUBMIT_PROTOCOL_VERSION,
     IntentJournal,
     IntentJournalCorruptionError,
     IntentJournalDuplicateError,
@@ -800,3 +801,77 @@ class TestSchemaCompatibilityV3:
 
         with pytest.raises(IntentJournalSchemaError):
             _old_v2_loader(path)
+
+class TestOrder07BJournalProtocol:
+    def test_new_created_is_terminalized_without_lookup(self, tmp_path):
+        j = _journal(tmp_path)
+        j.begin(
+            OrderIntent.from_order(
+                _order("C-NEW"), protocol_version=SUBMIT_PROTOCOL_VERSION
+            )
+        )
+        broker = _SpyBroker({})
+        outcomes = recover_pending_intents(j, broker)
+        assert broker.asked == []
+        assert outcomes[0].result == "PRE_SEND_FAILED"
+        assert j.get("C-NEW").state == "FAILED"
+        assert j.get("C-NEW").terminal is True
+
+    def test_legacy_created_uses_lookup_not_inference(self, tmp_path):
+        j = _journal(tmp_path)
+        j.begin(OrderIntent.from_order(_order("C-LEGACY")))  # sin protocolo
+        broker = _SpyBroker({})
+        outcomes = recover_pending_intents(j, broker)
+        assert broker.asked == ["C-LEGACY"]
+        assert outcomes[0].result == "NOT_FOUND"
+        assert j.get("C-LEGACY").state == "CREATED"
+        assert j.get("C-LEGACY").terminal is False
+
+    def test_new_submitting_requires_lookup_and_adopts(self, tmp_path):
+        j = _journal(tmp_path)
+        j.begin(
+            OrderIntent.from_order(
+                _order("C-SUB"), protocol_version=SUBMIT_PROTOCOL_VERSION
+            )
+        )
+        j.mark_state("C-SUB", "SUBMITTING")
+        broker = _SpyBroker(
+            {"C-SUB": _broker_order("C-SUB", BrokerOrderState.FILLED)}
+        )
+        outcomes = recover_pending_intents(j, broker)
+        assert broker.asked == ["C-SUB"]
+        assert outcomes[0].result == "RESOLVED_FOUND"
+        assert j.get("C-SUB").state == "FILLED"
+
+    def test_new_submitting_not_found_stays_unresolved(self, tmp_path):
+        j = _journal(tmp_path)
+        j.begin(
+            OrderIntent.from_order(
+                _order("C-SUB-NF"), protocol_version=SUBMIT_PROTOCOL_VERSION
+            )
+        )
+        j.mark_state("C-SUB-NF", "SUBMITTING")
+        broker = _SpyBroker({})
+        outcomes = recover_pending_intents(j, broker)
+        assert broker.asked == ["C-SUB-NF"]
+        assert outcomes[0].result == "NOT_FOUND"
+        assert j.get("C-SUB-NF").state == "SUBMITTING"
+        assert j.get("C-SUB-NF").terminal is False
+
+    def test_protocol_roundtrip_and_legacy_absent(self, tmp_path):
+        new_intent = OrderIntent.from_order(
+            _order("C-PROTO"), protocol_version=SUBMIT_PROTOCOL_VERSION
+        )
+        legacy_intent = OrderIntent.from_order(_order("C-OLD"))
+        assert new_intent.to_dict()["protocol_version"] == SUBMIT_PROTOCOL_VERSION
+        assert "protocol_version" not in legacy_intent.to_dict()
+
+        j = _journal(tmp_path)
+        j.begin(new_intent)
+        j.begin(legacy_intent)
+        reloaded = IntentJournal(j.path)
+        assert (
+            reloaded.get("C-PROTO").protocol_version
+            == SUBMIT_PROTOCOL_VERSION
+        )
+        assert reloaded.get("C-OLD").protocol_version is None

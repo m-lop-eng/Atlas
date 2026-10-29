@@ -39,9 +39,10 @@ from execution.order import (
     PURPOSE_REDUCE,
     Order,
     OrderSide,
+    OrderStatus,
     OrderType,
 )
-from execution.order_manager import OrderManager
+from execution.order_manager import OrderManager, OrderStateError
 from risk.types import AccountRiskState
 
 from brokers.models import (
@@ -56,6 +57,7 @@ from brokers.mt5 import (
     MT5Credentials,
     MT5Environment,
     ORDER_STATE_CANCELED,
+    ORDER_STATE_EXPIRED,
     ORDER_STATE_FILLED,
     ORDER_STATE_PLACED,
     ORDER_TYPE_BUY,
@@ -190,6 +192,32 @@ class FakeMT5:
             return SimpleNamespace(retcode=10012, order=0, deal=0, volume=0.0, price=0.0)
         if self.send_mode == "reject":
             return SimpleNamespace(retcode=10006, order=0, deal=0, volume=0.0, price=0.0)
+        if self.send_mode == "placed":
+            ticket = self._next
+            self._next += 1
+            self._open_orders[ticket] = self._mk_order(
+                ticket, request, ORDER_STATE_PLACED,
+                request["volume"], request["volume"],
+            )
+            return SimpleNamespace(
+                retcode=10008, order=ticket, deal=0,
+                volume=0.0, price=request["price"],
+            )
+        if self.send_mode == "partial":
+            ticket = self._next; self._next += 1
+            deal_ticket = self._next; self._next += 1
+            half = request["volume"] / 2
+            self._orders[ticket] = self._mk_order(
+                ticket, request, 2, request["volume"], request["volume"] - half
+            )
+            self._deals[deal_ticket] = SimpleNamespace(
+                ticket=deal_ticket, order=ticket, volume=half,
+                price=request["price"], commission=0.0, time=1_700_000_000,
+            )
+            return SimpleNamespace(
+                retcode=10010, order=ticket, deal=deal_ticket,
+                volume=half, price=request["price"],
+            )
         ticket = self._next; self._next += 1
         deal_ticket = self._next; self._next += 1
         self._orders[ticket] = self._mk_order(
@@ -1523,3 +1551,321 @@ class TestCloseReduce:
         outcomes = recover_pending_intents(journal, adapter)
         assert outcomes[0].result == "NOT_FOUND"
         assert journal.get("R-NF").terminal is False
+
+class _PostSendMappingFailureFake(FakeMT5):
+    """Simula order_send aceptado y fallo posterior de mapeo."""
+
+    def order_send(self, request):
+        result = super().order_send(request)
+        for rows in (self._orders, self._open_orders):
+            for row in rows.values():
+                row.symbol = "UNMAPPED"
+        return result
+
+
+class TestOrder07BFailureLifecycle:
+    def test_projected_gate_failure_terminalizes_order(self, tmp_path):
+        journal = IntentJournal.initialize(tmp_path / "j.json")
+
+        def gate(order):
+            raise ExecutionBlockedError("projected_exposure", "max_gross")
+
+        coord, adapter, fake = _coord(journal=journal, projected=gate)
+        with pytest.raises(ExecutionBlockedError):
+            _submit(coord, "C-PROJ")
+        assert fake.send_count == 0
+        assert len(journal) == 0
+        orders = list(coord._order_manager.orders.values())
+        assert len(orders) == 1
+        assert orders[0].status is OrderStatus.REJECTED
+
+        # Una identidad nueva sigue el flujo normal (sin huerfana que bloquee).
+        coord2, _, fake2 = _coord(journal=journal)
+        out = _submit(coord2, "C-PROJ-NEXT")
+        assert out.allowed is True
+        assert fake2.send_count == 1
+
+    def test_failure_after_write_ahead_before_adapter_terminalizes(self, tmp_path, monkeypatch):
+        journal = IntentJournal.initialize(tmp_path / "j.json")
+        coord, adapter, fake = _coord(journal=journal)
+
+        original_mark_submitting = OrderManager.mark_submitting
+        first = [True]
+
+        def fail(self, order_id):
+            if not first[0]:
+                return original_mark_submitting(self, order_id)
+            first[0] = False
+            raise OrderStateError("forced pre-send failure")
+
+        monkeypatch.setattr(OrderManager, "mark_submitting", fail)
+        with pytest.raises(ExecutionBlockedError) as ei:
+            _submit(coord, "C-PRE")
+        assert ei.value.stage == "order_manager"
+        assert fake.send_count == 0
+        assert journal.get("C-PRE").state == "FAILED"
+        orders = list(coord._order_manager.orders.values())
+        assert len(orders) == 1 and orders[0].status is OrderStatus.FAILED
+
+        # El intent terminal no bloquea una identidad nueva.
+        out = _submit(coord, "C-PRE-NEXT")
+        assert out.allowed is True
+        assert fake.send_count == 1
+
+    def test_order_check_rejection_is_terminal_no_send(self, tmp_path):
+        journal = IntentJournal.initialize(tmp_path / "j.json")
+        fake = _fake()
+        fake.check_retcode = 10013
+        coord, adapter, fake = _coord(fake=fake, journal=journal)
+        out = _submit(coord, "C-CHECK")
+        assert out.submission.status is SubmitStatus.REJECTED
+        assert fake.send_count == 0
+        assert journal.get("C-CHECK").state == "REJECTED"
+        orders = list(coord._order_manager.orders.values())
+        assert orders[0].status is OrderStatus.REJECTED
+
+    def test_order_check_exception_is_failed_pre_send(self, tmp_path):
+        journal = IntentJournal.initialize(tmp_path / "j.json")
+        fake = _fake()
+
+        def boom(request):
+            raise RuntimeError("order_check transport")
+
+        fake.order_check = boom
+        coord, adapter, fake = _coord(fake=fake, journal=journal)
+        with pytest.raises(BrokerConnectionError):
+            _submit(coord, "C-CHECK-EXC")
+        assert fake.send_count == 0
+        assert journal.get("C-CHECK-EXC").state == "FAILED"
+        orders = list(coord._order_manager.orders.values())
+        assert orders[0].status is OrderStatus.FAILED
+
+    def test_post_send_mapping_failure_is_unknown_no_resend(self, tmp_path):
+        journal = IntentJournal.initialize(tmp_path / "j.json")
+        fake = _PostSendMappingFailureFake()
+        fake.add_symbol(INSTRUMENT)
+        fake.add_tick(INSTRUMENT, bid=1.0999, ask=1.1001)
+        coord, adapter, fake = _coord(fake=fake, journal=journal)
+        out = _submit(coord, "C-POST")
+        assert out.submission.status is SubmitStatus.UNKNOWN
+        assert fake.send_count == 1
+        assert journal.get("C-POST").state == "UNKNOWN"
+        orders = list(coord._order_manager.orders.values())
+        assert orders[0].status is OrderStatus.UNKNOWN
+
+        with pytest.raises(UnresolvedIntentsError):
+            _submit(coord, "C-POST-NEXT")
+        assert fake.send_count == 1
+
+    def test_order_send_exception_is_unknown_no_resend(self, tmp_path):
+        journal = IntentJournal.initialize(tmp_path / "j.json")
+        fake = _fake()
+        fake.send_mode = "raise"
+        coord, adapter, fake = _coord(fake=fake, journal=journal)
+        out = _submit(coord, "C-SEND-EXC")
+        assert out.submission.status is SubmitStatus.UNKNOWN
+        assert fake.send_count == 1
+        assert journal.get("C-SEND-EXC").state == "UNKNOWN"
+        orders = list(coord._order_manager.orders.values())
+        assert orders[0].status is OrderStatus.UNKNOWN
+        with pytest.raises(UnresolvedIntentsError):
+            _submit(coord, "C-SEND-EXC-NEXT")
+        assert fake.send_count == 1
+
+    def test_journal_submits_boundary_before_adapter(self, tmp_path, monkeypatch):
+        journal = IntentJournal.initialize(tmp_path / "j.json")
+        coord, adapter, fake = _coord(journal=journal)
+        events: list[tuple[str, object]] = []
+        original_mark = journal.mark_state
+        original_send = fake.order_send
+
+        def mark_state(cid, state, **kwargs):
+            events.append(("journal", state))
+            return original_mark(cid, state, **kwargs)
+
+        def order_send(request):
+            events.append(("send", None))
+            return original_send(request)
+
+        monkeypatch.setattr(journal, "mark_state", mark_state)
+        fake.order_send = order_send
+        out = _submit(coord, "C-BOUNDARY")
+        assert out.allowed is True
+        assert ("journal", "SUBMITTING") in events
+        assert events.index(("journal", "SUBMITTING")) < events.index(("send", None))
+
+    def test_placed_is_submitted_not_filled(self, tmp_path):
+        journal = IntentJournal.initialize(tmp_path / "j.json")
+        fake = _fake()
+        fake.send_mode = "placed"
+        coord, adapter, fake = _coord(fake=fake, journal=journal)
+        out = _submit(coord, "C-PLACED")
+        assert out.submission.status is SubmitStatus.CONFIRMED
+        assert journal.get("C-PLACED").state == "SUBMITTED"
+        orders = list(coord._order_manager.orders.values())
+        assert orders[0].status is OrderStatus.SUBMITTED
+        assert orders[0].fill_quantity == 0
+
+    def test_done_partial_is_partially_filled(self, tmp_path):
+        journal = IntentJournal.initialize(tmp_path / "j.json")
+        fake = _fake()
+        fake.send_mode = "partial"
+        coord, adapter, fake = _coord(fake=fake, journal=journal)
+        out = _submit(coord, "C-PART", quantity=1.0)
+        assert out.submission.status is SubmitStatus.CONFIRMED
+        assert journal.get("C-PART").state == "PARTIALLY_FILLED"
+        orders = list(coord._order_manager.orders.values())
+        assert orders[0].status is OrderStatus.PARTIALLY_FILLED
+        assert orders[0].fill_quantity > 0
+
+    def test_done_is_filled_and_sync_is_idempotent(self, tmp_path):
+        journal = IntentJournal.initialize(tmp_path / "j.json")
+        coord, adapter, fake = _coord(journal=journal)
+        out = _submit(coord, "C-FILL", quantity=0.1)
+        assert out.submission.status is SubmitStatus.CONFIRMED
+        assert journal.get("C-FILL").state == "FILLED"
+        orders = list(coord._order_manager.orders.values())
+        assert orders[0].status is OrderStatus.FILLED
+        assert orders[0].fill_quantity == pytest.approx(0.1)
+        before = orders[0]
+        coord._sync_order_from_broker(before, out.submission.broker_order)
+        after = list(coord._order_manager.orders.values())[0]
+        assert after == before
+
+    def test_same_cid_after_terminal_does_not_send(self, tmp_path):
+        journal = IntentJournal.initialize(tmp_path / "j.json")
+        coord, adapter, fake = _coord(journal=journal)
+        first = _submit(coord, "C-DUP", quantity=0.1)
+        assert first.allowed is True
+        sends = fake.send_count
+        with pytest.raises(ExecutionBlockedError):
+            _submit(coord, "C-DUP", quantity=0.1)
+        assert fake.send_count == sends
+        assert len(journal) == 1
+        assert journal.get("C-DUP").state == "FILLED"
+
+class _CancelAckActiveFake(FakeMT5):
+    def _send_remove(self, request):
+        self.cancel_count += 1
+        ticket = int(request["order"])
+        return SimpleNamespace(
+            retcode=10009, order=ticket, deal=0, volume=0.0, price=0.0
+        )
+
+
+class _CancelAckFilledFake(FakeMT5):
+    def _send_remove(self, request):
+        self.cancel_count += 1
+        ticket = int(request["order"])
+        order = self._open_orders.pop(ticket, None)
+        if order is not None:
+            order.state = ORDER_STATE_FILLED
+            order.volume_current = 0.0
+            self._orders[ticket] = order
+            self.add_deal(
+                ticket + 10_000, ticket,
+                volume=order.volume_initial, price=order.price_open,
+            )
+        return SimpleNamespace(
+            retcode=10009, order=ticket, deal=0, volume=0.0, price=0.0
+        )
+
+
+class _CancelAckExpiredFake(FakeMT5):
+    def _send_remove(self, request):
+        self.cancel_count += 1
+        ticket = int(request["order"])
+        order = self._open_orders.pop(ticket, None)
+        if order is not None:
+            order.state = ORDER_STATE_EXPIRED
+            order.volume_current = 0.0
+            self._orders[ticket] = order
+        return SimpleNamespace(
+            retcode=10009, order=ticket, deal=0, volume=0.0, price=0.0
+        )
+
+
+class _CancelAckUnobservableFake(FakeMT5):
+    def _send_remove(self, request):
+        self.cancel_count += 1
+        ticket = int(request["order"])
+        self._open_orders.pop(ticket, None)
+        self._orders.pop(ticket, None)
+        return SimpleNamespace(
+            retcode=10009, order=ticket, deal=0, volume=0.0, price=0.0
+        )
+
+
+class TestOrder07CCancelConfirmation:
+    def _env(self, tmp_path, fake):
+        fake.add_symbol(INSTRUMENT)
+        fake.add_tick(INSTRUMENT, bid=1.0999, ask=1.1001)
+        journal = IntentJournal.initialize(tmp_path / "j.json")
+        coord, adapter, fake = _coord(fake=fake, journal=journal)
+        _seed_open_intent(journal, "C-ACT")
+        _plant_pending(adapter, fake, "C-ACT", 900)
+        return coord, adapter, fake, journal
+
+    def test_ack_but_active_is_not_cancelled(self, tmp_path):
+        coord, adapter, fake, journal = self._env(
+            tmp_path, _CancelAckActiveFake()
+        )
+        with pytest.raises(ExecutionBlockedError) as ei:
+            _cancel(coord, "C-ACT")
+        assert ei.value.stage == "cancel_target_active"
+        assert journal.get("CANCEL:C-ACT").state == "UNKNOWN"
+        assert journal.get("C-ACT").state == "SUBMITTED"
+        assert fake._open_orders[900].state == ORDER_STATE_PLACED
+        assert fake.cancel_count == 1
+
+        sends = fake.send_count
+        with pytest.raises(UnresolvedIntentsError):
+            _submit(coord, "C-AFTER-CANCEL")
+        assert fake.send_count == sends
+        assert fake.cancel_count == 1
+
+        outcomes = recover_pending_cancels(journal, adapter)
+        assert any(o.result == "TARGET_ACTIVE" for o in outcomes)
+        assert journal.get("CANCEL:C-ACT").terminal is False
+        assert fake.cancel_count == 1
+
+    def test_ack_but_filled_preserves_filled_state(self, tmp_path):
+        coord, adapter, fake, journal = self._env(
+            tmp_path, _CancelAckFilledFake()
+        )
+        with pytest.raises(ExecutionBlockedError) as ei:
+            _cancel(coord, "C-ACT")
+        assert ei.value.stage == "cancel_target_filled"
+        assert journal.get("CANCEL:C-ACT").state == "REJECTED"
+        assert journal.get("C-ACT").state == "FILLED"
+        assert fake._orders[900].state == ORDER_STATE_FILLED
+        assert len(adapter.get_order("C-ACT").fills) == 1
+
+    def test_ack_but_expired_preserves_terminal_state(self, tmp_path):
+        coord, adapter, fake, journal = self._env(
+            tmp_path, _CancelAckExpiredFake()
+        )
+        with pytest.raises(ExecutionBlockedError) as ei:
+            _cancel(coord, "C-ACT")
+        assert ei.value.stage == "cancel_target_terminal"
+        assert journal.get("CANCEL:C-ACT").state == "REJECTED"
+        assert journal.get("C-ACT").state == "EXPIRED"
+        assert fake._orders[900].state == ORDER_STATE_EXPIRED
+
+    def test_ack_unobservable_is_unknown_and_blocks(self, tmp_path):
+        coord, adapter, fake, journal = self._env(
+            tmp_path, _CancelAckUnobservableFake()
+        )
+        with pytest.raises(ExecutionBlockedError) as ei:
+            _cancel(coord, "C-ACT")
+        assert ei.value.stage == "cancel_unknown"
+        assert journal.get("CANCEL:C-ACT").state == "UNKNOWN"
+        assert journal.get("CANCEL:C-ACT").terminal is False
+        assert journal.get("C-ACT").state != "CANCELLED"
+        assert journal.get("C-ACT").terminal is False
+        assert fake.cancel_count == 1
+
+        sends = fake.send_count
+        with pytest.raises(UnresolvedIntentsError):
+            _submit(coord, "C-AFTER-CANCEL")
+        assert fake.send_count == sends

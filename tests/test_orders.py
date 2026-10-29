@@ -391,3 +391,101 @@ class TestUnknownTransient:
             m2.apply_fill(
                 o2.order_id, Fill(order_id=o2.order_id, quantity=1, price=100.0)
             )
+class TestOrder07BSendBoundaryState:
+    def test_presend_states_can_fail_terminal(self):
+        m = OrderManager()
+        created = m.create_order(**_make(client_order_id="BOUND-1", quantity=2))
+        failed = m.mark_failed(created.order_id, "journal failure")
+        assert failed.status is OrderStatus.FAILED
+        assert failed.reject_reason == "journal failure"
+
+        approved = m.create_order(**_make(client_order_id="BOUND-2", quantity=2))
+        m.approve(approved.order_id)
+        submitting = m.mark_submitting(approved.order_id)
+        assert submitting.status is OrderStatus.SUBMITTING
+        failed = m.mark_failed(submitting.order_id, "gate failure")
+        assert failed.status is OrderStatus.FAILED
+
+    def test_sync_placed_does_not_imply_fill(self):
+        m = OrderManager()
+        o = m.create_order(**_make(client_order_id="SYNC-PLACED", quantity=2))
+        m.approve(o.order_id)
+        m.mark_submitting(o.order_id)
+        synced = m.sync_broker_state(
+            o.order_id,
+            state=OrderStatus.SUBMITTED,
+            filled_quantity=0,
+        )
+        assert synced.status is OrderStatus.SUBMITTED
+        assert synced.fill_quantity == 0
+
+    def test_sync_partial_then_filled_is_idempotent(self):
+        m = OrderManager()
+        o = m.create_order(**_make(client_order_id="SYNC-FILL", quantity=2))
+        m.approve(o.order_id)
+        m.mark_submitting(o.order_id)
+        partial = m.sync_broker_state(
+            o.order_id,
+            state=OrderStatus.PARTIALLY_FILLED,
+            filled_quantity=1,
+            average_fill_price=100.0,
+            commission=0.5,
+        )
+        assert partial.status is OrderStatus.PARTIALLY_FILLED
+        assert partial.fill_quantity == 1
+        assert partial.average_fill_price == 100.0
+        assert partial.commission == 0.5
+
+        repeated = m.sync_broker_state(
+            o.order_id,
+            state=OrderStatus.PARTIALLY_FILLED,
+            filled_quantity=1,
+            average_fill_price=100.0,
+            commission=0.5,
+        )
+        assert repeated == partial
+
+        filled = m.sync_broker_state(
+            o.order_id,
+            state=OrderStatus.FILLED,
+            filled_quantity=2,
+            average_fill_price=101.0,
+            commission=0.75,
+        )
+        assert filled.status is OrderStatus.FILLED
+        assert filled.fill_quantity == 2
+        assert filled.average_fill_price == 101.0
+        assert filled.commission == 0.75
+
+        repeated_filled = m.sync_broker_state(
+            o.order_id,
+            state=OrderStatus.FILLED,
+            filled_quantity=2,
+            average_fill_price=101.0,
+            commission=0.75,
+        )
+        assert repeated_filled == filled
+
+    def test_sync_rejects_overfill_and_fill_regression(self):
+        m = OrderManager()
+        o = m.create_order(**_make(client_order_id="SYNC-BAD", quantity=2))
+        m.approve(o.order_id)
+        m.mark_submitting(o.order_id)
+        with pytest.raises(OrderStateError):
+            m.sync_broker_state(
+                o.order_id,
+                state=OrderStatus.FILLED,
+                filled_quantity=3,
+            )
+        m.sync_broker_state(
+            o.order_id,
+            state=OrderStatus.PARTIALLY_FILLED,
+            filled_quantity=1,
+        )
+        # No retrocede la cantidad acumulada.
+        same = m.sync_broker_state(
+            o.order_id,
+            state=OrderStatus.PARTIALLY_FILLED,
+            filled_quantity=0.5,
+        )
+        assert same.fill_quantity == 1

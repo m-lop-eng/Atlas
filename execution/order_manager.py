@@ -10,6 +10,7 @@ Responsabilidades (06_EXECUTION_OPERATION.md §4.3):
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field, replace
 
 from .order import Fill, Order, OrderStatus
@@ -29,17 +30,20 @@ ALLOWED_TRANSITIONS: dict[OrderStatus, frozenset[OrderStatus]] = {
         OrderStatus.APPROVED,
         OrderStatus.REJECTED,
         OrderStatus.CANCELLED,
+        OrderStatus.FAILED,
     }),
     OrderStatus.RISK_CHECKED: frozenset({
         OrderStatus.APPROVED,
         OrderStatus.REJECTED,
         OrderStatus.CANCELLED,
+        OrderStatus.FAILED,
     }),
     OrderStatus.APPROVED: frozenset({
         OrderStatus.SUBMITTING,
         OrderStatus.SUBMITTED,
         OrderStatus.REJECTED,
         OrderStatus.CANCELLED,
+        OrderStatus.FAILED,
     }),
     OrderStatus.SUBMITTING: frozenset({
         OrderStatus.SUBMITTED,
@@ -172,6 +176,98 @@ class OrderManager:
 
     def submit(self, order_id: str) -> Order:
         return self._transition(order_id, OrderStatus.SUBMITTED)
+
+    def mark_submitting(self, order_id: str) -> Order:
+        """Registra que el envio va a intentarse (frontera ORDER-07B)."""
+        return self._transition(order_id, OrderStatus.SUBMITTING)
+
+    def mark_failed(self, order_id: str, reason: str = "") -> Order:
+        """Fallo operativo terminal demostrado sin envio."""
+        order = self._transition(order_id, OrderStatus.FAILED)
+        if reason:
+            updated = replace(order, reject_reason=reason)
+            self.orders[order_id] = updated
+            return updated
+        return order
+
+    def sync_broker_state(
+        self,
+        order_id: str,
+        *,
+        state: OrderStatus,
+        filled_quantity: int | float | None = None,
+        average_fill_price: float | None = None,
+        commission: float | None = None,
+    ) -> Order:
+        """Sincroniza el estado agregado observado en el broker (idempotente).
+
+        No crea fills ni infiere ejecucion: `state`/`filled_quantity`/precio son
+        evidencia ya observada. No permite retroceder desde un estado terminal ni
+        reducir la cantidad acumulada.
+        """
+        order = self.orders.get(order_id)
+        if order is None:
+            raise KeyError(f"Orden desconocida: {order_id}")
+        if not isinstance(state, OrderStatus):
+            raise OrderStateError("state debe ser OrderStatus")
+        if order.status.terminal:
+            return order
+
+        qty = order.fill_quantity
+        if filled_quantity is not None:
+            try:
+                candidate = float(filled_quantity)
+            except (TypeError, ValueError) as exc:
+                raise OrderStateError(
+                    f"filled_quantity invalida: {filled_quantity!r}"
+                ) from exc
+            if not math.isfinite(candidate) or candidate < 0.0:
+                raise OrderStateError(
+                    f"filled_quantity invalida: {filled_quantity!r}"
+                )
+            if candidate > float(order.quantity) + 1e-9:
+                raise OrderStateError(
+                    f"filled_quantity {candidate} excede quantity {order.quantity}"
+                )
+            if candidate + 1e-9 < float(order.fill_quantity):
+                return order  # no regresion de fills
+            qty = candidate
+
+        avg = order.average_fill_price
+        if average_fill_price is not None:
+            try:
+                candidate_avg = float(average_fill_price)
+            except (TypeError, ValueError) as exc:
+                raise OrderStateError(
+                    f"average_fill_price invalido: {average_fill_price!r}"
+                ) from exc
+            if not math.isfinite(candidate_avg):
+                raise OrderStateError(
+                    f"average_fill_price invalido: {average_fill_price!r}"
+                )
+            avg = candidate_avg
+
+        comm = order.commission
+        if commission is not None:
+            try:
+                candidate_comm = float(commission)
+            except (TypeError, ValueError) as exc:
+                raise OrderStateError(
+                    f"commission invalida: {commission!r}"
+                ) from exc
+            if not math.isfinite(candidate_comm):
+                raise OrderStateError(f"commission invalida: {commission!r}")
+            comm = candidate_comm
+
+        updated = replace(
+            order,
+            status=state,
+            fill_quantity=qty,
+            average_fill_price=avg,
+            commission=comm,
+        )
+        self.orders[order_id] = updated
+        return updated
 
     def acknowledge(self, order_id: str) -> Order:
         return self._transition(order_id, OrderStatus.ACKNOWLEDGED)

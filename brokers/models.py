@@ -119,6 +119,9 @@ class BrokerFill:
     timestamp: datetime
     commission: float = 0.0
     fill_sequence: int = 0
+    # ORDER-07G: POSITION_IDENTIFIER transportado por el deal que origino el
+    # fill. `None` = el origen no aporta evidencia valida; no se infiere.
+    position_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

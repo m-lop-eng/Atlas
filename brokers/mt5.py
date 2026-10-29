@@ -1587,36 +1587,50 @@ class MT5BrokerAdapter(BrokerAdapter):
                 broker_order=None,
                 detail="order_send sin respuesta",
             )
-        retcode = int(getattr(result, "retcode", -1))
-        if retcode in _DONE_RETCODES:
-            # Semantica distinta por codigo, derivada del estado real via lookup:
-            #   DONE -> FILLED; DONE_PARTIAL -> PARTIALLY_FILLED; PLACED -> SUBMITTED
-            # (PLACED NO afirma fill).
-            ticket = self._ticket_from_result(result)
-            if ticket is not None:
-                self._remember(cid, ticket)
-                broker_order = self._build_broker_order(cid, ticket)
-            else:
-                broker_order = self._provisional_broker_order(cid, order, result)
+        try:
+            retcode = int(getattr(result, "retcode", -1))
+            if retcode in _DONE_RETCODES:
+                # Semantica distinta por codigo, derivada del estado real via lookup:
+                #   DONE -> FILLED; DONE_PARTIAL -> PARTIALLY_FILLED; PLACED -> SUBMITTED
+                # (PLACED NO afirma fill).
+                ticket = self._ticket_from_result(result)
+                if ticket is not None:
+                    self._remember(cid, ticket)
+                    broker_order = self._build_broker_order(cid, ticket)
+                else:
+                    broker_order = self._provisional_broker_order(cid, order, result)
+                return OrderSubmission(
+                    client_order_id=cid,
+                    status=SubmitStatus.CONFIRMED,
+                    broker_order=broker_order,
+                    detail=f"retcode={retcode}",
+                )
+            if retcode in _AMBIGUOUS_RETCODES:
+                return OrderSubmission(
+                    client_order_id=cid,
+                    status=SubmitStatus.UNKNOWN,
+                    broker_order=None,
+                    detail=f"retcode incierto={retcode}",
+                )
             return OrderSubmission(
                 client_order_id=cid,
-                status=SubmitStatus.CONFIRMED,
-                broker_order=broker_order,
-                detail=f"retcode={retcode}",
+                status=SubmitStatus.REJECTED,
+                broker_order=None,
+                detail=self._reject_detail(retcode),
             )
-        if retcode in _AMBIGUOUS_RETCODES:
+        except Exception as exc:  # noqa: BLE001 - order_send ya se invoco
+            # ORDER-07B: un fallo de interpretacion POST-SEND es ambiguo, nunca
+            # "no enviado". No se propaga como REJECTED ni como excepcion que el
+            # coordinador pudiera clasificar como pre-send.
             return OrderSubmission(
                 client_order_id=cid,
                 status=SubmitStatus.UNKNOWN,
                 broker_order=None,
-                detail=f"retcode incierto={retcode}",
+                detail=(
+                    "order_send: resultado no interpretable "
+                    f"({type(exc).__name__})"
+                ),
             )
-        return OrderSubmission(
-            client_order_id=cid,
-            status=SubmitStatus.REJECTED,
-            broker_order=None,
-            detail=self._reject_detail(retcode),
-        )
 
     def _ticket_from_result(self, result: Any) -> int | None:
         for field_name in ("order", "deal"):
@@ -2000,6 +2014,10 @@ class MT5BrokerAdapter(BrokerAdapter):
         posee SOLO el `LiveExecutionCoordinator`; un caller con el adapter no
         puede cancelar sin su autorizacion. NO cierra/reduce posiciones (fuera de
         alcance 02A).
+
+        ORDER-07C: un retcode de aceptacion no demuestra cancelacion. Se devuelve
+        el estado OBSERVADO (`SUBMITTED`/`PARTIALLY_FILLED`/`CANCELLED`/`FILLED`/
+        `EXPIRED`/`REJECTED`/`UNKNOWN`); nunca se sustituye por `CANCELLED`.
         """
         self._require_demo()
         self._require_ready()
@@ -2037,21 +2055,28 @@ class MT5BrokerAdapter(BrokerAdapter):
             ) from exc
         if result is None:
             raise BrokerConnectionError("cancel: sin respuesta (incierto)")
-        retcode = int(getattr(result, "retcode", -1))
+        try:
+            retcode = int(getattr(result, "retcode", -1))
+        except Exception as exc:  # noqa: BLE001 - order_send ya se invoco
+            raise BrokerConnectionError(
+                "cancel: resultado no interpretable tras envio"
+            ) from exc
         if retcode in _AMBIGUOUS_RETCODES:
             raise BrokerConnectionError(
                 f"cancel: resultado incierto (retcode={retcode})"
             )
         if retcode not in _DONE_RETCODES:
             raise OrderRejectedError(f"cancel rechazado (retcode={retcode})")
-        order = self._build_broker_order(client_order_id, ticket)
+        try:
+            order = self._build_broker_order(client_order_id, ticket)
+        except Exception as exc:  # noqa: BLE001 - post-send no interpretable
+            raise BrokerConnectionError(
+                "cancel: estado no interpretable tras envio"
+            ) from exc
         if order is None:
             raise BrokerConnectionError("cancel: estado no determinable")
-        if order.state not in (
-            BrokerOrderState.CANCELLED,
-            BrokerOrderState.FILLED,
-        ):
-            order = replace(order, state=BrokerOrderState.CANCELLED)
+        # ORDER-07C: un retcode de aceptacion NO demuestra cancelacion. Se
+        # devuelve SIEMPRE el estado observado; jamas se infiere CANCELLED.
         return order
 
     # ------------------------------------------------------- construccion vista
@@ -2224,9 +2249,21 @@ class MT5BrokerAdapter(BrokerAdapter):
         )
 
     @staticmethod
+    def _deal_position_id(deal: Any) -> str | None:
+        """POSITION_IDENTIFIER crudo del deal, solo si es un entero positivo."""
+        try:
+            raw = getattr(deal, "position_id", None)
+        except Exception:  # noqa: BLE001 - evidencia ausente, no se inventa
+            return None
+        if isinstance(raw, bool) or not isinstance(raw, int) or raw <= 0:
+            return None
+        return str(raw)
+
+    @staticmethod
     def _deal_to_fill(deal: Any) -> BrokerFill:
         # fill_sequence = ticket del deal (identidad ESTABLE y unica; no se
         # reenumera en cada poll). commission = importe monetario del deal.
+        # position_id = POSITION_IDENTIFIER del deal si existe y es valido.
         return BrokerFill(
             broker_order_id=str(getattr(deal, "order", "")),
             quantity=_finite(getattr(deal, "volume")),
@@ -2236,6 +2273,7 @@ class MT5BrokerAdapter(BrokerAdapter):
             ),
             commission=_finite(getattr(deal, "commission", 0.0)),
             fill_sequence=int(getattr(deal, "ticket", 0)),
+            position_id=MT5BrokerAdapter._deal_position_id(deal),
         )
 
     @staticmethod

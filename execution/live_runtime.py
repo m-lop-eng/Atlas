@@ -27,10 +27,11 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Callable
 
-from execution.intent_journal import OPERATION_CANCEL, IntentJournal
+from execution.intent_journal import OPERATION_CANCEL, OPERATION_OPEN, IntentJournal
 from execution.ledger_applier import LedgerApplier, CommissionPolicy
 from execution.ledger_store import LedgerStore
 from execution.live_execution import (
+    ExecutionBlockedError,
     ExecutionOutcome,
     LiveExecutionCoordinator,
     LiveExecutionError,
@@ -460,10 +461,135 @@ class LiveExecutionRuntime:
             if not self.journal.find_by_position_id(pid):
                 return f"posicion externa/sin propietario ({p.instrument})"
         for intent in self.journal.all():
+            # ORDER-07F: una apertura FILLED sin position_id es evidencia
+            # persistida de propiedad no resuelta, aunque no haya posiciones
+            # visibles (retraso/discrepancia del broker). Fail-closed.
+            if (
+                intent.operation == OPERATION_OPEN
+                and intent.state == "FILLED"
+                and intent.position_id is None
+            ):
+                return (
+                    "intent OPEN/FILLED sin position_id: ownership HEDGING "
+                    "no demostrado"
+                )
             if intent.position_id is not None and intent.position_id not in broker_ids:
                 if not intent.terminal:
                     return "posicion vinculada ausente en broker (intent no terminal)"
         return None
+
+    def _authoritative_position_id_for_open(
+        self, client_order_id: str
+    ) -> tuple[bool, str | None, str]:
+        """Identidad de posicion derivada de fills autoritativos de la orden.
+
+        Exige historial COMPLETE, fills de la MISMA orden y una POSITION_IDENTIFIER
+        valida y coherente en todos ellos. La posicion debe existir ademas en el
+        snapshot actual con esa identidad. Nunca usa unicidad por instrumento.
+        """
+        lookup = getattr(self.broker, "lookup_order_history", None)
+        if not callable(lookup):
+            return False, None, "lookup_order_history no disponible"
+        try:
+            result = lookup(client_order_id)
+        except Exception as exc:  # noqa: BLE001 - historial incierto
+            return False, None, f"lookup de historial fallo ({type(exc).__name__})"
+        if not bool(getattr(result, "complete", False)):
+            return False, None, "historial de la orden incompleto"
+        order = getattr(result, "order", None)
+        if order is None:
+            return False, None, "historial sin orden autoritativa"
+        order_id = getattr(order, "broker_order_id", None)
+        if order_id is None or not str(order_id).strip():
+            return False, None, "orden sin broker_order_id"
+        intent = self.journal.get(client_order_id)
+        if (
+            intent is not None
+            and intent.broker_order_id is not None
+            and str(intent.broker_order_id) != str(order_id)
+        ):
+            return False, None, "broker_order_id del intent no coincide"
+        fills = tuple(getattr(order, "fills", ()) or ())
+        if not fills:
+            return False, None, "orden sin fills autoritativos"
+        position_ids: set[str] = set()
+        for fill in fills:
+            fill_order = getattr(fill, "broker_order_id", None)
+            if fill_order is None or str(fill_order) != str(order_id):
+                return False, None, "fill no pertenece a la orden objetivo"
+            pid = getattr(fill, "position_id", None)
+            if not isinstance(pid, str) or not pid.strip():
+                return False, None, "fill sin position_id autoritativo"
+            position_ids.add(pid.strip())
+        if len(position_ids) != 1:
+            return False, None, "fills con identidades de posicion incompatibles"
+        position_id = next(iter(position_ids))
+        try:
+            positions = list(self.broker.get_positions())
+        except Exception as exc:  # noqa: BLE001 - snapshot incierto
+            return False, None, f"posiciones no determinables ({type(exc).__name__})"
+        matching = [
+            p
+            for p in positions
+            if p.instrument == self.instrument
+            and getattr(p, "position_id", None) is not None
+            and str(p.position_id) == position_id
+        ]
+        if len(matching) != 1:
+            return False, position_id, "posicion autoritativa no visible o ambigua"
+        return True, position_id, ""
+
+    def _link_position_for_open_intent(
+        self, client_order_id: str, *, strict: bool
+    ) -> bool:
+        """Vincula una intencion OPEN HEDGING con evidencia autoritativa.
+
+        La identidad procede de los deals/fills de la orden objetivo; no de la
+        unicidad de una posicion por instrumento. En modo estricto, la falta de
+        evidencia o un fallo de persistencia levantan `RuntimeNotReadyError`.
+        """
+        if not self.allow_restricted_hedging:
+            return True
+        intent = self.journal.get(client_order_id)
+        if intent is None:
+            if strict:
+                raise RuntimeNotReadyError(
+                    f"intent desconocido para vincular posicion: {client_order_id!r}"
+                )
+            self._ownership_unverified = True
+            return False
+        if intent.operation != OPERATION_OPEN:
+            return True
+        evidence_ok, position_id, reason = (
+            self._authoritative_position_id_for_open(client_order_id)
+        )
+        if intent.position_id is not None:
+            if position_id is not None and position_id != intent.position_id:
+                self._ownership_unverified = True
+                if strict:
+                    raise RuntimeNotReadyError(
+                        "evidencia de posicion contradice el position_id persistido"
+                    )
+                return False
+            return True
+        if not evidence_ok:
+            self._ownership_unverified = True
+            if strict:
+                raise RuntimeNotReadyError(
+                    "ownership HEDGING no demostrado: " + reason
+                )
+            return False
+        assert position_id is not None
+        try:
+            self.journal.link_position(client_order_id, position_id)
+        except Exception as exc:  # noqa: BLE001 - persistencia/conflicto ownership
+            self._ownership_unverified = True
+            if strict:
+                raise RuntimeNotReadyError(
+                    f"no se pudo persistir ownership de {client_order_id!r}"
+                ) from exc
+            return False
+        return True
 
     def _link_open_position(self, out: ExecutionOutcome) -> None:
         """Vincula durablemente la posicion creada por una APERTURA (HEDGING)."""
@@ -478,22 +604,7 @@ class LiveExecutionRuntime:
         cid = getattr(order, "client_order_id", None)
         if not cid:
             return
-        current = self.journal.get(cid)
-        if current is not None and current.position_id is not None:
-            return  # ya vinculada (idempotente)
-        try:
-            matching = [
-                p for p in self.broker.get_positions()
-                if p.instrument == self.instrument
-            ]
-        except Exception:  # noqa: BLE001
-            self._ownership_unverified = True
-            return
-        if len(matching) != 1 or matching[0].position_id is None:
-            # No se puede probar la propiedad de forma inequivoca: fail-closed.
-            self._ownership_unverified = True
-            return
-        self.journal.link_position(cid, matching[0].position_id)
+        self._link_position_for_open_intent(str(cid), strict=False)
 
     def _apply_known_fills(self) -> None:
         """Aplica (idempotente) los fills que el broker reporta para cada orden
@@ -611,6 +722,39 @@ class LiveExecutionRuntime:
             self._post_operation_failed = False
         return out
 
+    def _reconcile_after_cancel_filled(self, client_order_id: str) -> None:
+        """Reconcilia un FILLED observado durante cancelacion (ORDER-07D/07E).
+
+        La cancelacion no es exito, pero el fill SI ocurrio: aplicarlo,
+        reconciliar y (en HEDGING) persistir la propiedad de la posicion es
+        obligatorio antes de devolver el control. Cualquier fallo deja el runtime
+        fail-closed; no se convierte en cancelacion satisfactoria.
+        """
+        try:
+            self._apply_known_fills()
+            if self._history_incomplete:
+                raise RuntimeNotReadyError(
+                    "historial incompleto tras cancel_target_filled: "
+                    "fills no demostrables"
+                )
+            self.ledger_store.persist(self.ledger)
+            self.reconcile_now()
+            if self.allow_restricted_hedging:
+                self._link_position_for_open_intent(
+                    client_order_id, strict=True
+                )
+                reason = self._ownership_ready()
+                if reason is not None:
+                    self._ownership_unverified = True
+                    raise RuntimeNotReadyError(reason)
+            if self.mt5_accounting is not None:
+                refresh = getattr(self.mt5_accounting, "refresh", None)
+                if callable(refresh):
+                    refresh(self.broker)
+        except Exception:
+            self._post_operation_failed = True
+            raise
+
     def submit(self, **kwargs) -> ExecutionOutcome:
         # H-2: seccion critica completa (readiness -> coordinador -> post-operacion).
         with self._lock:
@@ -624,9 +768,21 @@ class LiveExecutionRuntime:
             # Preserva/contabiliza los fills YA ejecutados del objetivo
             # (idempotente) antes de cancelar el remanente.
             self._apply_known_fills()
-            out = self._coordinator.cancel_pending(
-                client_order_id=client_order_id, operation_id=operation_id
-            )
+            try:
+                out = self._coordinator.cancel_pending(
+                    client_order_id=client_order_id, operation_id=operation_id
+                )
+            except ExecutionBlockedError as exc:
+                # ORDER-07D: la orden se ejecuto durante la cancelacion. NO es
+                # exito de cancelacion, pero el fill debe aplicarse/reconciliarse
+                # antes de devolver el control. Cualquier fallo deja fail-closed.
+                if exc.stage == "cancel_target_filled":
+                    try:
+                        self._reconcile_after_cancel_filled(client_order_id)
+                    except Exception as recon_exc:
+                        self._post_operation_failed = True
+                        raise exc from recon_exc
+                raise
             return self._post_operation(out)
 
     def close_position(self, *, operation_id: str | None = None, target_position_id: str | None = None) -> ExecutionOutcome:
