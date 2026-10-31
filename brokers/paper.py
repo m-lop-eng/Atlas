@@ -19,6 +19,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from itertools import count
+from typing import Any
 
 from execution.order import Order, OrderSide, OrderType
 
@@ -31,6 +32,7 @@ from brokers.models import (
     BrokerOrder,
     BrokerOrderState,
     BrokerConnectionError,
+    BrokerPermissionError,
     OrderNotFoundError,
     OrderRejectedError,
     OrderSubmission,
@@ -90,7 +92,15 @@ class PaperBrokerAdapter(BrokerAdapter):
 
     # -------------------------------------------------------------- orders
 
-    def submit_order(self, order: Order) -> OrderSubmission:
+    def submit_order(
+        self, order: Order, *, authorization: Any = None
+    ) -> OrderSubmission:
+        # ORDER-09D: Paper no implementa verificacion criptografica. Rechaza
+        # explicitamente una autorizacion no nula en vez de ignorarla.
+        if authorization is not None:
+            raise BrokerPermissionError(
+                "PaperBrokerAdapter no acepta autorizaciones de ejecucion"
+            )
         if not self._connected:
             raise BrokerConnectionError(
                 f"Broker {self.account_id}: no conectado (submit_order)"
@@ -172,7 +182,19 @@ class PaperBrokerAdapter(BrokerAdapter):
             broker_order=broker_order,
         )
 
-    def cancel_order(self, client_order_id: str) -> BrokerOrder:
+    def cancel_order(
+        self,
+        client_order_id: str,
+        *,
+        operation_id: str | None = None,
+        instrument: str | None = None,
+        account_id: str | None = None,
+        authorization: Any = None,
+    ) -> BrokerOrder:
+        if authorization is not None:
+            raise BrokerPermissionError(
+                "PaperBrokerAdapter no acepta autorizaciones de ejecucion"
+            )
         if not self._connected:
             raise BrokerConnectionError(
                 f"Broker {self.account_id}: no conectado (cancel_order)"

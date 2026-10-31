@@ -7,6 +7,7 @@ Comprueban tanto los resultados como la AUSENCIA de llamadas indebidas
 
 from __future__ import annotations
 
+import tempfile
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
@@ -24,6 +25,8 @@ from execution.intent_journal import (
     recover_pending_cancels,
     recover_pending_intents,
 )
+from execution.execution_authority import ExecutionAuthority
+from execution.execution_instance_lock import ExecutionInstanceLock
 from execution.live_execution import (
     ACCOUNT_MARGIN_MODE_RETAIL_HEDGING,
     ExecutionBlockedError,
@@ -49,6 +52,7 @@ from brokers.models import (
     BrokerConnectionError,
     BrokerError,
     BrokerInvalidOrderError,
+    BrokerPermissionError,
     BrokerOrderState,
     SubmitStatus,
 )
@@ -88,7 +92,7 @@ class FakeMT5:
         self.account = SimpleNamespace(
             login=42, balance=10_000.0, equity=10_000.0, margin_free=9_000.0,
             currency="USD", margin_mode=0, trade_allowed=True, trade_expert=True,
-            trade_mode=0,
+            trade_mode=0, server="demo", credit=0.0,
         )
         self.last_error_value = (0, "ok")
         self.symbols: dict = {}
@@ -395,6 +399,30 @@ def _adapter(fake: FakeMT5) -> MT5BrokerAdapter:
     return adapter
 
 
+def _bind_test_execution_lock(adapter):
+    """Bind a real per-adapter OS lock for direct/coordinator test paths."""
+    existing = getattr(adapter, "_execution_lock", None)
+    if existing is not None:
+        return existing
+    lock_dir = tempfile.mkdtemp(prefix="atlas-exec-lock-")
+    lock = ExecutionInstanceLock.for_scope(
+        adapter.expected_execution_scope(), lock_dir=lock_dir
+    )
+    lock.acquire()
+    adapter._test_lock_dir = lock_dir
+    adapter.bind_execution_lock(lock)
+    return lock
+
+
+def _runtime_lock(tmp_path, adapter, *, tag: str = "lock"):
+    lock_dir = tmp_path / f"{tag}-{id(adapter)}"
+    lock = ExecutionInstanceLock.for_scope(
+        adapter.expected_execution_scope(), lock_dir=lock_dir
+    )
+    lock.acquire()
+    return lock
+
+
 def _ref(instrument=INSTRUMENT, interval=3600, open_time=OPEN_TIME, close_time=CLOSE_TIME):
     return MarketDataReference(instrument, interval, open_time, close_time)
 
@@ -414,17 +442,25 @@ def _coord(
     instrument=INSTRUMENT,
     adapter=None,
     spec=None,
+    authority=None,
+    verifier=None,
 ):
     fake = fake or _fake()
     adapter = adapter or _adapter(fake)
+    _bind_test_execution_lock(adapter)
     sessions = sessions or FakeSessions()
     kill_switch = kill_switch or FakeKillSwitch()
     risk = lambda: AccountRiskState(equity=10_000.0, open_positions=open_positions)
     ref = market_ref if market_ref is not None else _ref()
+    authority = authority or ExecutionAuthority()
+    verifier = verifier or authority.verifier()
     coord = LiveExecutionCoordinator(
         broker=adapter,
         order_manager=OrderManager(),
         journal=journal,
+        execution_authority=authority,
+        execution_verifier=verifier,
+        broker_scope=adapter.expected_execution_scope(),
         sessions=sessions,
         kill_switch=kill_switch,
         instrument=instrument,
@@ -441,6 +477,20 @@ def _coord(
         run_id="TEST",
     )
     return coord, adapter, fake
+
+
+class _RecordingAuthority(ExecutionAuthority):
+    """Emisor de test que registra las intenciones firmadas."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.issued: list = []
+        self.scopes: list = []
+
+    def issue(self, intent, *, broker_scope):
+        self.issued.append(intent)
+        self.scopes.append(broker_scope)
+        return super().issue(intent, broker_scope=broker_scope)
 
 
 def _submit(coord, cid="C-1", *, side=OrderSide.BUY, quantity=0.1, is_entry=True,
@@ -900,9 +950,13 @@ class TestJournalMandatory:
     def test_coordinator_requires_journal(self, tmp_path):
         fake = _fake()
         adapter = _adapter(fake)
+        authority = ExecutionAuthority()
         with pytest.raises(TypeError):
             LiveExecutionCoordinator(
                 broker=adapter, order_manager=OrderManager(), journal=None,
+                execution_authority=authority,
+                execution_verifier=authority.verifier(),
+                broker_scope=adapter.expected_execution_scope(),
                 sessions=FakeSessions(), kill_switch=FakeKillSwitch(),
                 instrument=INSTRUMENT, instrument_spec=_spec(), account_id="A",
                 account_currency="USD", max_open_positions=3,
@@ -1190,12 +1244,16 @@ class TestGateBindingHardening:
             adapter.bind_execution_gate(None)
         assert adapter._execution_gate is None
 
-    def test_bind_rejects_object_without_check(self):
+    def test_bind_rejects_incomplete_gate(self):
         adapter = _adapter(_fake())
-        with pytest.raises(BrokerError):
-            adapter.bind_execution_gate(object())
-        with pytest.raises(BrokerError):
-            adapter.bind_execution_gate(SimpleNamespace(check=None))
+        for gate in (
+            object(),
+            SimpleNamespace(check=None),
+            SimpleNamespace(check=lambda cid: None),
+            SimpleNamespace(check_operation=lambda *a, **k: None),
+        ):
+            with pytest.raises(BrokerError):
+                adapter.bind_execution_gate(gate)
         assert adapter._execution_gate is None
 
     def test_second_bind_fails_without_replacing(self, tmp_path):
@@ -1219,13 +1277,14 @@ class TestGateBindingHardening:
             adapter.submit_order(_new_order("UNAPPROVED"))
         assert fake.send_count == 0
 
-    def test_legacy_adapter_without_gate_still_sends(self):
+    def test_adapter_without_gate_is_rejected(self):
         fake = _fake()
         adapter = _adapter(fake)
-        assert adapter._execution_gate is None  # modo LIVE-09 heredado
-        out = adapter.submit_order(_new_order("LEGACY-1"))
-        assert out.status is SubmitStatus.CONFIRMED
-        assert fake.send_count == 1
+        assert adapter._execution_gate is None
+        with pytest.raises(BrokerPermissionError):
+            adapter.submit_order(_new_order("LEGACY-1"))
+        assert fake.check_count == 0
+        assert fake.send_count == 0
 
     def test_coordinator_is_authorized_route(self, tmp_path):
         journal = IntentJournal.initialize(tmp_path / "j.json")
@@ -1263,6 +1322,116 @@ class TestGateBindingHardening:
         with pytest.raises(ExecutionNotAuthorizedError):
             adapter.submit_order(_new_order("C-EXC"))
         assert fake.send_count == 0
+
+
+class TestAuthorizationIntegration:
+    def test_submit_rejects_open_reduce_only(self, tmp_path):
+        journal = IntentJournal.initialize(tmp_path / "j.json")
+        coord, adapter, fake = _coord(journal=journal)
+        with pytest.raises(ExecutionBlockedError):
+            coord.submit(
+                side=OrderSide.BUY, quantity=0.1, strategy_id="s",
+                strategy_version="1.0.0", client_order_id="O-RO",
+                reduce_only=True,
+            )
+        assert fake.send_count == 0
+
+    def test_submit_rejects_is_entry_false_before_side_effects(self, tmp_path):
+        journal = IntentJournal.initialize(tmp_path / "j.json")
+        authority = _RecordingAuthority()
+        coord, adapter, fake = _coord(journal=journal, authority=authority)
+        with pytest.raises(ExecutionBlockedError):
+            coord.submit(
+                side=OrderSide.BUY, quantity=0.1, strategy_id="s",
+                strategy_version="1.0.0", client_order_id="O-NOENTRY",
+                is_entry=False,
+            )
+        # Rechazo ANTES de crear orden, journal, firma Ed25519 o broker.
+        assert coord._order_manager.orders == {}
+        assert journal.all() == ()
+        assert authority.issued == []
+        assert fake.send_count == 0
+
+    @pytest.mark.parametrize("value", [False, 0, 1, "true", None])
+    def test_submit_requires_literal_true_is_entry(self, tmp_path, value):
+        journal = IntentJournal.initialize(tmp_path / "j.json")
+        authority = _RecordingAuthority()
+        coord, adapter, fake = _coord(journal=journal, authority=authority)
+        with pytest.raises(ExecutionBlockedError):
+            coord.submit(
+                side=OrderSide.BUY, quantity=0.1, strategy_id="s",
+                strategy_version="1.0.0", client_order_id="O-NOENTRY",
+                is_entry=value,
+            )
+        assert coord._order_manager.orders == {}
+        assert journal.all() == ()
+        assert authority.issued == []
+        assert fake.send_count == 0
+
+    def test_signing_happens_after_submitting_and_signs_effective_open(
+        self, tmp_path
+    ):
+        journal = IntentJournal.initialize(tmp_path / "j.json")
+        authority = _RecordingAuthority()
+        coord, adapter, fake = _coord(journal=journal, authority=authority)
+        out = _submit(coord, "O-SIGN", side=OrderSide.SELL, quantity=0.25)
+        assert out.allowed is True
+        assert len(authority.issued) == 1
+        intent = authority.issued[0]
+        assert intent.kind == "OPEN"
+        assert intent.side == "SELL"
+        assert intent.quantity == "0.25"
+        assert intent.instrument == INSTRUMENT
+        assert intent.account_id == "MT5-DEMO-1"
+        assert intent.reduce_only is False
+        assert intent.target_broker_order_id == ""
+        assert authority.scopes[0] == adapter.expected_execution_scope()
+        assert fake.send_count == 1
+
+    def test_journal_submitting_failure_issues_no_authorization(
+        self, tmp_path, monkeypatch
+    ):
+        journal = IntentJournal.initialize(tmp_path / "j.json")
+        authority = _RecordingAuthority()
+        coord, adapter, fake = _coord(journal=journal, authority=authority)
+        original = coord.journal.mark_state
+
+        def failing_mark_state(cid, state, *args, **kwargs):
+            if state == "SUBMITTING":
+                raise IntentJournalError("submitting persist failed")
+            return original(cid, state, *args, **kwargs)
+
+        monkeypatch.setattr(coord.journal, "mark_state", failing_mark_state)
+        with pytest.raises(ExecutionBlockedError):
+            _submit(coord, "O-JFAIL")
+        assert authority.issued == []
+        assert fake.send_count == 0
+
+    def test_coordinator_rejects_mismatched_key_pair(self, tmp_path):
+        journal = IntentJournal.initialize(tmp_path / "j.json")
+        issuer = ExecutionAuthority()
+        other = ExecutionAuthority()
+        with pytest.raises(ValueError):
+            _coord(
+                journal=journal, authority=issuer,
+                verifier=other.verifier(),
+            )
+
+    def test_cancel_signs_exact_target_and_ticket(self, tmp_path):
+        journal = IntentJournal.initialize(tmp_path / "j.json")
+        authority = _RecordingAuthority()
+        coord, adapter, fake = _coord(journal=journal, authority=authority)
+        _seed_open_intent(journal, "C-SIGN")
+        _plant_pending(adapter, fake, "C-SIGN", 607)
+        out = _cancel(coord, "C-SIGN")
+        assert out.allowed is True
+        intent = authority.issued[-1]
+        assert intent.kind == "CANCEL"
+        assert intent.op_id == "CANCEL:C-SIGN"
+        assert intent.client_order_id == "C-SIGN"
+        assert intent.instrument == INSTRUMENT
+        assert intent.account_id == "MT5-DEMO-1"
+        assert intent.target_broker_order_id == "607"
 
 
 # ==========================================================================
@@ -1683,18 +1852,13 @@ class TestCoordinatedCancelRecovery:
 
 
 class TestLegacyCancelCompatibility:
-    def test_legacy_cancel_without_gate_still_works(self):
+    def test_adapter_without_gate_cannot_cancel(self):
         fake = _fake()
         adapter = _adapter(fake)
-        assert adapter._execution_gate is None  # modo LIVE-09 heredado
-        fake.add_open_order(
-            520, symbol=INSTRUMENT, magic=adapter._magic_for("LEG-C"),
-            comment=adapter._comment_for("LEG-C"), volume=0.1, price=1.1,
-        )
-        adapter._remember("LEG-C", 520)
-        out = adapter.cancel_order("LEG-C")
-        assert out.state is BrokerOrderState.CANCELLED
-        assert fake.cancel_count == 1
+        assert adapter._execution_gate is None
+        with pytest.raises(BrokerPermissionError):
+            adapter.cancel_order("LEG-C")
+        assert fake.cancel_count == 0
 
 
 # ==========================================================================

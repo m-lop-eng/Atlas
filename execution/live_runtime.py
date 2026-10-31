@@ -22,11 +22,23 @@ contable, identidad ambigua) el runtime NO se marca preparado.
 
 from __future__ import annotations
 
+import secrets
 import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Callable
 
+from execution.execution_authority import (
+    BrokerScope,
+    ExecutionAuthority,
+    ExecutionVerifier,
+)
+from execution.execution_instance_lock import (
+    ExecutionInstanceLock,
+    ExecutionInstanceLockError,
+    execution_resource_key,
+)
 from execution.intent_journal import OPERATION_CANCEL, OPERATION_OPEN, IntentJournal
 from execution.ledger_applier import LedgerApplier, CommissionPolicy
 from execution.ledger_store import LedgerStore
@@ -107,9 +119,23 @@ class LiveExecutionRuntime:
     # adaptador MT5 lo hace). NO es un flag para desactivar la contabilidad: si el
     # adaptador la exige y falta el componente, el arranque se BLOQUEA.
     mt5_accounting: Any | None = None
+    # ORDER-09D: composition root de la autoridad de ejecucion. Si no se inyecta
+    # una pareja, el runtime genera una NUEVA por proceso (un reinicio invalida
+    # autorizaciones previas). Si se inyectan, deben ser la MISMA pareja.
+    execution_authority: ExecutionAuthority | None = None
+    execution_verifier: ExecutionVerifier | None = None
+    # ORDER-09D.1: identidad esperada de la cuenta/terminal. Si es None se
+    # obtiene del broker (`expected_execution_scope`). Si se inyecta, debe
+    # coincidir con la identidad esperada del adapter.
+    broker_scope: BrokerScope | None = None
+    # ORDER-09E: capacidad de lock inter-proceso YA adquirida por el composition
+    # root. Sin ella el runtime no llega a READY ni puede operar. No es un bool:
+    # debe ser un `ExecutionInstanceLock` real y activo para el mismo scope.
+    instance_lock: ExecutionInstanceLock | None = None
 
     _coordinator: LiveExecutionCoordinator = field(init=False, default=None)
     _applier: LedgerApplier = field(init=False, default=None)
+    _broker_scope: BrokerScope = field(init=False, default=None)
     _ready: bool = field(init=False, default=False)
     _last_report: ReconciliationReport | None = field(init=False, default=None)
     _commission_unverified: float = field(init=False, default=0.0)
@@ -124,16 +150,81 @@ class LiveExecutionRuntime:
     # `reconcile_now`. Cubre readiness + operacion + trabajo posterior + refresh
     # de admision como una seccion critica unica.
     _lock: Any = field(init=False, default_factory=threading.RLock)
+    _lifecycle_state: str = field(init=False, default="NO_LOCK")
+    _lock_owner: str = field(init=False, default="")
 
     def __post_init__(self) -> None:
         # La economia del instrumento queda registrada en el ledger (autoridad de
         # metadata economica); sin ella `apply_fill` usaria el path legacy cs=1.
         self.ledger.register_instrument(self.instrument_spec)
+        # ORDER-09D: composition root. La clave privada queda en el emisor que
+        # recibe el coordinador; el adapter solo recibe el verificador publico.
+        if (self.execution_authority is None) != (
+            self.execution_verifier is None
+        ):
+            raise ValueError(
+                "execution_authority y execution_verifier deben inyectarse "
+                "juntos (o ninguno para generar una pareja por proceso)"
+            )
+        if self.execution_authority is None:
+            execution_authority = ExecutionAuthority()
+            execution_verifier = execution_authority.verifier()
+        else:
+            execution_authority = self.execution_authority
+            execution_verifier = self.execution_verifier
+        # ORDER-09D.1: el composition root obtiene la identidad esperada del
+        # adapter; una identidad configurada debe coincidir con ella.
+        expected_scope = None
+        scope_getter = getattr(self.broker, "expected_execution_scope", None)
+        if callable(scope_getter):
+            expected_scope = scope_getter()
+            if not isinstance(expected_scope, BrokerScope):
+                raise TypeError(
+                    "expected_execution_scope debe devolver BrokerScope"
+                )
+        if self.broker_scope is None:
+            if expected_scope is None:
+                raise ValueError(
+                    "broker_scope obligatorio: el broker no expone "
+                    "expected_execution_scope"
+                )
+            broker_scope = expected_scope
+        else:
+            if not isinstance(self.broker_scope, BrokerScope):
+                raise TypeError("broker_scope debe ser BrokerScope")
+            if expected_scope is not None and self.broker_scope != expected_scope:
+                raise ValueError(
+                    "broker_scope inyectado no coincide con la identidad "
+                    "esperada del adapter"
+                )
+            broker_scope = self.broker_scope
+        self._broker_scope = broker_scope
+        # ORDER-09E: si se aporta un lock, debe ser real, estar activo y
+        # corresponder exactamente al BrokerScope del runtime.
+        if self.instance_lock is not None:
+            if not isinstance(self.instance_lock, ExecutionInstanceLock):
+                raise TypeError(
+                    "instance_lock debe ser ExecutionInstanceLock"
+                )
+            if not self.instance_lock.held:
+                raise ValueError("instance_lock aportado no esta adquirido")
+            if self.instance_lock.resource_key != execution_resource_key(
+                broker_scope
+            ):
+                raise ValueError(
+                    "instance_lock no corresponde al BrokerScope del runtime"
+                )
+            self._lock_owner = secrets.token_hex(16)
+            self.instance_lock.claim(self._lock_owner)
+            self._lifecycle_state = "LOCKED"
         # El coordinador exige un broker gate-bindable y un journal valido.
         self._coordinator = LiveExecutionCoordinator(
             broker=self.broker,
             order_manager=self.order_manager,
             journal=self.journal,
+            execution_authority=execution_authority,
+            execution_verifier=execution_verifier,
+            broker_scope=broker_scope,
             sessions=self.sessions,
             kill_switch=self.kill_switch,
             instrument=self.instrument,
@@ -157,6 +248,10 @@ class LiveExecutionRuntime:
             commission_policy=self.commission_policy,
             clock=self.clock,
         )
+        if self.instance_lock is not None and hasattr(
+            self.broker, "bind_execution_lock"
+        ):
+            self.broker.bind_execution_lock(self.instance_lock)
 
     # ------------------------------------------------------------ propiedades
     # H-1: el COORDINADOR (que puede enviar/gestionar ordenes con el token de
@@ -175,6 +270,10 @@ class LiveExecutionRuntime:
         return self._ready
 
     @property
+    def lifecycle_state(self) -> str:
+        return self._lifecycle_state
+
+    @property
     def last_reconciliation(self) -> ReconciliationReport | None:
         return self._last_report
 
@@ -189,18 +288,82 @@ class LiveExecutionRuntime:
         """True si el broker EXIGE admision contable MT5 (adaptador MT5)."""
         return bool(getattr(self.broker, "requires_accounting_admission", False))
 
+    def _instance_lock_ok(self) -> bool:
+        lock = self.instance_lock
+        return bool(
+            lock is not None
+            and lock.held
+            and lock.resource_key == execution_resource_key(self._broker_scope)
+        )
+
+    def _assert_instance_lock(self) -> None:
+        if not self._instance_lock_ok():
+            raise RuntimeNotReadyError(
+                "lock inter-proceso de ejecucion no activo o no correspondiente "
+                "al BrokerScope (fail-closed)"
+            )
+
     def initialize(self) -> ReadinessReport:
         """Secuencia de arranque fail-closed (serializada por instancia).
 
-        ATLAS-MT5-ACCOUNTING-05I (H-2): no se solapa con operaciones en curso ni
-        con `reconcile_now()`; una reinicializacion espera a que termine la seccion
-        critica anterior.
+        ORDER-09E.1: cualquier fallo de inicializacion (excepcion o report no
+        listo) libera el lock y desconecta el broker. El runtime queda en
+        FAILED/CLOSED y no puede volver a READY.
         """
         with self._lock:
-            return self._initialize_locked()
+            if self._lifecycle_state in (
+                "FAILED", "CLOSED", "SHUTTING_DOWN",
+            ):
+                self._ready = False
+                return self._not_ready(
+                    "closed",
+                    "runtime cerrado tras fallo/shutdown; cree una nueva instancia",
+                )
+            if not self._instance_lock_ok():
+                self._fail_initialization(disconnect=True)
+                return self._not_ready(
+                    "instance_lock",
+                    "lock inter-proceso de ejecucion no activo o no "
+                    "correspondiente al BrokerScope",
+                )
+            self._lifecycle_state = "INITIALIZING"
+            self._ready = False
+            try:
+                report = self._initialize_locked()
+            except BaseException:
+                self._fail_initialization(disconnect=True)
+                raise
+            if not report.ready:
+                self._fail_initialization(disconnect=True)
+                return report
+            self._lifecycle_state = "READY"
+            self._ready = True
+            return report
+
+    def _fail_initialization(self, *, disconnect: bool) -> None:
+        """Libera lock y recursos adquiridos tras un fallo de inicializacion."""
+        self._ready = False
+        self._lifecycle_state = "FAILED"
+        if disconnect:
+            try:
+                disconnect_fn = getattr(self.broker, "disconnect", None)
+                if callable(disconnect_fn):
+                    disconnect_fn()
+            except Exception:  # noqa: BLE001 - limpieza best-effort
+                pass
+        if self.instance_lock is not None and self._lock_owner:
+            self.instance_lock.release(self._lock_owner)
 
     def _initialize_locked(self) -> ReadinessReport:
         """Cuerpo de `initialize()` ejecutado con el lock de instancia tomado."""
+        # 0) ORDER-09E: sin lock inter-proceso activo no se toca journal,
+        # broker, recovery ni admission.
+        if not self._instance_lock_ok():
+            return self._not_ready(
+                "instance_lock",
+                "lock inter-proceso de ejecucion no activo o no correspondiente "
+                "al BrokerScope",
+            )
         # 1) config DEMO / mapping / moneda / NETTING
         if not self._demo_environment_ok():
             return self._not_ready("config", "entorno no DEMO (produccion prohibida)")
@@ -661,8 +824,9 @@ class LiveExecutionRuntime:
     # -------------------------------------------------------------- operacion
 
     def _ensure_operable(self) -> None:
-        if not self._ready:
+        if not self._ready or self._lifecycle_state != "READY":
             raise RuntimeNotReadyError("runtime no preparado: ejecute initialize()")
+        self._assert_instance_lock()
         if self._post_operation_failed:
             raise RuntimeNotReadyError(
                 "fallo en el procesamiento posterior a una operacion: recuperacion "
@@ -800,6 +964,123 @@ class LiveExecutionRuntime:
                 quantity=quantity, operation_id=operation_id, target_position_id=target_position_id
             )
             return self._post_operation(out)
+
+    # ------------------------------------------------- ciclo de vida (09E)
+
+    @classmethod
+    def open(
+        cls,
+        *,
+        broker: Any,
+        journal_factory: Callable[[], IntentJournal],
+        lock_dir: str | Path | None = None,
+        connect: bool = True,
+        **runtime_kwargs: Any,
+    ) -> "LiveExecutionRuntime":
+        """Composition root canonico: lock ANTES de conectar/cargar journal.
+
+        Orden obligatorio:
+          1. identidad esperada del adapter,
+          2. adquisicion del lock inter-proceso,
+          3. conexion del adapter,
+          4. carga/creacion del journal,
+          5. construccion del runtime.
+        Si cualquier paso falla, se libera el lock y se desconecta el broker.
+        """
+        scope_getter = getattr(broker, "expected_execution_scope", None)
+        if not callable(scope_getter):
+            raise TypeError(
+                "broker no expone expected_execution_scope: no se puede "
+                "adquirir el lock de ejecucion"
+            )
+        scope = scope_getter()
+        lock = ExecutionInstanceLock.for_scope(scope, lock_dir=lock_dir)
+        lock.acquire()
+        try:
+            if connect:
+                broker.connect()
+            journal = journal_factory()
+            return cls(
+                broker=broker,
+                journal=journal,
+                instance_lock=lock,
+                **runtime_kwargs,
+            )
+        except BaseException:
+            try:
+                if connect:
+                    broker.disconnect()
+            except Exception:  # noqa: BLE001 - limpieza best-effort
+                pass
+            lock.release()
+            raise
+
+    @classmethod
+    def start(
+        cls,
+        *,
+        broker: Any,
+        journal_factory: Callable[[], IntentJournal],
+        lock_dir: str | Path | None = None,
+        connect: bool = True,
+        **runtime_kwargs: Any,
+    ) -> tuple["LiveExecutionRuntime", ReadinessReport]:
+        """Abre y ejecuta `initialize`; si no queda READY libera el lock."""
+        runtime = cls.open(
+            broker=broker,
+            journal_factory=journal_factory,
+            lock_dir=lock_dir,
+            connect=connect,
+            **runtime_kwargs,
+        )
+        try:
+            report = runtime.initialize()
+        except BaseException:
+            runtime.shutdown()
+            raise
+        if not report.ready:
+            runtime.shutdown()
+        return runtime, report
+
+    def shutdown(self) -> None:
+        """Detiene operaciones, desconecta y libera el lock al final.
+
+        El lock se libera SIEMPRE, aunque `broker.disconnect()` falle. Un
+        segundo shutdown es idempotente. El runtime queda CLOSED/no operable.
+        """
+        with self._lock:
+            if self._lifecycle_state == "CLOSED":
+                if (
+                    self.instance_lock is not None
+                    and self.instance_lock.held
+                    and self._lock_owner
+                ):
+                    try:
+                        self.instance_lock.release(self._lock_owner)
+                    except ExecutionInstanceLockError:
+                        pass
+                return
+            self._ready = False
+            self._lifecycle_state = "SHUTTING_DOWN"
+            try:
+                disconnect = getattr(self.broker, "disconnect", None)
+                if callable(disconnect):
+                    disconnect()
+            finally:
+                try:
+                    if self.instance_lock is not None and self._lock_owner:
+                        self.instance_lock.release(self._lock_owner)
+                finally:
+                    self._lifecycle_state = "CLOSED"
+
+    def close(self) -> None:
+        self.shutdown()
+
+    def __enter__(self) -> "LiveExecutionRuntime":
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.shutdown()
 
 
 __all__ = [

@@ -11,13 +11,23 @@ RECONCILIATION. No usa sleeps.
 
 from __future__ import annotations
 
+import tempfile
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
 
+from execution.execution_instance_lock import ExecutionInstanceLock
+from execution.execution_authority import (
+    BrokerScope,
+    ExecutionAuthorizationInvalidError,
+    ExecutionAuthorizationRequiredError,
+    ExecutionAuthorizationReusedError,
+    ExecutionAuthority,
+    ExecutionIntent,
+)
 from execution.intent_journal import IntentJournal, OrderIntent
-from execution.order import Order, OrderSide, OrderType
+from execution.order import PURPOSE_REDUCE, Order, OrderSide, OrderType
 from reconciliation.orchestrator import broker_state_from_adapter
 
 from brokers.mt5 import (
@@ -86,10 +96,12 @@ class FakeMT5:
         self.symbols: dict = {}
         self.ticks: dict = {}
         self.check_retcode = 0
+        self.check_count = 0
         self.send_mode = "ok"        # ok | reject | none | raise | ambiguous
         self.remove_mode = "ok"      # ok | reject | none | raise | ambiguous
         self.accept_but_lose_response = False
         self.send_count = 0
+        self.cancel_count = 0
         self.last_request: dict | None = None
         self.fail_orders_get = False
         self.fail_history_orders_get = False
@@ -174,6 +186,7 @@ class FakeMT5:
         return self.ticks.get(name)
 
     def order_check(self, request):
+        self.check_count += 1
         return SimpleNamespace(retcode=self.check_retcode, comment="")
 
     def _mk_order(self, ticket, request, state, volume_initial, volume_current):
@@ -244,6 +257,7 @@ class FakeMT5:
         )
 
     def _send_remove(self, request):
+        self.cancel_count += 1
         if self.remove_mode == "raise":
             raise RuntimeError("transporte")
         if self.remove_mode == "none":
@@ -327,7 +341,9 @@ def _config(**over) -> MT5Config:
 
 
 def _credentials() -> MT5Credentials:
-    return MT5Credentials(login=123456, password=PASSWORD_CANARY, server="demo")
+    return MT5Credentials(
+        login=123456, password=PASSWORD_CANARY, server="MetaQuotes-Demo"
+    )
 
 
 def _adapter(
@@ -348,18 +364,97 @@ def _adapter(
     return adapter, fake
 
 
+class _TestGate:
+    """Gate de prueba expl?cito; no representa autorizaci?n de producci?n."""
+
+    def __init__(self, *, allow=True):
+        self.allow = bool(allow)
+        self.calls: list[tuple] = []
+
+    def check(self, client_order_id):
+        self.calls.append(("check", str(client_order_id)))
+        if not self.allow:
+            raise BrokerPermissionError("test gate denied")
+
+    def check_operation(self, operation, *, op_id, target):
+        self.calls.append(("check_operation", str(operation), str(op_id), str(target)))
+        if not self.allow:
+            raise BrokerPermissionError("test gate denied")
+
+
+def _bind_test_gate(adapter, gate=None):
+    gate = gate or _TestGate()
+    adapter.bind_execution_gate(gate)
+    if getattr(adapter, "_execution_authority", None) is None:
+        authority = ExecutionAuthority(ttl_s=3600.0)
+        adapter._test_authority = authority
+        adapter.bind_execution_authority(authority.verifier())
+    if getattr(adapter, "_execution_lock", None) is None:
+        lock_dir = tempfile.mkdtemp(prefix="atlas-live09-lock-")
+        lock = ExecutionInstanceLock.for_scope(
+            adapter.expected_execution_scope(), lock_dir=lock_dir
+        )
+        lock.acquire()
+        adapter._test_lock_dir = lock_dir
+        adapter.bind_execution_lock(lock)
+    return gate
+
+
 def _order(cid="C-1", *, side=OrderSide.BUY, quantity=0.1,
            order_type=OrderType.MARKET, instrument=ATLAS_INSTRUMENT,
-           reduce_only=False) -> Order:
+           reduce_only=False, purpose="OPEN", account_id="MT5-1",
+           target_position_id=None, limit_price=None, stop_price=None) -> Order:
     return Order(
-        strategy_id="s", strategy_version="1.0.0", account_id="MT5-1",
+        strategy_id="s", strategy_version="1.0.0", account_id=account_id,
         instrument=instrument, side=side, quantity=quantity,
         order_type=order_type, client_order_id=cid, reduce_only=reduce_only,
+        purpose=purpose, target_position_id=target_position_id,
+        limit_price=limit_price, stop_price=stop_price,
+    )
+
+
+def _test_authority(adapter):
+    authority = getattr(adapter, "_test_authority", None)
+    if authority is None:
+        authority = ExecutionAuthority(ttl_s=3600.0)
+        adapter._test_authority = authority
+    return authority
+
+
+def _submit(adapter, order, **kwargs):
+    authorization = _test_authority(adapter).issue(
+        ExecutionIntent.from_order(order),
+        broker_scope=adapter.expected_execution_scope(),
+    )
+    return adapter.submit_order(order, authorization=authorization, **kwargs)
+
+
+def _cancel(adapter, client_order_id, *, operation_id=None,
+            instrument=ATLAS_INSTRUMENT, account_id="MT5-1"):
+    op_id = str(operation_id) if operation_id else f"CANCEL:{client_order_id}"
+    ticket = adapter._cid_to_ticket.get(client_order_id)
+    authorization = _test_authority(adapter).issue(
+        ExecutionIntent.for_cancel(
+            op_id=op_id,
+            target_client_order_id=str(client_order_id),
+            instrument=str(instrument),
+            account_id=str(account_id),
+            target_broker_order_id=str(ticket) if ticket is not None else "UNRESOLVED",
+        ),
+        broker_scope=adapter.expected_execution_scope(),
+    )
+    return adapter.cancel_order(
+        client_order_id,
+        operation_id=operation_id,
+        instrument=instrument,
+        account_id=account_id,
+        authorization=authorization,
     )
 
 
 def _ready(**cfg) -> tuple[MT5BrokerAdapter, FakeMT5]:
     adapter, fake = _adapter(**cfg)
+    _bind_test_gate(adapter)
     adapter.connect()
     return adapter, fake
 
@@ -407,7 +502,7 @@ class TestConfig:
         # Aunque se forzara el estado interno, el submit queda prohibido.
         adapter._state = "READY"
         with pytest.raises(BrokerPermissionError):
-            adapter.submit_order(_order())
+            _submit(adapter, _order())
 
 
 # --------------------------------------------------------------------------
@@ -913,24 +1008,615 @@ class TestSymbol:
         adapter, fake = _ready()
         fake.symbols.pop(MT5_SYMBOL)
         with pytest.raises(BrokerInvalidOrderError):
-            adapter.submit_order(_order())
+            _submit(adapter, _order())
 
     def test_symbol_not_operable_fails(self):
         adapter, fake = _ready()
         fake.symbols[MT5_SYMBOL].trade_mode = 0
         with pytest.raises(BrokerInvalidOrderError):
-            adapter.submit_order(_order())
+            _submit(adapter, _order())
 
     def test_no_explicit_mapping_fails(self):
         adapter, _ = _adapter(symbol_map={})
+        _bind_test_gate(adapter)
         adapter.connect()
         with pytest.raises(BrokerInvalidOrderError):
-            adapter.submit_order(_order())
+            _submit(adapter, _order())
 
 
 # --------------------------------------------------------------------------
 # SUBMIT / order_check / order_send
 # --------------------------------------------------------------------------
+
+
+class TestExecutionGateRequired:
+    def test_submit_without_gate_is_rejected_before_broker(self):
+        adapter, fake = _adapter()
+        adapter.connect()
+        with pytest.raises(BrokerPermissionError):
+            _submit(adapter, _order(cid="NO-GATE-SUBMIT"))
+        assert fake.check_count == 0
+        assert fake.send_count == 0
+
+    def test_cancel_without_gate_is_rejected_before_broker(self):
+        adapter, fake = _adapter()
+        adapter.connect()
+        with pytest.raises(BrokerPermissionError):
+            _cancel(adapter, "NO-GATE-CANCEL")
+        assert fake.cancel_count == 0
+        assert fake.send_count == 0
+
+    @pytest.mark.parametrize(
+        "gate",
+        [
+            None,
+            SimpleNamespace(check=lambda cid: None),
+            SimpleNamespace(check_operation=lambda *args, **kwargs: None),
+            object(),
+        ],
+    )
+    def test_bind_rejects_incomplete_gate(self, gate):
+        adapter, _ = _adapter()
+        with pytest.raises(BrokerError):
+            adapter.bind_execution_gate(gate)
+        assert adapter._execution_gate is None
+
+    def test_valid_gate_enforces_open_cancel_and_denial(self):
+        adapter, fake = _adapter()
+        gate = _TestGate()
+        _bind_test_gate(adapter, gate)
+        adapter.connect()
+
+        sub = _submit(adapter, _order(cid="GATE-OPEN"))
+        assert sub.status is SubmitStatus.CONFIRMED
+        assert fake.send_count == 1
+        assert gate.calls[0] == ("check", "GATE-OPEN")
+
+        fake.add_open_order(
+            901, magic=adapter._magic_for("GATE-CANCEL"),
+            comment=adapter._comment_for("GATE-CANCEL"),
+        )
+        adapter._remember("GATE-CANCEL", 901)
+        cancelled = _cancel(adapter,
+            "GATE-CANCEL", operation_id="CANCEL:GATE-CANCEL"
+        )
+        assert cancelled.state is BrokerOrderState.CANCELLED
+        assert any(
+            call[0] == "check_operation" and call[1] == "CANCEL"
+            for call in gate.calls
+        )
+        assert fake.cancel_count == 1
+
+        denied, denied_fake = _adapter()
+        _bind_test_gate(denied, _TestGate(allow=False))
+        denied.connect()
+        with pytest.raises(BrokerPermissionError):
+            _submit(denied, _order(cid="DENIED-OPEN"))
+        assert denied_fake.check_count == 0
+        assert denied_fake.send_count == 0
+
+
+class TestExecutionAuthorityBinding:
+    def test_bind_rejects_none_and_foreign_object(self):
+        adapter, _ = _adapter()
+        for verifier in (None, object(), SimpleNamespace(consume=lambda *a, **k: None)):
+            with pytest.raises(BrokerError):
+                adapter.bind_execution_authority(verifier)
+        assert adapter._execution_authority is None
+
+    def test_second_bind_fails_without_replacing(self):
+        adapter, _ = _ready()
+        first = adapter._execution_authority
+        assert first is not None
+        with pytest.raises(BrokerError):
+            adapter.bind_execution_authority(
+                ExecutionAuthority().verifier()
+            )
+        assert adapter._execution_authority is first
+
+
+class TestExecutionLockBinding:
+    def _adapter_without_lock(self):
+        adapter, fake = _adapter()
+        adapter.bind_execution_gate(_TestGate())
+        authority = ExecutionAuthority(ttl_s=3600.0)
+        adapter.bind_execution_authority(authority.verifier())
+        adapter.connect()
+        return adapter, fake, authority
+
+    def test_submit_without_lock_rejected(self):
+        adapter, fake, authority = self._adapter_without_lock()
+        order = _order(cid="NO-LOCK-SUBMIT")
+        authorization = authority.issue(
+            ExecutionIntent.from_order(order),
+            broker_scope=adapter.expected_execution_scope(),
+        )
+        with pytest.raises(BrokerPermissionError):
+            adapter.submit_order(order, authorization=authorization)
+        assert fake.send_count == 0
+
+    def test_cancel_without_lock_rejected(self):
+        adapter, fake, authority = self._adapter_without_lock()
+        fake.add_open_order(
+            906, magic=adapter._magic_for("NO-LOCK-CANCEL"),
+            comment=adapter._comment_for("NO-LOCK-CANCEL"),
+        )
+        adapter._remember("NO-LOCK-CANCEL", 906)
+        authorization = authority.issue(
+            ExecutionIntent.for_cancel(
+                op_id="CANCEL:NO-LOCK-CANCEL",
+                target_client_order_id="NO-LOCK-CANCEL",
+                instrument=ATLAS_INSTRUMENT,
+                account_id="MT5-1",
+                target_broker_order_id="906",
+            ),
+            broker_scope=adapter.expected_execution_scope(),
+        )
+        with pytest.raises(BrokerPermissionError):
+            adapter.cancel_order(
+                "NO-LOCK-CANCEL",
+                operation_id="CANCEL:NO-LOCK-CANCEL",
+                instrument=ATLAS_INSTRUMENT,
+                account_id="MT5-1",
+                authorization=authorization,
+            )
+        assert fake.cancel_count == 0
+
+    def test_bind_lock_none_rejected(self):
+        adapter, _ = _adapter()
+        with pytest.raises(BrokerError):
+            adapter.bind_execution_lock(None)
+        assert adapter._execution_lock is None
+
+    def test_bind_lock_wrong_scope_rejected(self):
+        adapter, _ = _adapter()
+        lock_dir = tempfile.mkdtemp(prefix="atlas-lock-scope-")
+        lock = ExecutionInstanceLock.for_scope(
+            BrokerScope("demo", "MetaQuotes-Demo", "999999"),
+            lock_dir=lock_dir,
+        )
+        lock.acquire()
+        try:
+            with pytest.raises(BrokerError):
+                adapter.bind_execution_lock(lock)
+        finally:
+            lock.release()
+        assert adapter._execution_lock is None
+
+    def test_second_lock_bind_rejected(self):
+        adapter, _ = _ready()
+        first = adapter._execution_lock
+        assert first is not None
+        other = ExecutionInstanceLock.for_scope(
+            adapter.expected_execution_scope(),
+            lock_dir=tempfile.mkdtemp(prefix="atlas-lock-second-"),
+        )
+        other.acquire()
+        try:
+            with pytest.raises(BrokerError):
+                adapter.bind_execution_lock(other)
+        finally:
+            other.release()
+        assert adapter._execution_lock is first
+
+
+class TestExecutionAuthorizationRequired:
+    def test_submit_without_authorization_rejected(self):
+        adapter, fake = _ready()
+        with pytest.raises(ExecutionAuthorizationRequiredError):
+            adapter.submit_order(_order(cid="AUTH-NONE"))
+        # order_check puede ocurrir antes del consumo; order_send NO.
+        assert fake.send_count == 0
+
+    def test_submit_with_forged_authorization_rejected(self):
+        adapter, fake = _ready()
+        order = _order(cid="AUTH-FORGE")
+        forged = ExecutionAuthority().issue(
+            ExecutionIntent.from_order(order),
+            broker_scope=adapter.expected_execution_scope(),
+        )
+        with pytest.raises(ExecutionAuthorizationInvalidError):
+            adapter.submit_order(order, authorization=forged)
+        assert fake.send_count == 0
+
+    def test_authorization_bound_to_other_order_rejected(self):
+        adapter, fake = _ready()
+        order = _order(cid="AUTH-BIND")
+        authorization = _test_authority(adapter).issue(
+            ExecutionIntent.from_order(_order(cid="OTRO")),
+            broker_scope=adapter.expected_execution_scope(),
+        )
+        with pytest.raises(ExecutionAuthorizationInvalidError):
+            adapter.submit_order(order, authorization=authorization)
+        assert fake.send_count == 0
+
+    def test_replayed_authorization_rejected(self):
+        adapter, fake = _ready()
+        order = _order(cid="AUTH-REPLAY")
+        authorization = _test_authority(adapter).issue(
+            ExecutionIntent.from_order(order),
+            broker_scope=adapter.expected_execution_scope(),
+        )
+        first = adapter.submit_order(order, authorization=authorization)
+        assert first.status is SubmitStatus.CONFIRMED
+        with pytest.raises(ExecutionAuthorizationReusedError):
+            adapter.submit_order(order, authorization=authorization)
+        assert fake.send_count == 1
+
+    def test_cancel_without_authorization_rejected(self):
+        adapter, fake = _ready()
+        fake.add_open_order(
+            905, magic=adapter._magic_for("AUTH-CANCEL"),
+            comment=adapter._comment_for("AUTH-CANCEL"),
+        )
+        adapter._remember("AUTH-CANCEL", 905)
+        with pytest.raises(ExecutionAuthorizationRequiredError):
+            adapter.cancel_order(
+                "AUTH-CANCEL",
+                operation_id="CANCEL:AUTH-CANCEL",
+                instrument=ATLAS_INSTRUMENT,
+                account_id="MT5-1",
+            )
+        assert fake.cancel_count == 0
+
+
+def _live_scope(**over) -> BrokerScope:
+    values = dict(
+        environment="demo", server="MetaQuotes-Demo", login="123456"
+    )
+    values.update(over)
+    return BrokerScope(**values)
+
+
+class TestBrokerScopeBinding:
+    def test_authorization_for_other_login_rejected(self):
+        adapter, fake = _ready()
+        order = _order(cid="SCOPE-LOGIN")
+        authorization = _test_authority(adapter).issue(
+            ExecutionIntent.from_order(order),
+            broker_scope=_live_scope(login="999999"),
+        )
+        with pytest.raises(ExecutionAuthorizationInvalidError):
+            adapter.submit_order(order, authorization=authorization)
+        assert fake.send_count == 0
+
+    def test_authorization_for_other_server_rejected(self):
+        adapter, fake = _ready()
+        order = _order(cid="SCOPE-SERVER")
+        authorization = _test_authority(adapter).issue(
+            ExecutionIntent.from_order(order),
+            broker_scope=_live_scope(server="Other-Server"),
+        )
+        with pytest.raises(ExecutionAuthorizationInvalidError):
+            adapter.submit_order(order, authorization=authorization)
+        assert fake.send_count == 0
+
+    def test_authorization_for_other_environment_rejected(self):
+        adapter, fake = _ready()
+        order = _order(cid="SCOPE-ENV")
+        authorization = _test_authority(adapter).issue(
+            ExecutionIntent.from_order(order),
+            broker_scope=_live_scope(environment="live"),
+        )
+        with pytest.raises(ExecutionAuthorizationInvalidError):
+            adapter.submit_order(order, authorization=authorization)
+        assert fake.send_count == 0
+
+    @pytest.mark.parametrize("field", ["server", "login", "trade_mode"])
+    def test_incomplete_account_identity_fails_closed(self, field):
+        adapter, fake = _ready()
+        setattr(fake.account, field, None)
+        order = _order(cid=f"SCOPE-INCOMPLETE-{field}")
+        authorization = _test_authority(adapter).issue(
+            ExecutionIntent.from_order(order),
+            broker_scope=adapter.expected_execution_scope(),
+        )
+        with pytest.raises(BrokerPermissionError):
+            adapter.submit_order(order, authorization=authorization)
+        assert fake.send_count == 0
+
+    def test_non_demo_trade_mode_rejected(self):
+        adapter, fake = _ready()
+        fake.account.trade_mode = 2  # REAL
+        order = _order(cid="SCOPE-REAL")
+        authorization = _test_authority(adapter).issue(
+            ExecutionIntent.from_order(order),
+            broker_scope=adapter.expected_execution_scope(),
+        )
+        with pytest.raises(BrokerPermissionError):
+            adapter.submit_order(order, authorization=authorization)
+        assert fake.send_count == 0
+
+    def test_account_change_before_late_check_rejected(self):
+        adapter, fake = _ready()
+        order = _order(cid="SCOPE-CHANGE")
+        authorization = _test_authority(adapter).issue(
+            ExecutionIntent.from_order(order),
+            broker_scope=adapter.expected_execution_scope(),
+        )
+        original = fake.order_check
+
+        def order_check(request):
+            fake.account.login = 999999
+            return original(request)
+
+        fake.order_check = order_check
+        with pytest.raises(ExecutionAuthorizationInvalidError):
+            adapter.submit_order(order, authorization=authorization)
+        assert fake.send_count == 0
+
+    def test_cancel_authorization_for_other_login_rejected(self):
+        adapter, fake = _ready()
+        fake.add_open_order(
+            907, magic=adapter._magic_for("SCOPE-CANCEL"),
+            comment=adapter._comment_for("SCOPE-CANCEL"),
+        )
+        adapter._remember("SCOPE-CANCEL", 907)
+        authorization = _test_authority(adapter).issue(
+            ExecutionIntent.for_cancel(
+                op_id="CANCEL:SCOPE-CANCEL",
+                target_client_order_id="SCOPE-CANCEL",
+                instrument=ATLAS_INSTRUMENT,
+                account_id="MT5-1",
+                target_broker_order_id="907",
+            ),
+            broker_scope=_live_scope(login="999999"),
+        )
+        with pytest.raises(ExecutionAuthorizationInvalidError):
+            adapter.cancel_order(
+                "SCOPE-CANCEL",
+                operation_id="CANCEL:SCOPE-CANCEL",
+                instrument=ATLAS_INSTRUMENT,
+                account_id="MT5-1",
+                authorization=authorization,
+            )
+        assert fake.cancel_count == 0
+
+    def test_cancel_rejects_account_change_before_late_check(self):
+        adapter, fake = _ready()
+        fake.add_open_order(
+            908, magic=adapter._magic_for("SCOPE-CANCEL-2"),
+            comment=adapter._comment_for("SCOPE-CANCEL-2"),
+        )
+        adapter._remember("SCOPE-CANCEL-2", 908)
+        authorization = _test_authority(adapter).issue(
+            ExecutionIntent.for_cancel(
+                op_id="CANCEL:SCOPE-CANCEL-2",
+                target_client_order_id="SCOPE-CANCEL-2",
+                instrument=ATLAS_INSTRUMENT,
+                account_id="MT5-1",
+                target_broker_order_id="908",
+            ),
+            broker_scope=adapter.expected_execution_scope(),
+        )
+        fake.account.login = 999999
+        with pytest.raises(ExecutionAuthorizationInvalidError):
+            adapter.cancel_order(
+                "SCOPE-CANCEL-2",
+                operation_id="CANCEL:SCOPE-CANCEL-2",
+                instrument=ATLAS_INSTRUMENT,
+                account_id="MT5-1",
+                authorization=authorization,
+            )
+        assert fake.cancel_count == 0
+
+
+class TestAuthorizationEconomicBinding:
+    def test_small_sell_authorization_cannot_send_large_sell(self):
+        adapter, fake = _ready()
+        authorized = _order(cid="ECO-SMALL", side=OrderSide.SELL, quantity=0.01)
+        authorization = _test_authority(adapter).issue(
+            ExecutionIntent.from_order(authorized),
+            broker_scope=adapter.expected_execution_scope(),
+        )
+        tampered = _order(cid="ECO-SMALL", side=OrderSide.SELL, quantity=1.0)
+        with pytest.raises(ExecutionAuthorizationInvalidError):
+            adapter.submit_order(tampered, authorization=authorization)
+        assert fake.send_count == 0
+
+    def test_sell_authorization_cannot_send_buy(self):
+        adapter, fake = _ready()
+        authorized = _order(cid="ECO-SIDE", side=OrderSide.SELL, quantity=0.01)
+        authorization = _test_authority(adapter).issue(
+            ExecutionIntent.from_order(authorized),
+            broker_scope=adapter.expected_execution_scope(),
+        )
+        tampered = _order(cid="ECO-SIDE", side=OrderSide.BUY, quantity=0.01)
+        with pytest.raises(ExecutionAuthorizationInvalidError):
+            adapter.submit_order(tampered, authorization=authorization)
+        assert fake.send_count == 0
+
+    def test_authorization_cannot_change_limit_or_stop_price(self):
+        adapter, fake = _ready()
+        authorized = _order(cid="ECO-PRICE", limit_price=1.0, stop_price=0.5)
+        authorization = _test_authority(adapter).issue(
+            ExecutionIntent.from_order(authorized),
+            broker_scope=adapter.expected_execution_scope(),
+        )
+        tampered = _order(cid="ECO-PRICE", limit_price=2.0, stop_price=0.5)
+        with pytest.raises(ExecutionAuthorizationInvalidError):
+            adapter.submit_order(tampered, authorization=authorization)
+        assert fake.send_count == 0
+
+    def test_open_with_reduce_only_is_rejected(self):
+        adapter, fake = _ready()
+        order = _order(cid="ECO-OPEN-RO", reduce_only=True)
+        with pytest.raises(BrokerInvalidOrderError):
+            adapter.submit_order(order)
+        assert fake.send_count == 0
+
+    def test_cancel_authorization_bound_to_ticket(self):
+        adapter, fake = _ready()
+        fake.add_open_order(
+            903, magic=adapter._magic_for("CANCEL-T"),
+            comment=adapter._comment_for("CANCEL-T"),
+        )
+        adapter._remember("CANCEL-T", 903)
+        authorization = _test_authority(adapter).issue(
+            ExecutionIntent.for_cancel(
+                op_id="CANCEL:CANCEL-T",
+                target_client_order_id="CANCEL-T",
+                instrument=ATLAS_INSTRUMENT,
+                account_id="MT5-1",
+                target_broker_order_id="999",
+            ),
+            broker_scope=adapter.expected_execution_scope(),
+        )
+        with pytest.raises(ExecutionAuthorizationInvalidError):
+            adapter.cancel_order(
+                "CANCEL-T",
+                operation_id="CANCEL:CANCEL-T",
+                instrument=ATLAS_INSTRUMENT,
+                account_id="MT5-1",
+                authorization=authorization,
+            )
+        assert fake.cancel_count == 0
+
+    def test_foreign_verifier_key_cannot_authorize(self):
+        adapter, fake = _ready()
+        order = _order(cid="ECO-FOREIGN")
+        authorization = ExecutionAuthority().issue(
+            ExecutionIntent.from_order(order),
+            broker_scope=adapter.expected_execution_scope(),
+        )
+        with pytest.raises(ExecutionAuthorizationInvalidError):
+            adapter.submit_order(order, authorization=authorization)
+        assert fake.send_count == 0
+
+    def test_adapter_verifier_exposes_no_signing_capability(self):
+        adapter, _ = _ready()
+        verifier = adapter._execution_authority
+        assert not hasattr(verifier, "issue")
+        assert not hasattr(verifier, "_ExecutionVerifier__authority")
+        assert "private" not in " ".join(verifier.__slots__).lower()
+
+
+class TestAuthorizationConsumptionOrder:
+    def test_failed_order_check_does_not_consume_authorization(self):
+        adapter, fake = _ready()
+        fake.check_retcode = 10014
+        order = _order(cid="ORD-CHECK")
+        authorization = _test_authority(adapter).issue(
+            ExecutionIntent.from_order(order),
+            broker_scope=adapter.expected_execution_scope(),
+        )
+        result = adapter.submit_order(order, authorization=authorization)
+        assert result.status is SubmitStatus.REJECTED
+        assert adapter._execution_authority.consumed_count == 0
+        assert fake.send_count == 0
+
+    def test_failed_ticket_resolution_does_not_consume_cancel_authorization(self):
+        adapter, fake = _ready()
+        authorization = _test_authority(adapter).issue(
+            ExecutionIntent.for_cancel(
+                op_id="CANCEL:NOPE",
+                target_client_order_id="NOPE",
+                instrument=ATLAS_INSTRUMENT,
+                account_id="MT5-1",
+                target_broker_order_id="999",
+            ),
+            broker_scope=adapter.expected_execution_scope(),
+        )
+        with pytest.raises(OrderNotFoundError):
+            adapter.cancel_order(
+                "NOPE",
+                operation_id="CANCEL:NOPE",
+                instrument=ATLAS_INSTRUMENT,
+                account_id="MT5-1",
+                authorization=authorization,
+            )
+        assert adapter._execution_authority.consumed_count == 0
+        assert fake.cancel_count == 0
+
+    def test_authorization_is_consumed_before_order_send(self):
+        adapter, fake = _ready()
+        seen: dict[str, int] = {}
+        original = fake.order_send
+
+        def order_send(request):
+            seen["consumed"] = adapter._execution_authority.consumed_count
+            return original(request)
+
+        fake.order_send = order_send
+        _submit(adapter, _order(cid="ORD-ORDER"))
+        assert seen["consumed"] == 1
+        assert fake.send_count == 1
+
+    def test_nonce_lock_is_released_before_order_send(self):
+        import threading
+
+        adapter, fake = _ready()
+        authority = _test_authority(adapter)
+        original = fake.order_send
+
+        def order_send(request):
+            done = threading.Event()
+
+            def consume_other():
+                other_order = _order(cid="ORD-LOCK-OTHER")
+                other_intent = ExecutionIntent.from_order(other_order)
+                other_auth = authority.issue(
+                    other_intent,
+                    broker_scope=adapter.expected_execution_scope(),
+                )
+                adapter._execution_authority.consume(
+                    other_auth,
+                    intent=other_intent,
+                    broker_scope=adapter.expected_execution_scope(),
+                )
+                done.set()
+
+            worker = threading.Thread(target=consume_other)
+            worker.start()
+            worker.join(timeout=2.0)
+            assert done.is_set()
+            return original(request)
+
+        fake.order_send = order_send
+        _submit(adapter, _order(cid="ORD-LOCK"))
+        assert fake.send_count == 1
+
+    def test_concurrent_adapter_submit_uses_authorization_once(self):
+        import threading
+
+        class _BarrierFake(FakeMT5):
+            def __init__(self):
+                super().__init__()
+                self.barrier = threading.Barrier(2)
+
+            def order_check(self, request):
+                self.barrier.wait(timeout=5)
+                return super().order_check(request)
+
+        fake = _BarrierFake()
+        adapter, fake = _adapter(fake)
+        _bind_test_gate(adapter)
+        adapter.connect()
+        order = _order(cid="ORD-CONC")
+        authorization = _test_authority(adapter).issue(
+            ExecutionIntent.from_order(order),
+            broker_scope=adapter.expected_execution_scope(),
+        )
+        results: list[str] = []
+        lock = threading.Lock()
+
+        def attempt():
+            try:
+                adapter.submit_order(order, authorization=authorization)
+                outcome = "ok"
+            except ExecutionAuthorizationReusedError:
+                outcome = "reused"
+            with lock:
+                results.append(outcome)
+
+        threads = [threading.Thread(target=attempt) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        assert results.count("ok") == 1
+        assert results.count("reused") == 1
+        assert fake.send_count == 1
 
 
 class TestSymbolVolumeMetadata:
@@ -1011,13 +1697,13 @@ class TestSubmit:
     def test_order_check_rejection_no_send(self):
         adapter, fake = _ready()
         fake.check_retcode = 10013
-        sub = adapter.submit_order(_order())
+        sub = _submit(adapter, _order())
         assert sub.status is SubmitStatus.REJECTED
         assert fake.send_count == 0  # nunca llego a order_send
 
     def test_submit_confirmed_with_fill(self):
         adapter, fake = _ready()
-        sub = adapter.submit_order(_order(cid="C-OK"))
+        sub = _submit(adapter, _order(cid="C-OK"))
         assert sub.status is SubmitStatus.CONFIRMED
         assert sub.broker_order is not None
         assert sub.broker_order.state is BrokerOrderState.FILLED
@@ -1027,38 +1713,38 @@ class TestSubmit:
     def test_send_rejection(self):
         adapter, fake = _ready()
         fake.send_mode = "reject"
-        sub = adapter.submit_order(_order())
+        sub = _submit(adapter, _order())
         assert sub.status is SubmitStatus.REJECTED
 
     def test_send_none_is_unknown(self):
         adapter, fake = _ready()
         fake.send_mode = "none"
-        sub = adapter.submit_order(_order())
+        sub = _submit(adapter, _order())
         assert sub.status is SubmitStatus.UNKNOWN
         assert sub.broker_order is None
 
     def test_send_raises_is_unknown(self):
         adapter, fake = _ready()
         fake.send_mode = "raise"
-        sub = adapter.submit_order(_order())
+        sub = _submit(adapter, _order())
         assert sub.status is SubmitStatus.UNKNOWN
 
     def test_ambiguous_retcode_is_unknown(self):
         adapter, fake = _ready()
         fake.send_mode = "ambiguous"
-        sub = adapter.submit_order(_order())
+        sub = _submit(adapter, _order())
         assert sub.status is SubmitStatus.UNKNOWN
 
     def test_unsupported_order_type_no_submit(self):
         adapter, fake = _ready()
         with pytest.raises(BrokerInvalidOrderError):
-            adapter.submit_order(_order(order_type=OrderType.LIMIT))
+            _submit(adapter, _order(order_type=OrderType.LIMIT))
         assert fake.send_count == 0
 
     def test_volume_below_min_rejected(self):
         adapter, fake = _ready()
         with pytest.raises(BrokerInvalidOrderError):
-            adapter.submit_order(_order(quantity=0.001))
+            _submit(adapter, _order(quantity=0.001))
         assert fake.send_count == 0
 
     @pytest.mark.parametrize(
@@ -1076,18 +1762,18 @@ class TestSubmit:
         adapter, fake = _ready()
         fake.symbols[MT5_SYMBOL].volume_max = 0.10
         with pytest.raises(BrokerInvalidOrderError):
-            adapter.submit_order(_order(quantity=0.11))
+            _submit(adapter, _order(quantity=0.11))
         assert fake.send_count == 0
 
     def test_volume_not_aligned_rejected(self):
         adapter, fake = _ready()
         with pytest.raises(BrokerInvalidOrderError):
-            adapter.submit_order(_order(quantity=0.015))  # step 0.01
+            _submit(adapter, _order(quantity=0.015))  # step 0.01
         assert fake.send_count == 0
 
     def test_no_silent_quantity_mutation(self):
         adapter, fake = _ready()
-        adapter.submit_order(_order(quantity=0.10))
+        _submit(adapter, _order(quantity=0.10))
         assert fake.last_request["volume"] == pytest.approx(0.10)
 
     def test_intent_journal_write_ahead_before_submit(self, tmp_path):
@@ -1103,7 +1789,7 @@ class TestSubmit:
         fake.order_send = spy
         order = _order(cid="CID-WA")
         journal.begin(OrderIntent.from_order(order))
-        adapter.submit_order(order)
+        _submit(adapter, order)
         assert seen and seen[0] is not None
 
 
@@ -1115,14 +1801,14 @@ class TestSubmit:
 class TestCorrelationLookup:
     def test_cid_to_ticket_stable(self):
         adapter, fake = _ready()
-        sub = adapter.submit_order(_order(cid="C-CORR"))
+        sub = _submit(adapter, _order(cid="C-CORR"))
         ticket = int(sub.broker_order.broker_order_id)
         assert adapter._cid_to_ticket["C-CORR"] == ticket
         assert adapter.get_order("C-CORR").broker_order_id == str(ticket)
 
     def test_lookup_found(self):
         adapter, _ = _ready()
-        adapter.submit_order(_order(cid="C-FOUND"))
+        _submit(adapter, _order(cid="C-FOUND"))
         order = adapter.get_order("C-FOUND")
         assert order is not None
         assert order.state is BrokerOrderState.FILLED
@@ -1154,7 +1840,7 @@ class TestCorrelationLookup:
     def test_lookup_after_unknown_response(self):
         adapter, fake = _ready()
         fake.accept_but_lose_response = True
-        sub = adapter.submit_order(_order(cid="C-LOST"))
+        sub = _submit(adapter, _order(cid="C-LOST"))
         assert sub.status is SubmitStatus.UNKNOWN
         resolved = adapter.get_order("C-LOST")
         assert resolved is not None
@@ -1309,8 +1995,9 @@ class TestOrderSymbolConsumerRegression:
     # ---- fallo POST-SEND (efecto externo ya ocurrido) --------------------
     def test_submit_post_send_unmapped_returns_unknown_no_order(self):
         adapter, fake = _adapter(_UnmappedSymbolAfterSend())
+        _bind_test_gate(adapter)
         adapter.connect()
-        sub = adapter.submit_order(_order(cid="S-UNMAP"))
+        sub = _submit(adapter, _order(cid="S-UNMAP"))
         assert sub.status is SubmitStatus.UNKNOWN
         assert sub.broker_order is None
         assert fake.send_count == 1  # order_send SI ocurrio (efecto externo)
@@ -1322,8 +2009,9 @@ class TestOrderSymbolConsumerRegression:
             401, symbol=_UNMAPPED_MT5_SYMBOL,
             magic=adapter._magic_for(cid), comment=adapter._comment_for(cid),
         )
+        adapter._remember(cid, 401)
         with pytest.raises(BrokerConnectionError):
-            adapter.cancel_order(cid)
+            _cancel(adapter, cid, operation_id=f"CANCEL:{cid}")
         # La cancelacion SI se ejecuto en el broker antes del fallo de resolucion.
         assert fake._orders[401].state == ORDER_STATE_CANCELED
 
@@ -1336,7 +2024,7 @@ class TestOrderSymbolConsumerRegression:
 class TestFills:
     def test_single_deal(self):
         adapter, _ = _ready()
-        adapter.submit_order(_order(cid="F1"))
+        _submit(adapter, _order(cid="F1"))
         order = adapter.get_order("F1")
         assert len(order.fills) == 1
         assert order.fills[0].quantity == pytest.approx(0.1)
@@ -1375,7 +2063,7 @@ class TestFills:
 
     def test_duplicate_poll_no_duplication(self):
         adapter, _ = _ready()
-        adapter.submit_order(_order(cid="F4"))
+        _submit(adapter, _order(cid="F4"))
         a = adapter.get_order("F4").fills
         b = adapter.get_order("F4").fills
         assert [f.fill_sequence for f in a] == [f.fill_sequence for f in b]
@@ -1562,7 +2250,7 @@ class TestCancel:
         magic = adapter._magic_for("CAN-1")
         fake.add_open_order(90, magic=magic, comment=adapter._comment_for("CAN-1"))
         adapter._remember("CAN-1", 90)
-        cancelled = adapter.cancel_order("CAN-1")
+        cancelled = _cancel(adapter, "CAN-1", operation_id="CANCEL:CAN-1")
         assert cancelled.state is BrokerOrderState.CANCELLED
 
     def test_cancel_rejected(self):
@@ -1571,7 +2259,7 @@ class TestCancel:
         adapter._remember("CAN-2", 91)
         fake.remove_mode = "reject"
         with pytest.raises(OrderRejectedError):
-            adapter.cancel_order("CAN-2")
+            _cancel(adapter, "CAN-2", operation_id="CANCEL:CAN-2")
 
     def test_cancel_uncertain(self):
         adapter, fake = _ready()
@@ -1579,12 +2267,12 @@ class TestCancel:
         adapter._remember("CAN-3", 92)
         fake.remove_mode = "none"
         with pytest.raises(BrokerConnectionError):
-            adapter.cancel_order("CAN-3")
+            _cancel(adapter, "CAN-3", operation_id="CANCEL:CAN-3")
 
     def test_cancel_not_found(self):
         adapter, _ = _ready()
         with pytest.raises(OrderNotFoundError):
-            adapter.cancel_order("NO-EXISTE")
+            _cancel(adapter, "NO-EXISTE", operation_id="CANCEL:NO-EXISTE")
 
 
 # --------------------------------------------------------------------------
@@ -1596,13 +2284,13 @@ class TestSafetyReconciliation:
     def test_submit_before_ready_raises(self):
         adapter, fake = _adapter()
         with pytest.raises(BrokerConnectionError):
-            adapter.submit_order(_order())
+            _submit(adapter, _order())
         assert fake.send_count == 0
 
     def test_unknown_then_no_automatic_resubmit(self):
         adapter, fake = _ready()
         fake.accept_but_lose_response = True
-        adapter.submit_order(_order(cid="S-1"))
+        _submit(adapter, _order(cid="S-1"))
         adapter.get_order("S-1")
         assert fake.send_count == 1
 
@@ -1660,7 +2348,7 @@ class TestReadinessCapacity:
         with pytest.raises(BrokerPermissionError):
             adapter.connect()
         with pytest.raises(BrokerConnectionError):
-            adapter.submit_order(_order())
+            _submit(adapter, _order())
         assert fake.send_count == 0
 
 
@@ -1668,8 +2356,8 @@ class TestReduceOnly:
     def test_long_position_reduce_only_sell_request(self):
         adapter, fake = _ready()
         fake.add_position(80, symbol=MT5_SYMBOL, volume=1.0, type=ORDER_TYPE_BUY)
-        sub = adapter.submit_order(
-            _order(cid="R-LONG", side=OrderSide.SELL, quantity=1.0, reduce_only=True)
+        sub = _submit(adapter,
+            _order(cid="R-LONG", side=OrderSide.SELL, quantity=1.0, reduce_only=True, purpose=PURPOSE_REDUCE)
         )
         assert sub.status is SubmitStatus.CONFIRMED
         assert fake.last_request["type"] == ORDER_TYPE_SELL
@@ -1679,8 +2367,8 @@ class TestReduceOnly:
     def test_short_position_reduce_only_buy_request(self):
         adapter, fake = _ready()
         fake.add_position(81, symbol=MT5_SYMBOL, volume=2.0, type=ORDER_TYPE_SELL)
-        sub = adapter.submit_order(
-            _order(cid="R-SHORT", side=OrderSide.BUY, quantity=2.0, reduce_only=True)
+        sub = _submit(adapter,
+            _order(cid="R-SHORT", side=OrderSide.BUY, quantity=2.0, reduce_only=True, purpose=PURPOSE_REDUCE)
         )
         assert sub.status is SubmitStatus.CONFIRMED
         assert fake.last_request["type"] == ORDER_TYPE_BUY
@@ -1689,8 +2377,8 @@ class TestReduceOnly:
     def test_reduce_only_without_position_rejected_no_send(self):
         adapter, fake = _ready()
         with pytest.raises(BrokerInvalidOrderError):
-            adapter.submit_order(
-                _order(side=OrderSide.SELL, quantity=1.0, reduce_only=True)
+            _submit(adapter,
+                _order(side=OrderSide.SELL, quantity=1.0, reduce_only=True, purpose=PURPOSE_REDUCE)
             )
         assert fake.send_count == 0
 
@@ -1698,8 +2386,8 @@ class TestReduceOnly:
         adapter, fake = _ready()
         fake.add_position(82, symbol=MT5_SYMBOL, volume=1.0, type=ORDER_TYPE_BUY)
         with pytest.raises(BrokerInvalidOrderError):
-            adapter.submit_order(
-                _order(side=OrderSide.SELL, quantity=2.0, reduce_only=True)
+            _submit(adapter,
+                _order(side=OrderSide.SELL, quantity=2.0, reduce_only=True, purpose=PURPOSE_REDUCE)
             )
         assert fake.send_count == 0
 
@@ -1708,8 +2396,8 @@ class TestReduceOnly:
         fake.add_position(83, symbol=MT5_SYMBOL, volume=1.0, type=ORDER_TYPE_BUY)
         # BUY (mismo sentido) reduce_only => intentaria invertir/abrir.
         with pytest.raises(BrokerInvalidOrderError):
-            adapter.submit_order(
-                _order(side=OrderSide.BUY, quantity=1.0, reduce_only=True)
+            _submit(adapter,
+                _order(side=OrderSide.BUY, quantity=1.0, reduce_only=True, purpose=PURPOSE_REDUCE)
             )
         assert fake.send_count == 0
 
@@ -1718,14 +2406,14 @@ class TestReduceOnly:
         fake.account.margin_mode = 2  # RETAIL_HEDGING
         fake.add_position(84, symbol=MT5_SYMBOL, volume=1.0, type=ORDER_TYPE_BUY)
         with pytest.raises(BrokerPermissionError):
-            adapter.submit_order(
-                _order(side=OrderSide.SELL, quantity=1.0, reduce_only=True)
+            _submit(adapter,
+                _order(side=OrderSide.SELL, quantity=1.0, reduce_only=True, purpose=PURPOSE_REDUCE)
             )
         assert fake.send_count == 0
 
     def test_normal_entry_has_no_position_field(self):
         adapter, fake = _ready()
-        adapter.submit_order(_order(cid="R-ENTRY"))
+        _submit(adapter, _order(cid="R-ENTRY"))
         assert "position" not in fake.last_request
         assert fake.last_request["type"] == ORDER_TYPE_BUY
 
@@ -1733,14 +2421,14 @@ class TestReduceOnly:
 class TestOrderResultMapping:
     def test_done_confirmed_filled(self):
         adapter, fake = _ready()
-        sub = adapter.submit_order(_order(cid="M-DONE"))
+        sub = _submit(adapter, _order(cid="M-DONE"))
         assert sub.status is SubmitStatus.CONFIRMED
         assert sub.broker_order.state is BrokerOrderState.FILLED
 
     def test_placed_confirmed_submitted_no_fill(self):
         adapter, fake = _ready()
         fake.send_mode = "placed"
-        sub = adapter.submit_order(_order(cid="M-PLACED"))
+        sub = _submit(adapter, _order(cid="M-PLACED"))
         assert sub.status is SubmitStatus.CONFIRMED
         assert sub.broker_order.state is BrokerOrderState.SUBMITTED
         assert sub.broker_order.fills == ()
@@ -1748,7 +2436,7 @@ class TestOrderResultMapping:
     def test_done_partial_confirmed_partially_filled(self):
         adapter, fake = _ready()
         fake.send_mode = "partial"
-        sub = adapter.submit_order(_order(cid="M-PARTIAL", quantity=1.0))
+        sub = _submit(adapter, _order(cid="M-PARTIAL", quantity=1.0))
         assert sub.status is SubmitStatus.CONFIRMED
         assert sub.broker_order.state is BrokerOrderState.PARTIALLY_FILLED
         assert len(sub.broker_order.fills) >= 1
@@ -1756,13 +2444,13 @@ class TestOrderResultMapping:
     def test_timeout_unknown(self):
         adapter, fake = _ready()
         fake.send_mode = "timeout"
-        sub = adapter.submit_order(_order(cid="M-TIMEOUT"))
+        sub = _submit(adapter, _order(cid="M-TIMEOUT"))
         assert sub.status is SubmitStatus.UNKNOWN
 
     def test_connection_unknown(self):
         adapter, fake = _ready()
         fake.send_mode = "ambiguous"  # retcode 10031 CONNECTION
-        sub = adapter.submit_order(_order(cid="M-CONN"))
+        sub = _submit(adapter, _order(cid="M-CONN"))
         assert sub.status is SubmitStatus.UNKNOWN
 
 
@@ -1771,20 +2459,20 @@ class TestOrderCheck:
         adapter, fake = _ready()
         fake.order_check = lambda request: None
         with pytest.raises(BrokerConnectionError):
-            adapter.submit_order(_order(cid="K-NONE"))
+            _submit(adapter, _order(cid="K-NONE"))
         assert fake.send_count == 0
 
     def test_order_check_nonzero_rejected_no_send(self):
         adapter, fake = _ready()
         fake.check_retcode = 10014  # invalid volume
-        sub = adapter.submit_order(_order(cid="K-REJ"))
+        sub = _submit(adapter, _order(cid="K-REJ"))
         assert sub.status is SubmitStatus.REJECTED
         assert fake.send_count == 0
 
     def test_order_check_zero_proceeds_to_send(self):
         adapter, fake = _ready()
         fake.check_retcode = 0
-        sub = adapter.submit_order(_order(cid="K-OK"))
+        sub = _submit(adapter, _order(cid="K-OK"))
         assert sub.status is SubmitStatus.CONFIRMED
         assert fake.send_count == 1
 
@@ -1809,7 +2497,7 @@ class TestPaperDefaultUnchanged:
 class TestOrderHistoryLookup:
     def test_history_complete(self):
         adapter, _ = _ready()
-        adapter.submit_order(_order(cid="H-OK"))
+        _submit(adapter, _order(cid="H-OK"))
         result = adapter.lookup_order_history("H-OK")
         assert result.status == HISTORY_COMPLETE
         assert result.order is not None
@@ -1862,7 +2550,7 @@ class TestOrderHistoryLookup:
 
     def test_deals_none_for_filled_is_incomplete(self):
         adapter, fake = _ready()
-        adapter.submit_order(_order(cid="D-NONE"))  # FILLED con 1 deal
+        _submit(adapter, _order(cid="D-NONE"))  # FILLED con 1 deal
         fake.none_history_deals_get = True
         result = adapter.lookup_order_history("D-NONE")
         assert result.status == HISTORY_INCOMPLETE
@@ -1897,7 +2585,7 @@ class TestOrderHistoryLookup:
         # _deals_for DEBE invocar history_deals_get(ticket=...) (firma real) y
         # recuperar los deals de la orden.
         adapter, fake = _ready()
-        adapter.submit_order(_order(cid="DK-1"))
+        _submit(adapter, _order(cid="DK-1"))
         fake.last_deals_kwargs = None
         order = adapter.get_order("DK-1")
         assert len(order.fills) == 1
@@ -1924,9 +2612,10 @@ class TestCancelAckNoInference:
             990, symbol=MT5_SYMBOL, magic=0, comment=""
         )
         adapter, fake = _adapter(fake)
+        _bind_test_gate(adapter)
         adapter.connect()
         adapter._remember("CANCEL-ACK-ACTIVE", 990)
-        result = adapter.cancel_order("CANCEL-ACK-ACTIVE")
+        result = _cancel(adapter, "CANCEL-ACK-ACTIVE", operation_id="CANCEL:CANCEL-ACK-ACTIVE")
         assert result.state is BrokerOrderState.SUBMITTED
         assert fake._open_orders[990].state == ORDER_STATE_PLACED
 

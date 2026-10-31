@@ -11,7 +11,7 @@ Todos los casos son deterministas (sin look-ahead; solo barras cerradas).
 
 from __future__ import annotations
 
-from pathlib import Path
+import csv
 
 import pytest
 
@@ -35,6 +35,32 @@ def make_bars():
         {"ts": "3000", "open": 107.0, "high": 112.0, "low": 103.0, "close": 105.0},
         {"ts": "4000", "open": 104.0, "high": 104.5, "low": 90.0, "close": 92.0},
     ]
+
+
+def _write_synthetic_side_csv(path) -> None:
+    """Dataset OHLC determinista, sin depender de `experiments/data/*.csv`.
+
+    Produce al menos un trade LONG y uno SHORT con la configuracion de
+    `TestSideAggregation` (RandomEntryParams seed=7).
+    """
+    bars = [
+        {"ts": "1000", "open": 100.0, "high": 101.0, "low": 99.0, "close": 100.5},
+        {"ts": "2000", "open": 100.5, "high": 103.0, "low": 100.0, "close": 102.5},
+        {"ts": "3000", "open": 102.5, "high": 104.0, "low": 101.0, "close": 103.5},
+        {"ts": "4000", "open": 103.5, "high": 104.5, "low": 100.0, "close": 101.0},
+        {"ts": "5000", "open": 101.0, "high": 102.0, "low": 98.0, "close": 99.0},
+        {"ts": "6000", "open": 99.0, "high": 99.5, "low": 96.0, "close": 97.0},
+        {"ts": "7000", "open": 97.0, "high": 98.0, "low": 94.0, "close": 95.0},
+        {"ts": "8000", "open": 95.0, "high": 97.0, "low": 93.0, "close": 96.0},
+        {"ts": "9000", "open": 96.0, "high": 99.0, "low": 95.0, "close": 98.0},
+        {"ts": "10000", "open": 98.0, "high": 101.0, "low": 97.0, "close": 100.0},
+    ]
+    with path.open("w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(
+            fh, fieldnames=["ts", "open", "high", "low", "close"]
+        )
+        writer.writeheader()
+        writer.writerows(bars)
 
 
 def make_engine(
@@ -144,7 +170,7 @@ class TestTradeRecord:
 
 
 class TestSideAggregation:
-    def _run_random(self) -> dict:
+    def _run_random(self, tmp_path) -> dict:
         cfg = {
             "experiment": {"environment": "BACKTEST"},
             "strategy": {
@@ -169,17 +195,20 @@ class TestSideAggregation:
                 "account_id": "T", "point_value": 1.0,
                 "min_size": 0.001, "max_bars_in_trade": 3,
             },
-            "dataset": {"path": "unused", "n_bars": 5, "seed": 7},
+            "dataset": {"path": "unused", "n_bars": 10, "seed": 7},
         }
-        csv = Path(__file__).resolve().parents[1] / "experiments" / "data" / "sample_1h.csv"
-        return run_experiment(cfg, csv)
+        data_path = tmp_path / "synthetic_1h.csv"
+        _write_synthetic_side_csv(data_path)
+        return run_experiment(cfg, data_path)
 
-    def test_sides_long_short(self) -> None:
-        report = self._run_random()
+    def test_sides_long_short(self, tmp_path) -> None:
+        report = self._run_random(tmp_path)
         sides = report["sides"]
         lo = sides["LONG"]
         sh = sides["SHORT"]
         assert isinstance(lo["trades"], int) and isinstance(sh["trades"], int)
+        assert lo["trades"] > 0
+        assert sh["trades"] > 0
         assert lo["trades"] + sh["trades"] == report["trades_breakdown"]["total"]
 
         sig = report["signals"]

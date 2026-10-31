@@ -74,7 +74,9 @@ class StreamHeartbeat(StreamEvent):
     kind: ClassVar[StreamEventKind] = StreamEventKind.HEARTBEAT
 
     def __post_init__(self) -> None:
-        super().__post_init__()
+        # ORDER-CI: llamada explicita a la base. `super()` de cero argumentos
+        # falla en Python 3.12 cuando la dataclass base se recrea con slots=True.
+        StreamEvent.__post_init__(self)
         if self.server_time is not None:
             ensure_utc(self.server_time)
 

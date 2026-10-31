@@ -93,6 +93,22 @@ def test_server_time_si_presente_debe_ser_utc() -> None:
     assert hb.server_time is None
 
 
+def test_heartbeat_valido_y_validaciones_heredadas() -> None:
+    now = utc_now()
+    hb = StreamHeartbeat(received_at=now, server_time=now)
+    assert hb.received_at is now
+    assert hb.server_time is now
+
+    with pytest.raises(ValueError):
+        StreamHeartbeat(
+            received_at=datetime(2026, 9, 1), server_time=None
+        )
+    with pytest.raises(ValueError):
+        StreamHeartbeat(
+            received_at=now, server_time=datetime(2026, 9, 1)
+        )
+
+
 def test_ensure_utc_devuelve_el_mismo_instante() -> None:
     now = utc_now()
     assert ensure_utc(now) is now

@@ -23,6 +23,7 @@ Principios que fija este contrato (06_EXECUTION_OPERATION.md):
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from typing import Any
 
 from execution.order import Order
 
@@ -50,8 +51,15 @@ class BrokerAdapter(ABC):
         """True si el broker responde (conexión viva y autenticada)."""
 
     @abstractmethod
-    def submit_order(self, order: Order) -> OrderSubmission:
+    def submit_order(
+        self, order: Order, *, authorization: Any = None
+    ) -> OrderSubmission:
         """Envía una orden y devuelve su disposición.
+
+        `authorization` es opcional en el contrato genérico. Los adapters que
+        exigen una autorización de ejecución de un solo uso (MT5) la validan y
+        consumen de forma atómica antes del envío. Un adapter que no la soporta
+        debe rechazarla explícitamente, nunca ignorarla en silencio.
 
         Contrato de fase (ORDER-07B): una implementación que ya invocó
         `order_send`/el transporte de envío NUNCA debe propagar una excepción
@@ -70,7 +78,15 @@ class BrokerAdapter(ABC):
         """
 
     @abstractmethod
-    def cancel_order(self, client_order_id: str) -> BrokerOrder:
+    def cancel_order(
+        self,
+        client_order_id: str,
+        *,
+        operation_id: str | None = None,
+        instrument: str | None = None,
+        account_id: str | None = None,
+        authorization: Any = None,
+    ) -> BrokerOrder:
         """Cancela una orden pendiente. Raises OrderNotFoundError si no
         existe; OrderRejectedError si ya no se puede cancelar (p. ej. llena).
 

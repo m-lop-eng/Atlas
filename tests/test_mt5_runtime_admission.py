@@ -22,6 +22,10 @@ from tests.test_mt5_execution_foundation import (
     _spec,
 )
 
+import uuid
+
+from execution.execution_authority import BrokerScope
+from execution.execution_instance_lock import ExecutionInstanceLock
 from execution.intent_journal import IntentJournal, OrderIntent
 from execution.ledger_applier import CommissionPolicy, LedgerApplier
 from execution.ledger_store import LedgerStore
@@ -103,9 +107,21 @@ class _FakeBroker:
         self._account_id = account_id
         self._positions: tuple = ()
         self._execution_gate = None
+        self._execution_authority = None
 
     def bind_execution_gate(self, gate) -> None:
         self._execution_gate = gate
+
+    def bind_execution_authority(self, verifier) -> None:
+        self._execution_authority = verifier
+
+    def expected_execution_scope(self) -> BrokerScope:
+        environment = getattr(self.environment, "value", self.environment)
+        return BrokerScope(
+            environment=str(environment),
+            server=str(self._server),
+            login=str(self._login),
+        )
 
     def remember_identity(self, client_order_id, broker_order_id) -> None:
         return None
@@ -206,14 +222,21 @@ def _make_runtime(
     account_mode=0,
     kill_switch=None,
     allow_hedging=False,
+    broker_scope=None,
 ):
     journal = IntentJournal.initialize(tmp_path / "j.json")
     ledger = AccountLedger(initial_cash=10_000.0, account_currency="USD")
     ledger.register_instrument(_spec())
+    scope = broker.expected_execution_scope()
+    lock = ExecutionInstanceLock.for_scope(
+        scope, lock_dir=tmp_path / f"locks-{uuid.uuid4().hex}"
+    )
+    lock.acquire()
     rt = LiveExecutionRuntime(
         broker=broker,
         order_manager=OrderManager(),
         journal=journal,
+        instance_lock=lock,
         ledger=ledger,
         ledger_store=LedgerStore(tmp_path / "ledger.json"),
         sessions=FakeSessions(),
@@ -235,6 +258,7 @@ def _make_runtime(
         run_id="ADM",
         mt5_accounting=admission,
         allow_restricted_hedging=allow_hedging,
+        broker_scope=broker_scope,
     )
     return rt, ledger, journal
 
@@ -257,6 +281,14 @@ class TestRequiredGate:
         rt, _, _ = _make_runtime(tmp_path, broker=_GenericBroker(), admission=None)
         rep = rt.initialize()
         assert rep.ready is True and rep.stage == "ready"
+
+    def test_injected_broker_scope_mismatch_blocks(self, tmp_path):
+        with pytest.raises(ValueError):
+            _make_runtime(
+                tmp_path,
+                broker=_FakeBroker(),
+                broker_scope=BrokerScope("demo", "OTHER-SERVER", "1"),
+            )
 
 
 # --------------------------------------------------------------------------

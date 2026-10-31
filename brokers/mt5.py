@@ -45,15 +45,18 @@ from enum import Enum
 from typing import Any, Callable, Mapping
 
 from execution.instrument import AssetClass, InstrumentSpec, InstrumentSpecError
-from execution.intent_journal import (
-    OPERATION_CANCEL,
-    OPERATION_CLOSE,
-    OPERATION_REDUCE,
+from execution.execution_authority import (
+    BrokerScope,
+    ExecutionIntent,
+    ExecutionIntentError,
+    ExecutionVerifier,
 )
+from execution.execution_instance_lock import (
+    ExecutionInstanceLock,
+    execution_resource_key,
+)
+from execution.intent_journal import OPERATION_CANCEL, OPERATION_OPEN
 from execution.order import (
-    PURPOSE_CLOSE,
-    PURPOSE_OPEN,
-    PURPOSE_REDUCE,
     Order,
     OrderSide,
     OrderType,
@@ -99,6 +102,9 @@ ORDER_FILLING_RETURN = 2
 SYMBOL_TRADE_MODE_FULL = 4
 ACCOUNT_MARGIN_MODE_RETAIL_NETTING = 0
 ACCOUNT_MARGIN_MODE_RETAIL_HEDGING = 2
+ACCOUNT_TRADE_MODE_DEMO = 0
+ACCOUNT_TRADE_MODE_CONTEST = 1
+ACCOUNT_TRADE_MODE_REAL = 2
 
 ORDER_STATE_PLACED = 1
 ORDER_STATE_PARTIAL = 2
@@ -861,11 +867,16 @@ class MT5BrokerAdapter(BrokerAdapter):
         self._cid_to_ticket: dict[str, int] = {}
         self._ticket_to_cid: dict[int, str] = {}
         self._specs: dict[str, MT5SymbolSpec] = {}
-        # MT5-DEMO-EXECUTION-FOUNDATION-01: gate de capacidad OPCIONAL. Si se
-        # enlaza (`bind_execution_gate`), `submit_order` exige que el gate
-        # conozca el `client_order_id` (lo aprueba SOLO el coordinador de
-        # ejecucion). Sin gate (default) el comportamiento LIVE-09 es intacto.
+        # ORDER-09C: gate de capacidad OBLIGATORIO para submit/cancel. La
+        # ejecucion plenamente protegida pasa por LiveExecutionCoordinator/
+        # LiveExecutionRuntime; el adaptador no opera sin una autoridad enlazada.
         self._execution_gate = None
+        # ORDER-09D: verificador de autorizaciones firmadas de un solo uso. El
+        # coordinador enlaza aqui su `ExecutionVerifier`; sin el NO se envia.
+        self._execution_authority = None
+        # ORDER-09E: capacidad de lock inter-proceso. Sin un lock real y activo
+        # para el mismo BrokerScope no se ejecuta ninguna orden.
+        self._execution_lock = None
         # 06E: UN solo resolver validado (rechaza mappings no inyectivos). El
         # diccionario inverso se DERIVA de el, evitando dos algoritmos inversos.
         self._symbol_resolver = MT5SymbolResolver.from_mapping(config.symbol_map)
@@ -983,25 +994,28 @@ class MT5BrokerAdapter(BrokerAdapter):
         accidental:
 
           * `None` se rechaza: no existe "desenlazar" por API publica.
-          * un objeto sin `check(client_order_id)` llamable se rechaza.
+          * se exigen `check(client_order_id)` y
+            `check_operation(operation, op_id, target)` llamables.
           * si YA hay un gate enlazado, un segundo enlace falla SIN reemplazarlo
             (una llamada fallida nunca muta el estado).
 
-        Sin gate enlazado el comportamiento LIVE-09 es intacto (compatibilidad
-        heredada); ese modo NO esta autorizado para la ruta coordinada y no debe
-        activarse desde un runner de ejecucion. Con gate, `submit_order` rechaza
-        cualquier `client_order_id` que el coordinador (poseedor del token) no
-        haya aprobado; no cambia la semantica de submit.
+        ORDER-09C: `submit_order` y `cancel_order` rechazan fail-closed si no
+        existe gate. La ruta plenamente protegida es el coordinador/runtime; un
+        gate arbitrario no demuestra por si solo que se aplicaron journal, riesgo
+        o recovery.
         """
         if gate is None:
             raise BrokerError(
                 "bind_execution_gate rechaza None: no se puede desenlazar el "
                 "gate por API publica (fail-closed)"
             )
-        if not callable(getattr(gate, "check", None)):
+        if not callable(getattr(gate, "check", None)) or not callable(
+            getattr(gate, "check_operation", None)
+        ):
             raise BrokerError(
-                "bind_execution_gate exige un gate con check(client_order_id) "
-                "llamable (interfaz de comprobacion esperada)"
+                "bind_execution_gate exige un gate con check(client_order_id) y "
+                "check_operation(operation, op_id, target) llamables (interfaz "
+                "de comprobacion completa)"
             )
         if self._execution_gate is not None:
             raise BrokerError(
@@ -1009,6 +1023,84 @@ class MT5BrokerAdapter(BrokerAdapter):
                 "asignacion (no se sustituye)"
             )
         self._execution_gate = gate
+
+    def bind_execution_authority(self, verifier) -> None:
+        """Enlaza (una sola vez) el verificador de autorizaciones de ejecucion.
+
+        ORDER-09D: `submit_order`/`cancel_order` exigen ademas una
+        `ExecutionAuthorization` firmada por el coordinador, consumida de forma
+        atomica antes de tocar el broker. El adapter solo acepta un
+        `ExecutionVerifier` real (no un objeto duck-typed): un verificador
+        permisivo fabricado por un consumidor no puede sustituir a la autoridad.
+
+        Igual que el gate, el enlace es de una sola asignacion: `None` o un
+        segundo enlace fallan SIN mutar el estado (fail-closed).
+        """
+        if verifier is None:
+            raise BrokerError(
+                "bind_execution_authority rechaza None: no se puede desenlazar "
+                "la autoridad por API publica (fail-closed)"
+            )
+        if not isinstance(verifier, ExecutionVerifier):
+            raise BrokerError(
+                "bind_execution_authority exige un ExecutionVerifier "
+                "(autoridad de ejecucion real)"
+            )
+        if self._execution_authority is not None:
+            raise BrokerError(
+                "ya existe una autoridad de ejecucion enlazada: el enlace es de "
+                "una sola asignacion (no se sustituye)"
+            )
+        self._execution_authority = verifier
+
+    def bind_execution_lock(self, lock) -> None:
+        """Enlaza (una sola vez) la capacidad de lock inter-proceso de ejecucion.
+
+        ORDER-09E: sin un `ExecutionInstanceLock` real, activo y ligado al mismo
+        `BrokerScope` esperado del adapter no se ejecuta ninguna orden. No se
+        acepta un booleano ni un objeto duck-typed: la capacidad debe representar
+        un lock del SO efectivamente adquirido.
+        """
+        if lock is None:
+            raise BrokerError(
+                "bind_execution_lock rechaza None: no se puede desenlazar el "
+                "lock de ejecucion por API publica (fail-closed)"
+            )
+        if not isinstance(lock, ExecutionInstanceLock):
+            raise BrokerError(
+                "bind_execution_lock exige un ExecutionInstanceLock real"
+            )
+        if not lock.held:
+            raise BrokerError(
+                "bind_execution_lock exige un lock activo (no adquirido)"
+            )
+        expected_key = execution_resource_key(self.expected_execution_scope())
+        if lock.resource_key != expected_key:
+            raise BrokerError(
+                "el lock de ejecucion no corresponde al BrokerScope del adapter"
+            )
+        if self._execution_lock is not None:
+            raise BrokerError(
+                "ya existe un lock de ejecucion enlazado: el enlace es de una "
+                "sola asignacion (no se sustituye)"
+            )
+        self._execution_lock = lock
+
+    def _assert_execution_lock(self) -> None:
+        if self._execution_lock is None:
+            raise BrokerPermissionError(
+                "MT5 submit/cancel requiere un lock inter-proceso de ejecucion "
+                "enlazado (fail-closed)"
+            )
+        if not self._execution_lock.held:
+            raise BrokerPermissionError(
+                "el lock inter-proceso de ejecucion no esta activo"
+            )
+        expected_key = execution_resource_key(self.expected_execution_scope())
+        if self._execution_lock.resource_key != expected_key:
+            raise BrokerPermissionError(
+                "el lock de ejecucion no corresponde al BrokerScope del adapter"
+            )
 
     def remember_identity(self, client_order_id: str, broker_order_id: int | str) -> None:
         """Prima la correlacion `cid<->ticket` desde una fuente fiable (journal).
@@ -1168,6 +1260,69 @@ class MT5BrokerAdapter(BrokerAdapter):
             observed_at=observed_at,
             read_started_monotonic=read_started,
             read_finished_monotonic=read_finished,
+        )
+
+    # ------------------------------- identidad de cuenta autorizada (09D.1)
+
+    def expected_execution_scope(self) -> BrokerScope:
+        """Identidad esperada configurada en el composition root (sin conectar).
+
+        Deriva de la configuracion/credenciales del adapter, NUNCA de argumentos
+        del llamante de `submit_order`. El adapter DEMO exige entorno demo.
+        """
+        self._require_demo()
+        return BrokerScope(
+            environment=self.config.environment.value,
+            server=self._credentials.server,
+            login=str(self._credentials.login),
+        )
+
+    def effective_execution_scope(self) -> BrokerScope:
+        """Identidad EFECTIVA observada en el terminal MT5 (fail-closed)."""
+        self._require_demo()
+        self._require_ready()
+        mt5 = self._module()
+        try:
+            info = mt5.account_info()
+        except BrokerError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - transporte/consulta incierta
+            raise BrokerConnectionError(
+                f"account_info fallo ({type(exc).__name__}): identidad no "
+                "verificable"
+            ) from exc
+        if info is None:
+            raise BrokerConnectionError(
+                "account_info() sin respuesta: identidad no verificable"
+            )
+        server = getattr(info, "server", None)
+        if not isinstance(server, str) or not server.strip():
+            raise BrokerPermissionError(
+                "identidad de cuenta incompleta: server no observable"
+            )
+        login = getattr(info, "login", None)
+        if isinstance(login, bool) or not isinstance(login, (int, str)):
+            raise BrokerPermissionError(
+                "identidad de cuenta incompleta: login no observable"
+            )
+        if not str(login).strip():
+            raise BrokerPermissionError(
+                "identidad de cuenta incompleta: login vacio"
+            )
+        trade_mode = getattr(info, "trade_mode", None)
+        if isinstance(trade_mode, bool) or not isinstance(trade_mode, int):
+            raise BrokerPermissionError(
+                "identidad de cuenta incompleta: trade_mode no observable"
+            )
+        if trade_mode != ACCOUNT_TRADE_MODE_DEMO:
+            raise BrokerPermissionError(
+                "cuenta MT5 no DEMO "
+                f"(trade_mode={trade_mode}): operacion rechazada"
+            )
+        return BrokerScope(
+            environment=self.config.environment.value,
+            server=server,
+            login=login,
         )
 
     # -------------------------------------------------------- marcas (06F)
@@ -1552,12 +1707,65 @@ class MT5BrokerAdapter(BrokerAdapter):
             )
         return int(ticket)
 
-    def submit_order(self, order: Order) -> OrderSubmission:
+    @staticmethod
+    def _order_from_authorized_intent(intent: ExecutionIntent) -> Order:
+        """Snapshot privado e inmutable de la Order efectiva ya autorizada.
+
+        El request se construye desde este snapshot derivado de la intencion
+        canonica, no desde el objeto `Order` del llamante. Asi una mutacion
+        posterior del objeto original no puede alterar la orden enviada.
+        """
+        return Order(
+            strategy_id="authorized",
+            strategy_version="1.0.0",
+            account_id=intent.account_id,
+            instrument=intent.instrument,
+            side=OrderSide(intent.side),
+            quantity=float(intent.quantity),
+            order_type=OrderType(intent.order_type),
+            client_order_id=intent.client_order_id,
+            reduce_only=intent.reduce_only,
+            purpose=intent.purpose,
+            target_position_id=(
+                intent.target_position_id or None
+            ),
+            limit_price=(
+                float(intent.limit_price) if intent.limit_price else None
+            ),
+            stop_price=(
+                float(intent.stop_price) if intent.stop_price else None
+            ),
+            time_in_force=intent.time_in_force,
+        )
+
+    def submit_order(
+        self, order: Order, *, authorization=None
+    ) -> OrderSubmission:
         self._require_demo()
         self._require_ready()
-        cid = order.client_order_id
-        if not cid:
-            raise BrokerInvalidOrderError("client_order_id obligatorio")
+        # ORDER-09C: el adaptador MT5 no opera sin una autoridad de capacidad
+        # enlazada. La ruta plenamente protegida es LiveExecutionCoordinator/
+        # LiveExecutionRuntime; un gate arbitrario no demuestra esa ruta.
+        if self._execution_gate is None:
+            raise BrokerPermissionError(
+                "MT5 submit_order requiere un ExecutionGate enlazado; use "
+                "LiveExecutionCoordinator/LiveExecutionRuntime (fail-closed)"
+            )
+        if self._execution_authority is None:
+            raise BrokerPermissionError(
+                "MT5 submit_order requiere una autoridad de ejecucion enlazada; "
+                "use LiveExecutionCoordinator/LiveExecutionRuntime (fail-closed)"
+            )
+        self._assert_execution_lock()
+        # ORDER-09D: congela la operacion efectiva en una intencion inmutable.
+        # A partir de aqui TODO (gate, request, validaciones y consumo) usa el
+        # snapshot derivado de la intencion, nunca el objeto mutable del llamante.
+        try:
+            expected_intent = ExecutionIntent.from_order(order)
+        except ExecutionIntentError as exc:
+            raise BrokerInvalidOrderError(str(exc)) from exc
+        order = self._order_from_authorized_intent(expected_intent)
+        cid = expected_intent.client_order_id
         # ATLAS-MT5-HEDGING-02B/02E (H-3): el modo de cuenta se VERIFICA antes de
         # cualquier envio. Modo no verificable (account_info None/excepcion/ausente)
         # o no reconocido => fail-closed (nunca se asume NETTING). La ruta DIRECTA
@@ -1574,19 +1782,12 @@ class MT5BrokerAdapter(BrokerAdapter):
         # MT5-DEMO-EXECUTION-FOUNDATION-01 / 02B: solo envia si el gate de
         # capacidad enlazado autoriza esta operacion. El TIPO se deriva del
         # `purpose` tipado (NO de reduce_only): OPEN usa target=cid; CLOSE/REDUCE
-        # usan target=instrument (posicion). Sin gate (default) => LIVE-09 intacto.
-        if self._execution_gate is not None:
-            purpose = str(getattr(order, "purpose", PURPOSE_OPEN))
-            if purpose == PURPOSE_CLOSE:
-                self._execution_gate.check_operation(
-                    OPERATION_CLOSE, op_id=cid, target=str(order.instrument)
-                )
-            elif purpose == PURPOSE_REDUCE:
-                self._execution_gate.check_operation(
-                    OPERATION_REDUCE, op_id=cid, target=str(order.instrument)
-                )
-            else:
-                self._execution_gate.check(cid)
+        # usan target=instrument (posicion).
+        kind, target = expected_intent.kind, expected_intent.target
+        if kind == OPERATION_OPEN:
+            self._execution_gate.check(cid)
+        else:
+            self._execution_gate.check_operation(kind, op_id=cid, target=target)
         if order.order_type is not OrderType.MARKET:
             raise BrokerInvalidOrderError(
                 f"tipo de orden no soportado por MT5 en LIVE-09: {order.order_type}"
@@ -1672,6 +1873,18 @@ class MT5BrokerAdapter(BrokerAdapter):
                 broker_order=None,
                 detail=f"order_check retcode={check_code}",
             )
+        # ORDER-09D.1: ultima comprobacion de identidad EFECTIVA del terminal
+        # inmediatamente antes del consumo/envio. Un cambio de cuenta posterior
+        # a esta lectura no puede volverse atomico con la API MT5.
+        effective_scope = self.effective_execution_scope()
+        self._assert_execution_lock()
+        # ORDER-09D: consume de forma atomica la intencion CONGELADA al inicio,
+        # inmediatamente antes de order_send y con el lock ya liberado.
+        self._execution_authority.consume(
+            authorization,
+            intent=expected_intent,
+            broker_scope=effective_scope,
+        )
         # A partir de aqui el envio puede ocurrir: el limite de ambiguedad.
         try:
             result = mt5.order_send(request)
@@ -2121,21 +2334,23 @@ class MT5BrokerAdapter(BrokerAdapter):
         return self._clock()
 
     def cancel_order(
-        self, client_order_id: str, *, operation_id: str | None = None
+        self,
+        client_order_id: str,
+        *,
+        operation_id: str | None = None,
+        instrument: str | None = None,
+        account_id: str | None = None,
+        authorization=None,
     ) -> BrokerOrder:
         """Cancela una orden pendiente.
 
-        Compatibilidad heredada (LIVE-09): sin gate enlazado, `operation_id` se
-        ignora y el comportamiento es el de siempre (NO es ruta coordinada
-        segura; no debe usarse desde un runner live).
-
-        Modo coordinado (MT5-DEMO-EXECUTION-CONTROLS-02A): si hay un
-        `ExecutionGate` enlazado, la operacion exige autorizacion de capacidad de
-        tipo `CANCEL`, ligada a `(operation_id, client_order_id)`. Sin `operation_id`
-        o sin autorizacion valida => se impide la llamada al broker. El gate lo
-        posee SOLO el `LiveExecutionCoordinator`; un caller con el adapter no
-        puede cancelar sin su autorizacion. NO cierra/reduce posiciones (fuera de
-        alcance 02A).
+        ORDER-09C/09D: exige gate y verificador enlazados; sin ellos se rechaza
+        fail-closed antes de consultar o enviar al broker. La autorizacion
+        Ed25519 liga `(operation_id, client_order_id, instrument, account_id,
+        target_broker_order_id)` y se consume tras resolver el ticket exacto,
+        inmediatamente antes de `order_send`. La ruta plenamente protegida es
+        `LiveExecutionCoordinator`/`LiveExecutionRuntime`; NO cierra/reduce
+        posiciones (fuera de alcance 02A).
 
         ORDER-07C: un retcode de aceptacion no demuestra cancelacion. Se devuelve
         el estado OBSERVADO (`SUBMITTED`/`PARTIALLY_FILLED`/`CANCELLED`/`FILLED`/
@@ -2143,17 +2358,37 @@ class MT5BrokerAdapter(BrokerAdapter):
         """
         self._require_demo()
         self._require_ready()
-        if self._execution_gate is not None:
-            if not operation_id or not str(operation_id).strip():
-                raise BrokerError(
-                    "cancelacion coordinada (gate enlazado) requiere operation_id: "
-                    "sin identidad de operacion no se llama al broker"
-                )
-            self._execution_gate.check_operation(
-                OPERATION_CANCEL,
-                op_id=str(operation_id),
-                target=client_order_id,
+        if self._execution_gate is None:
+            raise BrokerPermissionError(
+                "MT5 cancel_order requiere un ExecutionGate enlazado; use "
+                "LiveExecutionCoordinator/LiveExecutionRuntime (fail-closed)"
             )
+        if not operation_id or not str(operation_id).strip():
+            raise BrokerError(
+                "cancelacion coordinada requiere operation_id: "
+                "sin identidad de operacion no se llama al broker"
+            )
+        self._execution_gate.check_operation(
+            OPERATION_CANCEL,
+            op_id=str(operation_id),
+            target=client_order_id,
+        )
+        if not instrument or not str(instrument).strip():
+            raise BrokerError(
+                "cancelacion coordinada requiere instrument: sin identidad de "
+                "instrumento no se puede ligar la autorizacion de ejecucion"
+            )
+        if not account_id or not str(account_id).strip():
+            raise BrokerError(
+                "cancelacion coordinada requiere account_id: sin cuenta no se "
+                "puede ligar la autorizacion de ejecucion"
+            )
+        if self._execution_authority is None:
+            raise BrokerPermissionError(
+                "MT5 cancel_order requiere una autoridad de ejecucion enlazada; "
+                "use LiveExecutionCoordinator/LiveExecutionRuntime (fail-closed)"
+            )
+        self._assert_execution_lock()
         ticket = self._cid_to_ticket.get(client_order_id)
         if ticket is None:
             matches = self._discover_tickets(client_order_id)
@@ -2167,8 +2402,28 @@ class MT5BrokerAdapter(BrokerAdapter):
                 )
             ticket = matches[0]
             self._remember(client_order_id, ticket)
+        try:
+            expected_intent = ExecutionIntent.for_cancel(
+                op_id=str(operation_id),
+                target_client_order_id=str(client_order_id),
+                instrument=str(instrument),
+                account_id=str(account_id),
+                target_broker_order_id=str(ticket),
+            )
+        except ExecutionIntentError as exc:
+            raise BrokerInvalidOrderError(str(exc)) from exc
         mt5 = self._module()
         request = {"action": TRADE_ACTION_REMOVE, "order": ticket}
+        # ORDER-09D.1: identidad efectiva del terminal justo antes de consumir.
+        effective_scope = self.effective_execution_scope()
+        self._assert_execution_lock()
+        # ORDER-09D: consumo ATOMICO tras resolver el ticket exacto y justo
+        # antes de order_send; el lock se libera antes del I/O de broker.
+        self._execution_authority.consume(
+            authorization,
+            intent=expected_intent,
+            broker_scope=effective_scope,
+        )
         try:
             result = mt5.order_send(request)
         except Exception as exc:  # noqa: BLE001

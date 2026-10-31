@@ -33,6 +33,14 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable
 
+from execution.execution_authority import (
+    BrokerScope,
+    ExecutionAuthorizationError,
+    ExecutionAuthority,
+    ExecutionIntent,
+    ExecutionIntentError,
+    ExecutionVerifier,
+)
 from execution.instrument import InstrumentSpec
 from execution.intent_journal import (
     OPERATION_CANCEL,
@@ -276,6 +284,9 @@ class LiveExecutionCoordinator:
         broker: Any,
         order_manager: OrderManager,
         journal: IntentJournal,
+        execution_authority: ExecutionAuthority,
+        execution_verifier: ExecutionVerifier,
+        broker_scope: BrokerScope,
         sessions: Any,
         kill_switch: Any,
         instrument: str,
@@ -298,10 +309,33 @@ class LiveExecutionCoordinator:
                 "LiveExecutionCoordinator exige un IntentJournal (obligatorio); "
                 "None o un objeto distinto NO es aceptable (fail-closed)"
             )
+        if not isinstance(execution_authority, ExecutionAuthority):
+            raise TypeError(
+                "execution_authority debe ser ExecutionAuthority (emisor Ed25519)"
+            )
+        if not isinstance(execution_verifier, ExecutionVerifier):
+            raise TypeError(
+                "execution_verifier debe ser ExecutionVerifier (solo clave publica)"
+            )
+        if (
+            execution_authority.public_key_bytes
+            != execution_verifier.public_key_bytes
+        ):
+            raise ValueError(
+                "execution_authority/execution_verifier no forman el mismo par "
+                "de claves (se exige una unica pareja configurada)"
+            )
+        if not isinstance(broker_scope, BrokerScope):
+            raise TypeError("broker_scope debe ser BrokerScope")
         if not hasattr(broker, "bind_execution_gate"):
             raise TypeError(
                 "broker no admite gate de ejecucion (bind_execution_gate): "
                 "no es un adapter de ejecucion habilitable"
+            )
+        if not hasattr(broker, "bind_execution_authority"):
+            raise TypeError(
+                "broker no admite autoridad de ejecucion "
+                "(bind_execution_authority): no es un adapter habilitable"
             )
         if not isinstance(instrument_spec, InstrumentSpec):
             raise TypeError("instrument_spec debe ser InstrumentSpec")
@@ -342,6 +376,11 @@ class LiveExecutionCoordinator:
         self._token = secrets.token_hex(32)
         self._gate = ExecutionGate(self._token)
         broker.bind_execution_gate(self._gate)
+        # ORDER-09D: el coordinador conserva el emisor; el adapter recibe SOLO
+        # el verificador (clave publica) desde el composition root.
+        self._signer = execution_authority
+        self._broker_scope = broker_scope
+        broker.bind_execution_authority(execution_verifier)
 
     # --------------------------------------------------------------- consulta
     @property
@@ -1030,9 +1069,30 @@ class LiveExecutionCoordinator:
         limit_price: float | None = None,
         signal_id: str | None = None,
     ) -> ExecutionOutcome:
-        """Ejecuta la ruta segura completa. Levanta `ExecutionBlockedError` en veto."""
+        """Ejecuta una APERTURA por la ruta segura completa.
+
+        CLOSE/REDUCE tienen metodos dedicados. `is_entry` se conserva solo por
+        compatibilidad de firma: cualquier valor distinto de `True` se rechaza
+        ANTES de crear orden, persistir journal o firmar autorizacion. Los gates
+        de apertura son fijos y no dependen de ningun booleano del llamante.
+        """
+        if is_entry is not True:
+            raise ExecutionBlockedError(
+                "identity",
+                "submit() solo admite is_entry=True; use close_position/"
+                "reduce_position para operaciones de mantenimiento",
+            )
         if not client_order_id or not str(client_order_id).strip():
             raise ExecutionBlockedError("identity", "client_order_id obligatorio")
+        # ORDER-09D: `submit` representa una APERTURA. Un reduce_only aqui seria
+        # una combinacion purpose=OPEN/reduce_only incoherente y jamas debe
+        # ejecutarse como una apertura autorizada.
+        if reduce_only:
+            raise ExecutionBlockedError(
+                "identity",
+                "submit() no admite reduce_only=True; use close_position/"
+                "reduce_position para operaciones reductoras",
+            )
         spec = self._instrument_spec
         try:
             quantity = validate_quantity_lattice(
@@ -1047,18 +1107,17 @@ class LiveExecutionCoordinator:
         now = self._clock()
         # 1-8: gates obligatorios, en orden, TODOS antes de tocar el broker.
         self._assert_no_unresolved()
-        self._assert_session(now, is_entry=is_entry)
+        self._assert_session(now, is_entry=True)
         self._assert_kill_switch()
         self._assert_broker_health()
         self._assert_reconciliation()
         self._assert_market_data(now)
         self._assert_currency()
-        self._assert_account_mode(is_entry=is_entry)
+        self._assert_account_mode(is_entry=True)
         self._assert_position_limit()
         # HEDGING restringido: una sola posicion por simbolo; una APERTURA exige
-        # que no exista ya posicion del instrumento.
-        if is_entry:
-            self._assert_no_open_position_for_entry()
+        # que no exista ya posicion del instrumento. Siempre se aplica.
+        self._assert_no_open_position_for_entry()
 
         # OrderManager: identidad estable + idempotencia.
         try:
@@ -1128,10 +1187,23 @@ class LiveExecutionCoordinator:
             raise ExecutionBlockedError("journal_persist", str(exc)) from exc
 
         # Frontera durable ya escrita: a partir de aqui el envio pudo ocurrir.
+        # ORDER-09D: la intencion canonica se construye desde la orden validada
+        # y se firma DESPUES de SUBMITTING; el adapter la verifica y consume
+        # atomicamente antes de order_send.
+        try:
+            intent = ExecutionIntent.from_order(order)
+        except ExecutionIntentError as exc:
+            self._mark_pre_send_failed(order, f"intent: {exc}")
+            raise ExecutionBlockedError("identity", str(exc)) from exc
+        authorization = self._signer.issue(
+            intent, broker_scope=self._broker_scope
+        )
         try:
             self._gate.approve(client_order_id, token=self._token)
-            submission = self._broker.submit_order(order)
-        except ExecutionNotAuthorizedError as exc:
+            submission = self._broker.submit_order(
+                order, authorization=authorization
+            )
+        except (ExecutionNotAuthorizedError, ExecutionAuthorizationError) as exc:
             self._mark_pre_send_failed(order, str(exc))
             raise
         except OrderRejectedError as exc:
@@ -1347,18 +1419,43 @@ class LiveExecutionCoordinator:
         except IntentJournalError as exc:
             raise ExecutionBlockedError("journal_persist", str(exc)) from exc
 
-        # 6) Autorizacion de capacidad `CANCEL` + llamada al broker.
+        # 6) Intencion canonica CANCEL + autorizacion + llamada al broker.
+        target_broker_order_id = str(intent.target_broker_order_id or "")
+        if not target_broker_order_id:
+            self._journal.mark_state(op_id, "FAILED")
+            raise ExecutionBlockedError(
+                "cancel_evidence",
+                "broker order id no determinable: no se autoriza la cancelacion",
+            )
+        try:
+            cancel_authorization_intent = ExecutionIntent.for_cancel(
+                op_id=op_id,
+                target_client_order_id=target_cid,
+                instrument=target_intent.instrument,
+                account_id=self._account_id,
+                target_broker_order_id=target_broker_order_id,
+            )
+        except ExecutionIntentError as exc:
+            self._journal.mark_state(op_id, "FAILED")
+            raise ExecutionBlockedError("identity", str(exc)) from exc
+        authorization = self._signer.issue(
+            cancel_authorization_intent, broker_scope=self._broker_scope
+        )
         try:
             self._gate.approve_operation(
                 OPERATION_CANCEL, op_id=op_id, target=target_cid, token=self._token
             )
             broker_order = self._broker.cancel_order(
-                target_cid, operation_id=op_id
+                target_cid,
+                operation_id=op_id,
+                instrument=target_intent.instrument,
+                account_id=self._account_id,
+                authorization=authorization,
             )
         except OrderRejectedError as exc:
             self._journal.mark_state(op_id, "REJECTED")
             raise ExecutionBlockedError("cancel_rejected", str(exc)) from exc
-        except ExecutionNotAuthorizedError as exc:
+        except (ExecutionNotAuthorizedError, ExecutionAuthorizationError) as exc:
             self._journal.mark_state(op_id, "FAILED")
             raise ExecutionBlockedError("cancel_not_authorized", str(exc)) from exc
         except OrderNotFoundError as exc:
@@ -1621,11 +1718,21 @@ class LiveExecutionCoordinator:
             raise ExecutionBlockedError("journal_persist", str(exc)) from exc
 
         try:
+            close_reduce_intent = ExecutionIntent.from_order(order)
+        except ExecutionIntentError as exc:
+            self._mark_pre_send_failed(order, f"intent: {exc}")
+            raise ExecutionBlockedError("identity", str(exc)) from exc
+        authorization = self._signer.issue(
+            close_reduce_intent, broker_scope=self._broker_scope
+        )
+        try:
             self._gate.approve_operation(
                 kind, op_id=op_id, target=instrument, token=self._token
             )
-            submission = self._broker.submit_order(order)
-        except ExecutionNotAuthorizedError as exc:
+            submission = self._broker.submit_order(
+                order, authorization=authorization
+            )
+        except (ExecutionNotAuthorizedError, ExecutionAuthorizationError) as exc:
             self._mark_pre_send_failed(order, str(exc))
             raise
         except OrderRejectedError as exc:

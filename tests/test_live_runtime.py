@@ -21,6 +21,7 @@ from tests.test_mt5_execution_foundation import (
     ORDER_TYPE_SELL,
     FakeMT5,
     FakeSessions,
+    _runtime_lock,
     passing_admission,
 )
 from tests.test_mt5_hedging_restricted import (
@@ -173,7 +174,8 @@ def _ledger() -> AccountLedger:
 
 def _runtime(tmp_path, *, fake=None, journal=None, ledger=None, account_mode=0,
              symbol_map=None, commission_policy=CommissionPolicy("USD"),
-             ledger_store=None, adapter=None, kill_switch=None, maker=True):
+             ledger_store=None, adapter=None, kill_switch=None, maker=True,
+             with_lock=True):
     fake = fake or AccountingFakeMT5()
     if maker:
         fake.add_symbol(INSTRUMENT)
@@ -183,8 +185,10 @@ def _runtime(tmp_path, *, fake=None, journal=None, ledger=None, account_mode=0,
     ledger = ledger or _ledger()
     store = ledger_store or LedgerStore(tmp_path / "ledger.json")
     ks = kill_switch or KillSwitchCoordinator()
+    lock = _runtime_lock(tmp_path, adapter) if with_lock else None
     rt = LiveExecutionRuntime(
         broker=adapter, order_manager=OrderManager(), journal=journal, ledger=ledger,
+        instance_lock=lock,
         ledger_store=store, sessions=FakeSessions(), kill_switch=ks,
         instrument=INSTRUMENT, instrument_spec=_spec(), account_id="DEMO-1",
         account_currency="USD", max_open_positions=3,
@@ -224,6 +228,18 @@ class TestStartup:
         assert rep.reconciliation.status.value == "RECONCILIATION_OK"
         # secuencia: journal migrado + ledger persistido
         assert store.exists
+
+    def test_runtime_rejects_is_entry_false_before_side_effects(self, tmp_path):
+        rt, adapter, fake, ledger, journal, store = _runtime(tmp_path)
+        assert rt.initialize().ready is True
+        with pytest.raises(ExecutionBlockedError):
+            rt.submit(
+                side=OrderSide.BUY, quantity=0.1, strategy_id="s",
+                strategy_version="1.0.0", client_order_id="O-NOENTRY",
+                is_entry=False,
+            )
+        assert journal.all() == ()
+        assert fake.send_count == 0
 
     def test_initialize_terminalizes_new_created_without_send(self, tmp_path):
         journal = IntentJournal.initialize(tmp_path / "j.json")
@@ -376,6 +392,7 @@ class TestIdempotencyDurability:
         adapter2 = _adapter(fake)
         rt2 = LiveExecutionRuntime(
             broker=adapter2, order_manager=OrderManager(), journal=journal,
+            instance_lock=_runtime_lock(tmp_path, adapter2),
             ledger=_ledger(), ledger_store=store, sessions=FakeSessions(),
             kill_switch=KillSwitchCoordinator(), instrument=INSTRUMENT,
             instrument_spec=_spec(), account_id="DEMO-1", account_currency="USD",
@@ -530,6 +547,7 @@ class TestHistoryIntegrity:
         ledger2 = _ledger()
         rt2 = LiveExecutionRuntime(
             broker=adapter2, order_manager=OrderManager(), journal=journal,
+            instance_lock=_runtime_lock(tmp_path, adapter2),
             ledger=ledger2, ledger_store=store, sessions=FakeSessions(),
             kill_switch=KillSwitchCoordinator(), instrument=INSTRUMENT,
             instrument_spec=_spec(), account_id="DEMO-1", account_currency="USD",

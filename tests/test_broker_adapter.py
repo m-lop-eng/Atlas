@@ -30,7 +30,12 @@ from brokers import (
     PaperBrokerAdapter,
     SubmitStatus,
 )
-from brokers.models import BrokerInvalidOrderError, BrokerOrder, Position
+from brokers.models import (
+    BrokerInvalidOrderError,
+    BrokerOrder,
+    BrokerPermissionError,
+    Position,
+)
 from brokers.reconcile import is_uncertain, resolve_order
 from execution.order import Order, OrderSide, OrderType
 
@@ -638,6 +643,34 @@ class TestPaperReduceOnly:
             "R-FULL", side=OrderSide.SELL, quantity=1.0, reduce_only=True,
         ))
         assert adapter.get_positions() == []
+
+
+class TestPaperAuthorizationContract:
+    """09D: Paper acepta la firma base pero rechaza autorizaciones no nulas."""
+
+    def test_submit_rejects_execution_authorization(self) -> None:
+        adapter = _paper()
+        with pytest.raises(BrokerPermissionError):
+            adapter.submit_order(_order(), authorization=object())
+
+    def test_cancel_rejects_execution_authorization(self) -> None:
+        adapter = _paper()
+        with pytest.raises(BrokerPermissionError):
+            adapter.cancel_order("X", authorization=object())
+
+    def test_optional_metadata_without_authorization_is_accepted(self) -> None:
+        adapter = _paper()
+        adapter.submit_order(
+            _order("META-1", order_type=OrderType.LIMIT, limit_price=1.0)
+        )
+        canceled = adapter.cancel_order(
+            "META-1",
+            operation_id="CANCEL:META-1",
+            instrument="BTCUSDT",
+            account_id="acc-1",
+            authorization=None,
+        )
+        assert canceled.state is BrokerOrderState.CANCELLED
 
 
 if __name__ == "__main__":  # pragma: no cover

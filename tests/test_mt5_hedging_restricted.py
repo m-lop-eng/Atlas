@@ -8,6 +8,8 @@ Exclusivamente FakeMT5: sin terminal real, sin credenciales, sin ordenes reales.
 
 from __future__ import annotations
 
+from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -23,10 +25,18 @@ from tests.test_mt5_execution_foundation import (
     FakeKillSwitch,
     FakeMT5,
     FakeSessions,
+    _RecordingAuthority,
+    _bind_test_execution_lock,
+    _runtime_lock,
     _spec,
     passing_admission,
 )
 
+from execution.execution_authority import (
+    ExecutionAuthorizationInvalidError,
+    ExecutionAuthority,
+    ExecutionIntent,
+)
 from execution.intent_journal import (
     IntentJournal,
     IntentJournalCorruptionError,
@@ -41,7 +51,13 @@ from execution.live_execution import (
     UnresolvedIntentsError,
     UnsupportedAccountModeError,
 )
-from execution.order import Order, OrderSide, OrderType
+from execution.order import (
+    PURPOSE_CLOSE,
+    PURPOSE_REDUCE,
+    Order,
+    OrderSide,
+    OrderType,
+)
 from execution.order_manager import OrderManager
 from brokers.models import (
     BrokerConnectionError,
@@ -252,9 +268,54 @@ def _adapter(fake, *, allow=True) -> MT5BrokerAdapter:
     return adapter
 
 
-def _coord(journal, adapter, *, allow=True, account_mode=2, kill_switch=None):
+class _AllowTestGate:
+    """Gate de prueba para llamadas directas; no es producci?n."""
+
+    def __init__(self, *, allow=True):
+        self.allow = bool(allow)
+        self.calls: list[tuple] = []
+
+    def check(self, client_order_id):
+        self.calls.append(("check", str(client_order_id)))
+        if not self.allow:
+            raise BrokerPermissionError("test gate denied")
+
+    def check_operation(self, operation, *, op_id, target):
+        self.calls.append(
+            ("check_operation", str(operation), str(op_id), str(target))
+        )
+        if not self.allow:
+            raise BrokerPermissionError("test gate denied")
+
+
+def _bind_direct_gate(adapter, gate=None):
+    gate = gate or _AllowTestGate()
+    adapter.bind_execution_gate(gate)
+    authority = ExecutionAuthority(ttl_s=3600.0)
+    adapter._test_authority = authority
+    adapter.bind_execution_authority(authority.verifier())
+    _bind_test_execution_lock(adapter)
+    return adapter
+
+
+def _direct_submit(adapter, order):
+    authorization = adapter._test_authority.issue(
+        ExecutionIntent.from_order(order),
+        broker_scope=adapter.expected_execution_scope(),
+    )
+    return adapter.submit_order(order, authorization=authorization)
+
+
+def _coord(
+    journal, adapter, *, allow=True, account_mode=2, kill_switch=None,
+    authority=None,
+):
+    authority = authority or ExecutionAuthority()
+    _bind_test_execution_lock(adapter)
     return LiveExecutionCoordinator(
         broker=adapter, order_manager=OrderManager(), journal=journal,
+        execution_authority=authority, execution_verifier=authority.verifier(),
+        broker_scope=adapter.expected_execution_scope(),
         sessions=FakeSessions(),
         kill_switch=kill_switch or KillSwitchCoordinator(),
         instrument=INSTRUMENT, instrument_spec=_spec(), account_id="DEMO-1",
@@ -282,6 +343,7 @@ def _hedge_runtime(journal, adapter, ledger_path, marks):
     """Runtime HEDGING restringido con ledger/store propios (reconciliable)."""
     return LiveExecutionRuntime(
         broker=adapter, order_manager=OrderManager(), journal=journal,
+        instance_lock=_runtime_lock(Path(ledger_path).parent, adapter),
         ledger=AccountLedger(initial_cash=10_000.0, account_currency="USD"),
         ledger_store=LedgerStore(ledger_path), sessions=FakeSessions(),
         kill_switch=KillSwitchCoordinator(), instrument=INSTRUMENT,
@@ -496,6 +558,7 @@ class TestJournalPositionLinkage:
         adapter = _adapter(fake, allow=True)
         rt = LiveExecutionRuntime(
             broker=adapter, order_manager=OrderManager(), journal=journal,
+            instance_lock=_runtime_lock(tmp_path, adapter),
             ledger=AccountLedger(initial_cash=10_000.0, account_currency="USD"),
             ledger_store=LedgerStore(tmp_path / "ledger.json"), sessions=FakeSessions(),
             kill_switch=KillSwitchCoordinator(), instrument=INSTRUMENT,
@@ -524,6 +587,7 @@ class TestJournalPositionLinkage:
                                 volume=0.2, price=1.1)
         rt = LiveExecutionRuntime(
             broker=adapter, order_manager=OrderManager(), journal=journal,
+            instance_lock=_runtime_lock(tmp_path, adapter),
             ledger=AccountLedger(initial_cash=10_000.0, account_currency="USD"),
             ledger_store=LedgerStore(tmp_path / "ledger.json"), sessions=FakeSessions(),
             kill_switch=KillSwitchCoordinator(), instrument=INSTRUMENT,
@@ -547,6 +611,7 @@ class TestJournalPositionLinkage:
         adapter = _adapter(fake, allow=False)
         rt = LiveExecutionRuntime(
             broker=adapter, order_manager=OrderManager(), journal=journal,
+            instance_lock=_runtime_lock(tmp_path, adapter),
             ledger=AccountLedger(initial_cash=10_000.0, account_currency="USD"),
             ledger_store=LedgerStore(tmp_path / "ledger.json"), sessions=FakeSessions(),
             kill_switch=KillSwitchCoordinator(), instrument=INSTRUMENT,
@@ -1071,27 +1136,116 @@ def _direct_order(cid, *, side=OrderSide.BUY, quantity=0.1):
     )
 
 
+def _hedge_reduce_order(cid, *, purpose, target, quantity=0.5):
+    return Order(
+        strategy_id="s", strategy_version="1.0.0", account_id="A",
+        instrument=INSTRUMENT, side=OrderSide.SELL, quantity=quantity,
+        order_type=OrderType.MARKET, client_order_id=cid,
+        reduce_only=True, purpose=purpose, target_position_id=target,
+    )
+
+
+class TestAdapterDirectHedgingAuthorization:
+    @pytest.mark.parametrize("purpose", [PURPOSE_CLOSE, PURPOSE_REDUCE])
+    def test_authorization_for_position_a_cannot_close_position_b(self, purpose):
+        fake = _fake()
+        adapter = _bind_direct_gate(_adapter(fake, allow=True))
+        fake.add_hedge_position(identifier=66, ticket=66, volume=0.5)
+        fake.add_hedge_position(identifier=77, ticket=77, volume=0.5)
+        order_a = _hedge_reduce_order(
+            "HEDGE-AUTH-A", purpose=purpose, target="66", quantity=0.2
+        )
+        authorization = adapter._test_authority.issue(
+            ExecutionIntent.from_order(order_a),
+            broker_scope=adapter.expected_execution_scope(),
+        )
+        order_b = replace(order_a, target_position_id="77")
+        with pytest.raises(ExecutionAuthorizationInvalidError):
+            adapter.submit_order(order_b, authorization=authorization)
+        assert fake.send_count == 0
+
+    @pytest.mark.parametrize("purpose", [PURPOSE_CLOSE, PURPOSE_REDUCE])
+    def test_valid_authorization_uses_the_authorized_position_ticket(self, purpose):
+        fake = _fake()
+        adapter = _bind_direct_gate(_adapter(fake, allow=True))
+        fake.add_hedge_position(identifier=66, ticket=66, volume=0.5)
+        fake.add_hedge_position(identifier=77, ticket=77, volume=0.5)
+        order = _hedge_reduce_order(
+            f"HEDGE-AUTH-OK-{purpose}", purpose=purpose, target="66",
+            quantity=0.2,
+        )
+        authorization = adapter._test_authority.issue(
+            ExecutionIntent.from_order(order),
+            broker_scope=adapter.expected_execution_scope(),
+        )
+        submission = adapter.submit_order(order, authorization=authorization)
+        assert submission.status is SubmitStatus.CONFIRMED
+        assert fake.last_request["position"] == 66
+
+
+class TestCoordinatorHedgingAuthorization:
+    def test_close_signs_actual_target_position(self, tmp_path):
+        journal = IntentJournal.initialize(tmp_path / "j.json")
+        fake = _fake()
+        adapter = _adapter(fake, allow=True)
+        authority = _RecordingAuthority()
+        coord = _coord(
+            journal, adapter, allow=True, account_mode=2, authority=authority
+        )
+        fake.add_hedge_position(identifier=3006, ticket=3006, volume=0.5)
+        _seed_owned(journal, adapter, "O-SIGN-C", identifier=3006, ticket=3006)
+        out = coord.close_position(target_position_id="3006")
+        assert out.allowed is True
+        intent = authority.issued[-1]
+        assert intent.kind == PURPOSE_CLOSE
+        assert intent.target_position_id == "3006"
+        assert intent.target == INSTRUMENT
+        assert intent.account_id == "DEMO-1"
+        assert intent.reduce_only is True
+        assert fake.last_request["position"] == 3006
+
+    def test_reduce_signs_quantity_and_target_position(self, tmp_path):
+        journal = IntentJournal.initialize(tmp_path / "j.json")
+        fake = _fake()
+        adapter = _adapter(fake, allow=True)
+        authority = _RecordingAuthority()
+        coord = _coord(
+            journal, adapter, allow=True, account_mode=2, authority=authority
+        )
+        fake.add_hedge_position(identifier=3007, ticket=3007, volume=0.5)
+        _seed_owned(journal, adapter, "O-SIGN-R", identifier=3007, ticket=3007)
+        out = coord.reduce_position(
+            quantity=0.2, target_position_id="3007"
+        )
+        assert out.allowed is True
+        intent = authority.issued[-1]
+        assert intent.kind == PURPOSE_REDUCE
+        assert intent.quantity == "0.2"
+        assert intent.target_position_id == "3007"
+        assert intent.reduce_only is True
+        assert fake.last_request["position"] == 3007
+
+
 class TestAdapterDirectHedgingGate:
     def test_direct_hedging_open_without_optin_rejected(self):
         fake = _fake()
-        adapter = _adapter(fake, allow=False)
-        assert adapter._execution_gate is None  # sin coordinador
+        adapter = _bind_direct_gate(_adapter(fake, allow=False))
         with pytest.raises(BrokerPermissionError):
-            adapter.submit_order(_direct_order("D-H1"))
+            _direct_submit(adapter, _direct_order("D-H1"))
         assert fake.send_count == 0
 
     def test_direct_hedging_open_with_optin_allowed(self):
         fake = _fake()
-        adapter = _adapter(fake, allow=True)
-        out = adapter.submit_order(_direct_order("D-H2"))
+        adapter = _bind_direct_gate(_adapter(fake, allow=True))
+        out = _direct_submit(adapter, _direct_order("D-H2"))
         assert out.status is SubmitStatus.CONFIRMED
         assert fake.send_count == 1
 
     def test_direct_netting_open_no_regression(self):
         fake = _fake()
         fake.account.margin_mode = 0  # NETTING
-        adapter = _adapter(fake, allow=False)
-        out = adapter.submit_order(_direct_order("D-N1"))
+        adapter = _bind_direct_gate(_adapter(fake, allow=False))
+        out = _direct_submit(adapter, _direct_order("D-N1"))
         assert out.status is SubmitStatus.CONFIRMED
         assert fake.send_count == 1
 
@@ -1104,12 +1258,12 @@ class TestAdapterDirectHedgingGate:
 class TestAdapterAccountModeFailClosed:
     def _prepared(self):
         fake = _fake()
-        adapter = _adapter(fake, allow=True)
+        adapter = _bind_direct_gate(_adapter(fake, allow=True))
         return fake, adapter
 
     def _assert_rejected_no_send(self, adapter, fake, exc):
         with pytest.raises(exc):
-            adapter.submit_order(_direct_order("AM-1"))
+            _direct_submit(adapter, _direct_order("AM-1"))
         assert fake.check_count == 0   # order_check NO invocado
         assert fake.send_count == 0    # order_send NO invocado
         assert fake.last_request is None
